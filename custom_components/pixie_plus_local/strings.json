@@ -1,0 +1,95 @@
+{
+  "title": "Pixie Plus Local",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect gateway",
+        "description": "Use your Pixie account once to retrieve the parameters needed for ongoing local operation.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "cover_mapping": {
+        "title": "Blind mapping",
+        "description": "Map Home Assistant blind actions to the button positions configured in the Pixie app.",
+        "data": {
+          "cover_open_position": "Open button position",
+          "cover_stop_position": "Stop button position",
+          "cover_close_position": "Close button position",
+          "cover_open_tilt_position": "Open tilt button position",
+          "cover_stop_tilt_position": "Stop tilt button position",
+          "cover_close_tilt_position": "Close tilt button position"
+        },
+        "data_description": {
+          "cover_open_position": "Default is 2.",
+          "cover_stop_position": "Default is 5.",
+          "cover_close_position": "Default is 8.",
+          "cover_open_tilt_position": "Optional.",
+          "cover_stop_tilt_position": "Optional.",
+          "cover_close_tilt_position": "Optional."
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Authentication failed.",
+      "cannot_connect": "Could not connect to the Pixie gateway.",
+      "unknown": "Unexpected error. Check the logs."
+    },
+    "abort": {
+      "already_configured": "This Pixie home is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Blind mapping",
+        "description": "Adjust the button positions used for blind commands.",
+        "data": {
+          "cover_open_position": "Open button position",
+          "cover_stop_position": "Stop button position",
+          "cover_close_position": "Close button position",
+          "cover_open_tilt_position": "Open tilt button position",
+          "cover_stop_tilt_position": "Stop tilt button position",
+          "cover_close_tilt_position": "Close tilt button position"
+        },
+        "data_description": {
+          "cover_open_tilt_position": "Optional.",
+          "cover_stop_tilt_position": "Optional.",
+          "cover_close_tilt_position": "Optional."
+        }
+      }
+    },
+    "abort": {
+      "no_blind_devices": "No blind devices were found for this Pixie home."
+    }
+  },
+  "entity": {
+    "light": {
+      "light": {
+        "name": "Light"
+      }
+    },
+    "switch": {
+      "switch": {
+        "name": "Switch"
+      }
+    },
+    "cover": {
+      "blind": {
+        "name": "Blind"
+      }
+    }
+  },
+  "device": {
+    "usb_outlet": {
+      "name": "USB outlet"
+    },
+    "left_relay": {
+      "name": "Left relay"
+    },
+    "right_relay": {
+      "name": "Right relay"
+    }
+  }
+}
