@@ -46,13 +46,13 @@ For compatible models, the integration supports on/off, dimming, RGB color, and 
 ### HACS
 
 1. Open HACS.
-2. Go to the custom repositories section (HACS →  ⋮ (top right corner) → Custom repositories).
-3. Add `https://github.com/nirnachmani/Pixie_Plus_Local` as an `Integration` repository.
+2. Go to the custom repositories section.
+3. Add `https://github.com/nirnachmani/Pixie_Plus_local` as an `Integration` repository.
 4. Search for `Pixie Plus Local` in HACS and download it.
 5. Restart Home Assistant.
 6. Go to Settings > Devices & Services > Add Integration.
 7. Search for `Pixie Plus Local` and complete the setup flow.
-8. Enter your Pixie Plus username and password when prompted (username and password are not stored in Home Assistant.)
+8. Enter your Pixie Plus username and password when prompted.
 
 ### Manual
 
@@ -64,8 +64,8 @@ config/custom_components/pixie_plus_local/
 
 2. Restart Home Assistant.
 3. Go to Settings > Devices & Services > Add Integration.
-4. Search for `Pixie Plus Local`.
-5. Enter your Pixie Plus username and password when prompted (username and password are not stored in Home Assistant.)
+4. Search for `Pixie Plus Local` and complete the setup flow.
+5. Enter your Pixie Plus username and password when prompted.
 
 
 ## Notes on migration from the old integration
@@ -113,7 +113,8 @@ Blind entities are exposed as assumed-state covers. The integration sends the co
 
 - The integration requires a Pixie Plus hub.
 - Devices must already be set up in the official Pixie app.
-- Pixie cloud login is still required during the initial setup flow.
+- Pixie cloud login is required during the initial setup flow.
+- The integration will attempt local inventory refresh but if unsuccessful will operate in a hybrid mode where it requires the cloud on each startup to build the inventory but will otherwise use local communication. In that case, the Pixie Plus username and password will be stored in Home Assistant.
 - Groups, scenes, schedules, and timers from the Pixie ecosystem are not implemented.
 
 ## Troubleshooting
