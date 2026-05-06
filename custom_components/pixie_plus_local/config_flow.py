@@ -304,6 +304,11 @@ async def _async_validate_setup_input(user_input: dict[str, Any]) -> ValidatedSe
         if handler.runtime_session is not None:
             await asyncio.to_thread(handler.runtime_session.stop_and_join, 5.0)
 
+    if handler.inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+        LOGGER.warning(
+            "Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup"
+        )
+
     has_cover_devices = _has_cover_devices(handler)
     options: dict[str, Any] = {}
     cover_devices = _cover_controller_choices(handler.inventory)

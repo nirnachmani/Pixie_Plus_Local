@@ -510,6 +510,9 @@ async def _async_build_runtime_data(
 
     try:
         if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+            LOGGER.warning(
+                "Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup"
+            )
             if not username or not password:
                 raise ConfigEntryError("Cloud fallback mode requires stored Pixie credentials")
             try:
