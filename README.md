@@ -8,7 +8,7 @@ The integration communicates with the Pixie gateway on two ports, 41578 and 5321
 
 This is where you can help me by sending me debug logging from the integration and corresponding capture of port 53216 communication. This requires some technical knowledge. 
 
-I only need this data from systems where port 53216 fails. In those cases you will see a warning in the log:
+I only need this data from systems where port 53216 fails. In those cases you will see a warning in the log (only in integration version 0.31 or later):
 
 ```
 Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup
