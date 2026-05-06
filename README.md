@@ -2,7 +2,7 @@
 
 ## I need your help !! 
 
-Part of this integration doesn't work and I need your help to figure out why.
+Part of this integration doesn't work and I need your help to figure out why (the integration is functional but not completely local).
 
 The integration communicates with the Pixie gateway on two ports, 41578 and 53216. Each port uses different encryption. Port 41578 is used to send commands and get updates to/from the gateway. Port 53216 provides an initial snapshot of all the Pixie devices. On my system the integration works with both ports, but for other users port 53216 communication doesn't work and I can't figure out why. For now I manage this issue by getting the snapshot of all the Pixie devices from the cloud if port 53216 communications fails. This happens every time the integration loads. I also store the device snapshot in HA to be used if there is no access to the cloud (in that case if you add or remove devices that won't be reflected in the integration). However, I prefer to figure out the underlying issue so that the integration can be truly local.
 
@@ -28,7 +28,7 @@ logger:
 
 I will need all logging related to pixie_plus_local. Note that if you filter the log you won't see the lines that contain the data that I need.
 
-To capture the traffic you will need to install [mitmproxy](https://www.mitmproxy.org) on a computer and WireGuard on the mobile phone which you use for the Pixie Plus app. You  need to run mitmproxy in [WireGaurd Mode](https://docs.mitmproxy.org/stable/concepts/modes/#wireguard) and configure WireGuard on the phone accordingly (it's easy, mitmproxy gives you a QR code to use with WireGaurd). Once they are connected you need to start the Pixie Plus app. You will see that one of the captures is TCP traffic on port 53216 - I need the data that is transferred in that port. Contact me on Github to discuss how you will transfer this to me. Thanks in advance.  
+To capture the traffic you will need to install [mitmproxy](https://www.mitmproxy.org) on a computer and WireGuard on the mobile phone which you use for the Pixie Plus app. You  need to run mitmproxy in [WireGaurd Mode](https://docs.mitmproxy.org/stable/concepts/modes/#wireguard) and configure WireGuard on the phone accordingly (it's easy, mitmproxy gives you a QR code to use with WireGaurd). Once they are connected you need to start the Pixie Plus app. You will see that one of the captures is TCP traffic on port 53216 - I need the data that is transferred in that port. An example of the data can be seen [here](https://github.com/nirnachmani/Pixie_Plus_Local/blob/main/port_53216_traffic_example.jpg). Make sure you include everything. Contact me on Github to discuss how you will transfer this to me. Thanks in advance.  
 
 ##
 
