@@ -1,5 +1,37 @@
 # Pixie Plus Local for Home Assistant
 
+## I need your help !! 
+
+Part of this integration doesn't work and I need your help to figure out why.
+
+The integration communicates with the Pixie gateway on two ports, 41578 and 53216. Each port uses different encryption. Port 41578 is used to send commands and get updates to/from the gateway. Port 53216 provides an initial snapshot of all the Pixie devices. On my system the integration works with both ports, but for other users port 53216 communication doesn't work and I can't figure out why. For now I manage this issue by getting the snapshot of all the Pixie devices from the cloud if port 53216 communications fails. This happens every time the integration loads. I also store the device snapshot in HA to be used if there is no access to the cloud (in that case if you add or remove devices that won't be reflected in the integration). However, I prefer to figure out the underlying issue so that the integration can be truly local.
+
+This is where you can help me by sending me debug logging from the integration and corresponding capture of port 53216 communication. This requires some technical knowledge. 
+
+I only need this data from systems where port 53216 fails. In those cases you will see a warning in the log:
+
+```
+Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup
+```
+
+If you don't see this message it means the integration is using port 53216.
+
+
+To get debug logging you need to add the following to configuration.yaml:
+
+```
+logger:
+  default: warn
+  logs:
+    custom_components.pixie_plus_local: debug  
+```
+
+I will need all logging related to pixie_plus_local. Note that if you filter the log you won't see the lines that contain the data that I need.
+
+To capture the traffic you will need to install [mitmproxy](https://www.mitmproxy.org) on a computer and WireGuard on the mobile phone which you use for the Pixie Plus app. You  need to run mitmproxy in [WireGaurd Mode](https://docs.mitmproxy.org/stable/concepts/modes/#wireguard) and configure WireGuard on the phone accordingly (it's easy, mitmproxy gives you a QR code to use with WireGaurd). Once they are connected you need to start the Pixie Plus app. You will see that one of the captures is TCP traffic on port 53216 - I need the data that is transferred in that port. Contact me on Github to discuss how you will transfer this to me. Thanks in advance.  
+
+##
+
 Pixie Plus Local is a Home Assistant custom integration for SAL Pixie Plus devices.
 
 Unlike the older Pixie Plus integration, this one controls the hub locally over your LAN instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata the hub requires for local access, but after that the integration runs against the hub directly. I attempted to implement Bluetooth support as well but Pixie Plus devices are not compatible with Home Assistant Bluetooth (Pixie devices ignore CCCD write which is required for a successful handshake.) As such, the integration still requires a Pixie Gateway to work. 
