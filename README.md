@@ -16,7 +16,7 @@ Pixie Plus Local is using cloud-assisted inventory mode because direct local inv
 
 If you don't see this message it means the integration is using port 53216. 
 
-### Can you please vote in the discussion section regarding the presence of this message? I wonder if port 53216 is successful for some.
+### Can you please vote in the Discussions section regarding the presence of this message? I wonder if port 53216 is successful for some.
 
 
 To get debug logging you need to add the following to configuration.yaml:
