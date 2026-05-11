@@ -31,6 +31,8 @@ hardware_list = {
 # Unified model capability truth.
 MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "0102": {
+        "is_light": False,
+        "is_switch": False,
         "supports_onoff": False,
         "supports_dimming": False,
         "supports_color": False,
@@ -40,6 +42,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "0107": {
+        "is_light": False,
+        "is_switch": True,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -49,6 +53,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "0208": {
+        "is_light": False,
+        "is_switch": True,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -58,6 +64,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "1002": {
+        "is_light": False,
+        "is_switch": True,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -67,6 +75,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "1102": {
+        "is_light": False,
+        "is_switch": False,
         "supports_onoff": False,
         "supports_dimming": False,
         "supports_color": False,
@@ -76,6 +86,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": True,
     },
     "2213": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -85,6 +97,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2211": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -94,6 +108,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2212": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -103,6 +119,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2313": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": False,
@@ -112,6 +130,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2312": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": False,
@@ -121,6 +141,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2311": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": False,
@@ -130,6 +152,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2402": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": False,
@@ -139,6 +163,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2403": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": False,
@@ -148,6 +174,8 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2702": {
+        "is_light": True,
+        "is_switch": False,
         "supports_onoff": True,
         "supports_dimming": True,
         "supports_color": True,
@@ -164,6 +192,8 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     """Return normalized capability flags for a model number."""
     caps = MODEL_CAPABILITIES.get(str(model_no), {})
     return {
+        "is_light": bool(caps.get("is_light", False)),
+        "is_switch": bool(caps.get("is_switch", False)),
         "supports_onoff": bool(caps.get("supports_onoff", False)),
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),

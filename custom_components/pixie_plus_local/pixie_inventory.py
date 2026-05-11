@@ -301,6 +301,8 @@ class DeviceCapabilities:
     """Capability profile derived from device type range and record flags.
 
     Rules (reverse-engineered from the app's native Java layer):
+    - is_light           : expose the primary endpoint as a HA light
+    - is_switch          : expose the primary endpoint as a HA switch
     - supports_dimming  : model supports a brightness payload/state
     - supports_color    : model supports RGB payload/state
     - supports_effects  : model supports named effect commands/state
@@ -310,6 +312,8 @@ class DeviceCapabilities:
     - supports_usb_subentity : model 0107 (type=1, stype=7) only
     """
 
+    is_light: bool = False
+    is_switch: bool = False
     supports_onoff: bool = True
     supports_dimming: bool = False
     supports_color: bool = False
@@ -322,6 +326,8 @@ class DeviceCapabilities:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "is_light": self.is_light,
+            "is_switch": self.is_switch,
             "supports_onoff": self.supports_onoff,
             "supports_dimming": self.supports_dimming,
             "supports_color": self.supports_color,
@@ -336,6 +342,8 @@ class DeviceCapabilities:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DeviceCapabilities":
         return cls(
+            is_light=bool(data.get("is_light", False)),
+            is_switch=bool(data.get("is_switch", False)),
             supports_onoff=bool(data.get("supports_onoff", True)),
             supports_dimming=bool(data.get("supports_dimming", False)),
             supports_color=bool(data.get("supports_color", False)),
@@ -432,6 +440,8 @@ class PixieInventory:
         cap = DeviceCapabilities()
         model_caps = get_model_capabilities(model_no)
 
+        cap.is_light = model_caps["is_light"]
+        cap.is_switch = model_caps["is_switch"]
         cap.supports_onoff = model_caps["supports_onoff"]
         cap.supports_dimming = model_caps["supports_dimming"]
         cap.supports_color = model_caps["supports_color"]
@@ -674,7 +684,9 @@ class PixieInventory:
                 )
             )
             lines.append(
-                "   capabilities: onoff={onoff} dimming={dim} color={color} effects={effects} multi_channel={multi} usb_subentity={usb} supports_cover={cover}".format(
+                "   capabilities: light={light} switch={switch} onoff={onoff} dimming={dim} color={color} effects={effects} multi_channel={multi} usb_subentity={usb} supports_cover={cover}".format(
+                    light=d.capabilities.is_light,
+                    switch=d.capabilities.is_switch,
                     onoff=d.capabilities.supports_onoff,
                     dim=d.capabilities.supports_dimming,
                     color=d.capabilities.supports_color,

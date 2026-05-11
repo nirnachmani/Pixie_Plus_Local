@@ -52,14 +52,7 @@ def _iter_light_endpoints(inventory) -> list[PixieEndpoint]:
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
-        if not record.capabilities.supports_onoff:
-            continue
-        if not (
-            record.capabilities.supports_dimming
-            or record.capabilities.supports_color
-            or record.capabilities.supports_effects
-            or record.model_no in {"2213", "2212"}
-        ):
+        if not record.capabilities.is_light:
             continue
         endpoints.append(
             PixieEndpoint(

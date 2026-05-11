@@ -34,61 +34,65 @@ def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
         record = inventory.devices_by_id[device_id]
         parent_identifier = physical_device_identifier(record)
 
-        if record.model_no == "0107":
-            endpoints.append(
-                PixieEndpoint(
-                    device_id=record.id,
-                    endpoint_key="main",
-                    command_target="relay",
-                    entity_unique_id=endpoint_unique_identifier(record, "main"),
-                    device_identifier=parent_identifier,
-                    device_name=record.name,
-                    via_device_identifier=gateway_identifier,
-                    entity_translation_key="switch",
-                )
-            )
-            endpoints.append(
-                PixieEndpoint(
-                    device_id=record.id,
-                    endpoint_key="usb",
-                    command_target="usb",
-                    entity_unique_id=child_device_identifier(record, "usb"),
-                    device_identifier=parent_identifier,
-                    device_name=record.name,
-                    via_device_identifier=gateway_identifier,
-                    entity_name="USB",
-                )
+        if not record.capabilities.is_switch:
+            continue
+
+        if record.capabilities.supports_multi_channel:
+            left_name = record.left_name
+            right_name = record.right_name
+            endpoints.extend(
+                [
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="left",
+                        command_target="left",
+                        entity_unique_id=child_device_identifier(record, "left"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name=left_name or "Left Relay",
+                    ),
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="right",
+                        command_target="right",
+                        entity_unique_id=child_device_identifier(record, "right"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name=right_name or "Right Relay",
+                    ),
+                ]
             )
             continue
 
-        if not record.capabilities.supports_multi_channel:
+        endpoints.append(
+            PixieEndpoint(
+                device_id=record.id,
+                endpoint_key="main",
+                command_target="relay",
+                entity_unique_id=endpoint_unique_identifier(record, "main"),
+                device_identifier=parent_identifier,
+                device_name=record.name,
+                via_device_identifier=gateway_identifier,
+                entity_translation_key="switch",
+            )
+        )
+
+        if not record.capabilities.supports_usb_subentity:
             continue
 
-        left_name = record.left_name
-        right_name = record.right_name
-        endpoints.extend(
-            [
-                PixieEndpoint(
-                    device_id=record.id,
-                    endpoint_key="left",
-                    command_target="left",
-                    entity_unique_id=child_device_identifier(record, "left"),
-                    device_identifier=parent_identifier,
-                    device_name=record.name,
-                    via_device_identifier=gateway_identifier,
-                    entity_name=left_name or "Left Relay",
-                ),
-                PixieEndpoint(
-                    device_id=record.id,
-                    endpoint_key="right",
-                    command_target="right",
-                    entity_unique_id=child_device_identifier(record, "right"),
-                    device_identifier=parent_identifier,
-                    device_name=record.name,
-                    via_device_identifier=gateway_identifier,
-                    entity_name=right_name or "Right Relay",
-                ),
-            ]
+        endpoints.append(
+            PixieEndpoint(
+                device_id=record.id,
+                endpoint_key="usb",
+                command_target="usb",
+                entity_unique_id=child_device_identifier(record, "usb"),
+                device_identifier=parent_identifier,
+                device_name=record.name,
+                via_device_identifier=gateway_identifier,
+                entity_name="USB",
+            )
         )
     return endpoints
 
