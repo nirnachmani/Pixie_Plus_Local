@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 hardware_list = {
     "0102": "Gateway G3 - SGW3BTAM",
     "2213": "Smart Switch G3 - SWL600BTAM",
+    "2211": "Smart Switch - Unknown Model",
     "2313": "Smart dimmer G3 - SDD300BTAM",
     "0107": "Smart plug - ESS105/BT",
     "2702": "Flexi smart LED strip - FLP12V2M/RGBBT",
@@ -75,6 +76,15 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": True,
     },
     "2213": {
+        "supports_onoff": True,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2211": {
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
