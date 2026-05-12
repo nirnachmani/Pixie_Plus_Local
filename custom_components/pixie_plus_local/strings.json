@@ -10,6 +10,14 @@
           "password": "Password"
         }
       },
+      "reconfigure": {
+        "title": "Add Pixie credentials",
+        "description": "Direct local inventory is unavailable. Enter your Pixie account credentials so the integration can use cloud fallback when needed.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
       "cover_mapping": {
         "title": "Blind mapping",
         "description": "Map Home Assistant blind actions to the button positions configured in the Pixie app.",
@@ -37,7 +45,15 @@
       "unknown": "Unexpected error. Check the logs."
     },
     "abort": {
-      "already_configured": "This Pixie home is already configured."
+      "already_configured": "This Pixie home is already configured.",
+      "reconfigure_successful": "Pixie credentials updated.",
+      "reconfigure_failed": "The Pixie entry could not be reconfigured."
+    }
+  },
+  "issues": {
+    "missing_fallback_credentials": {
+      "title": "Pixie credentials required for fallback",
+      "description": "Direct local inventory is unavailable for {entry_title}. The integration is running from the stored inventory snapshot. Reconfigure the integration and enter your Pixie username and password so it can use cloud fallback when direct local inventory is unavailable."
     }
   },
   "options": {

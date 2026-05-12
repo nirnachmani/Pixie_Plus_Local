@@ -33,6 +33,7 @@ from . import (
     CONF_USER_ID,
     DOMAIN,
     INVENTORY_MODE_CLOUD_FALLBACK,
+    _async_delete_missing_credentials_issue,
 )
 from .pixie_runtime import CloudParams, PixieAuthError, PixieAuthHandler
 from .pixie_value_profiles import (
@@ -388,6 +389,57 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
+
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
+        """Store Pixie credentials so the entry can use cloud fallback when local inventory fails."""
+        errors: dict[str, str] = {}
+        entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            username = str(user_input[CONF_USERNAME]).strip()
+            password = str(user_input[CONF_PASSWORD])
+            handler = PixieAuthHandler()
+            try:
+                cloud_params = await handler.async_fetch_cloud_params(
+                    username,
+                    password,
+                    include_inventory_seed=True,
+                )
+            except PixieAuthError:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(str(cloud_params.home_id))
+                self._abort_if_unique_id_mismatch(reason="reconfigure_failed")
+                _async_delete_missing_credentials_issue(self.hass, entry)
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data=_build_entry_data_with_mode(
+                        cloud_params,
+                        inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
+                        username=username,
+                        password=password,
+                    ),
+                )
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_USERNAME): TextSelector(
+                    TextSelectorConfig(
+                        type=TextSelectorType.TEXT,
+                        autocomplete="username",
+                    )
+                ),
+                vol.Required(CONF_PASSWORD): TextSelector(
+                    TextSelectorConfig(
+                        type=TextSelectorType.PASSWORD,
+                        autocomplete="current-password",
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(step_id="reconfigure", data_schema=data_schema, errors=errors)
 
     async def async_step_cover_controller(self, user_input: dict[str, Any] | None = None):
         """Select which blind controller to configure."""
