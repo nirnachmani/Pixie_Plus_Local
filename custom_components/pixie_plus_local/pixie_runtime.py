@@ -1194,13 +1194,14 @@ class PixieAuthHandler:
     def _derive_sync_53216_nonce(unix_seconds: int, mesh_net2: int) -> int:
         """Derive 53216 nonce from timestamp and meshNet2.
 
-        nonce_high_byte = (meshNet2 >> 16) & 0xFF
-        xor_const       = meshNet2 & 0xFFFFFF
-        nonce_low24     = (unix_seconds & 0xFFFFFF) ^ xor_const
-        nonce           = (nonce_high_byte << 24) | nonce_low24
+        The gateway reconstructs the timestamp from the nonce using:
+          ts_high  = (nonce >> 24) ^ (meshNet2 >> 24)
+          ts_low24 = (nonce & 0xFFFFFF) ^ (meshNet2 & 0xFFFFFF)
+
+        So the nonce must encode the clock so the gateway can recover it.
         """
         xor_const = int(mesh_net2) & 0xFFFFFF
-        nonce_high = (int(mesh_net2) >> 16) & 0xFF
+        nonce_high = ((int(unix_seconds) >> 24) ^ (int(mesh_net2) >> 24)) & 0xFF
         ts_low24 = int(unix_seconds) & 0xFFFFFF
         nonce_low24 = ts_low24 ^ xor_const
         return ((nonce_high << 24) | (nonce_low24 & 0xFFFFFF)) & 0xFFFFFFFF

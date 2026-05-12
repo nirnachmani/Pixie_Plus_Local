@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -38,6 +39,7 @@ CONF_PIXIE_PASSWORD = "pixie_password"
 
 INVENTORY_MODE_LOCAL_53216 = "local_53216"
 INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
+ISSUE_ID_MISSING_FALLBACK_CREDENTIALS = "missing_fallback_credentials"
 
 COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
 INVENTORY_STORE_VERSION = 1
@@ -131,6 +133,40 @@ async def _async_update_entry_runtime_data(
         entry.entry_id,
         inventory_mode,
         " with stored credentials" if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK else " without stored credentials",
+    )
+
+
+def _credentials_issue_id(entry: ConfigEntry) -> str:
+    return f"{ISSUE_ID_MISSING_FALLBACK_CREDENTIALS}_{entry.entry_id}"
+
+
+def _async_create_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _credentials_issue_id(entry),
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=ISSUE_ID_MISSING_FALLBACK_CREDENTIALS,
+        translation_placeholders={
+            "entry_title": entry.title or INTEGRATION_TITLE,
+        },
+    )
+
+
+def _async_delete_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, _credentials_issue_id(entry))
+
+
+def _handler_cloud_params(handler: PixieAuthHandler, fallback: CloudParams) -> CloudParams:
+    return CloudParams(
+        home_id=str(handler.home_id or fallback.home_id),
+        home_name=str(handler.home_name or fallback.home_name),
+        user_id=str(handler.user_id or fallback.user_id),
+        meshnet=str(handler.meshnet or fallback.meshnet),
+        meshnet2=str(handler.meshnet2 or fallback.meshnet2),
+        netid=str(handler.netid_seed or fallback.netid),
     )
 
 
@@ -497,83 +533,126 @@ async def _async_build_runtime_data(
     handler = PixieAuthHandler()
     coordinator: PixiePlusRuntimeCoordinator | None = None
 
-    async def _shutdown_runtime() -> None:
-        runtime_session = handler.runtime_session
+    async def _shutdown_runtime(current_handler: PixieAuthHandler) -> None:
+        runtime_session = current_handler.runtime_session
         if runtime_session is not None:
             await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
 
+    async def _async_start_snapshot_runtime(
+        snapshot_inventory: PixieInventory,
+        *,
+        runtime_mode: str,
+    ) -> tuple[PixieAuthHandler, PixieRuntimeData]:
+        snapshot_handler = PixieAuthHandler()
+        snapshot_handler.inventory = snapshot_inventory
+        snapshot_handler.gateway_identity = snapshot_inventory.gateway
+        snapshot_runtime = await snapshot_handler.async_bootstrap_gateway(
+            cloud_params,
+            username="",
+            password="",
+            keep_control_alive=True,
+            wait_for_shutdown=False,
+            hydrate_inventory=False,
+        )
+        snapshot_runtime.inventory = snapshot_inventory
+        snapshot_runtime.inventory_mode = runtime_mode
+        return snapshot_handler, snapshot_runtime
+
+    async def _async_start_local_inventory_runtime() -> tuple[PixieAuthHandler, PixieRuntimeData]:
+        local_handler = PixieAuthHandler()
+        local_runtime = await local_handler.async_bootstrap_gateway(
+            cloud_params,
+            username="",
+            password="",
+            keep_control_alive=True,
+            wait_for_shutdown=False,
+        )
+        local_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
+        return local_handler, local_runtime
+
+    async def _async_start_cloud_fallback_runtime() -> tuple[PixieAuthHandler, PixieRuntimeData, CloudParams]:
+        fallback_handler = PixieAuthHandler()
+        refreshed_cloud_params = await fallback_handler.async_fetch_cloud_params(
+            username,
+            password,
+            include_inventory_seed=True,
+        )
+        fallback_runtime = await fallback_handler.async_bootstrap_gateway(
+            refreshed_cloud_params,
+            username=username,
+            password=password,
+            keep_control_alive=True,
+            wait_for_shutdown=False,
+            hydrate_inventory=False,
+        )
+        fallback_runtime.inventory_mode = INVENTORY_MODE_CLOUD_FALLBACK
+        if fallback_runtime.inventory is None:
+            fallback_runtime.inventory = fallback_handler.inventory
+        return fallback_handler, fallback_runtime, refreshed_cloud_params
+
     try:
-        if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
-            LOGGER.warning(
-                "Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup"
-            )
-            if not username or not password:
-                raise ConfigEntryError("Cloud fallback mode requires stored Pixie credentials")
-            try:
-                LOGGER.debug("Refreshing Pixie inventory from cloud for entry %s", entry.entry_id)
-                refreshed_cloud_params = await handler.async_fetch_cloud_params(
-                    username,
-                    password,
-                    include_inventory_seed=True,
-                )
-                cloud_params = refreshed_cloud_params
+        LOGGER.debug("Trying direct local Pixie inventory startup for entry %s", entry.entry_id)
+        handler, pixie_runtime = await _async_start_local_inventory_runtime()
+
+        if pixie_runtime.inventory is not None:
+            _async_delete_missing_credentials_issue(hass, entry)
+            if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+                LOGGER.info("Pixie entry %s recovered direct local inventory; switching to local_53216 mode", entry.entry_id)
                 await _async_update_entry_runtime_data(
                     hass,
                     entry,
                     cloud_params,
-                    inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
-                    username=username,
-                    password=password,
-                )
-            except Exception as err:
-                if persisted_inventory is None:
-                    raise ConfigEntryNotReady(f"Pixie cloud refresh failed and no stored inventory is available: {err}") from err
-                LOGGER.warning("Pixie cloud refresh failed; using stored inventory snapshot: %s", err)
-                handler.inventory = persisted_inventory
-                handler.gateway_identity = persisted_inventory.gateway
-
-            pixie_runtime = await handler.async_bootstrap_gateway(
-                cloud_params,
-                username=username,
-                password=password,
-                keep_control_alive=True,
-                wait_for_shutdown=False,
-                hydrate_inventory=False,
-            )
-            pixie_runtime.inventory_mode = INVENTORY_MODE_CLOUD_FALLBACK
-            if pixie_runtime.inventory is None:
-                pixie_runtime.inventory = handler.inventory
-            LOGGER.debug("Pixie entry %s using cloud-assisted inventory mode", entry.entry_id)
-        else:
-            LOGGER.debug("Trying direct local Pixie inventory startup for entry %s", entry.entry_id)
-            pixie_runtime = await handler.async_bootstrap_gateway(
-                cloud_params,
-                username="",
-                password="",
-                keep_control_alive=True,
-                wait_for_shutdown=False,
-            )
-            pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
-            if pixie_runtime.inventory is None:
-                if persisted_inventory is None:
-                    raise ConfigEntryNotReady("Pixie startup inventory unavailable and no stored inventory snapshot exists")
-                LOGGER.warning("Direct local Pixie inventory startup failed; using stored inventory snapshot")
-                await _shutdown_runtime()
-                handler = PixieAuthHandler()
-                handler.inventory = persisted_inventory
-                handler.gateway_identity = persisted_inventory.gateway
-                pixie_runtime = await handler.async_bootstrap_gateway(
-                    cloud_params,
+                    inventory_mode=INVENTORY_MODE_LOCAL_53216,
                     username="",
                     password="",
-                    keep_control_alive=True,
-                    wait_for_shutdown=False,
-                    hydrate_inventory=False,
                 )
-                pixie_runtime.inventory = persisted_inventory
-                pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
+            pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
+        else:
+            LOGGER.warning("Direct local Pixie inventory startup failed for entry %s", entry.entry_id)
+            await _shutdown_runtime(handler)
+
+            if username and password:
+                try:
+                    handler, pixie_runtime, cloud_params = await _async_start_cloud_fallback_runtime()
+                    _async_delete_missing_credentials_issue(hass, entry)
+                    if inventory_mode != INVENTORY_MODE_CLOUD_FALLBACK:
+                        LOGGER.warning(
+                            "Pixie direct local inventory failed; switching entry %s to cloud fallback mode",
+                            entry.entry_id,
+                        )
+                    await _async_update_entry_runtime_data(
+                        hass,
+                        entry,
+                        _handler_cloud_params(handler, cloud_params),
+                        inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
+                        username=username,
+                        password=password,
+                    )
+                    cloud_params = _handler_cloud_params(handler, cloud_params)
+                except Exception as err:
+                    if persisted_inventory is None:
+                        raise ConfigEntryNotReady(
+                            f"Pixie live inventory unavailable and no stored inventory snapshot exists: {err}"
+                        ) from err
+                    LOGGER.warning("Pixie live inventory failed; using stored inventory snapshot: %s", err)
+                    handler, pixie_runtime = await _async_start_snapshot_runtime(
+                        persisted_inventory,
+                        runtime_mode=inventory_mode,
+                    )
             else:
-                LOGGER.debug("Direct local Pixie inventory startup succeeded for entry %s", entry.entry_id)
+                if persisted_inventory is None:
+                    _async_create_missing_credentials_issue(hass, entry)
+                    raise ConfigEntryError(
+                        "Pixie direct local inventory failed and Pixie credentials are required for cloud fallback"
+                    )
+                LOGGER.warning(
+                    "Direct local Pixie inventory failed with no stored Pixie credentials; using stored inventory snapshot"
+                )
+                _async_create_missing_credentials_issue(hass, entry)
+                handler, pixie_runtime = await _async_start_snapshot_runtime(
+                    persisted_inventory,
+                    runtime_mode=inventory_mode,
+                )
 
         coordinator = PixiePlusRuntimeCoordinator(hass, entry, pixie_runtime)
         handler.set_inventory_update_callback(
@@ -582,10 +661,10 @@ async def _async_build_runtime_data(
         await coordinator.async_config_entry_first_refresh()
         await _async_save_inventory_snapshot(hass, entry, pixie_runtime.inventory)
     except PixieAuthError as err:
-        await _shutdown_runtime()
+        await _shutdown_runtime(handler)
         raise ConfigEntryNotReady(str(err)) from err
     except Exception:
-        await _shutdown_runtime()
+        await _shutdown_runtime(handler)
         raise
 
     runtime_data = PixiePlusConfigEntryRuntimeData(
