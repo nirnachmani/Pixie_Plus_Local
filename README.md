@@ -11,7 +11,7 @@ Pixie Plus Local is using cloud-assisted inventory mode because direct local inv
 
 Pixie Plus Local is a Home Assistant custom integration for SAL Pixie Plus devices.
 
-Unlike the older Pixie Plus integration, this one controls the hub locally over your LAN instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata the hub requires for local access, but after that the integration runs against the hub directly. I attempted to implement Bluetooth support as well but Pixie Plus devices are not compatible with Home Assistant Bluetooth (Pixie devices ignore CCCD write which is required for a successful handshake.) As such, the integration still requires a Pixie Gateway to work. 
+Unlike the older Pixie Plus integration, this one controls the gateway locally over your LAN instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata required for local access, but after that the integration runs against the gateway directly. I attempted to implement Bluetooth support as well but Pixie Plus devices are not compatible with Home Assistant Bluetooth (Pixie devices ignore CCCD write which is required for a successful handshake.) As such, the integration still requires a Pixie Gateway to work. 
 
 ## Features
 
