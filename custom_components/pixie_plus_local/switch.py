@@ -125,9 +125,12 @@ class PixiePlusSwitchEntity(PixiePlusCoordinatorEntity, SwitchEntity):
     def is_on(self) -> bool | None:
         runtime = self.record.runtime
         target = self.endpoint.command_target
+        endpoint_key = self.endpoint.endpoint_key
 
         if target == "usb":
             return bool(runtime.r & 0x02) if isinstance(runtime.r, int) else None
+        if endpoint_key == "main" and self.record.capabilities.supports_usb_subentity:
+            return bool(runtime.r & 0x01) if isinstance(runtime.r, int) else runtime.is_on
         if target == "left":
             return bool(runtime.r & 0x01) if isinstance(runtime.r, int) else None
         if target == "right":
