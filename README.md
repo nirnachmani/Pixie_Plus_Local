@@ -47,6 +47,7 @@ The current code includes support for these model families:
 - Flexi Smart LED Strip - FLP12V2M/RGBBT
 - Flexi Streamline - FLP24V2M
 - LED Strip Controller - LT8915DIM/BT
+- Smart Passive Infrared Motion Sensor - SMS861CD/BTAM 
 
 For compatible models, the integration supports on/off, dimming, RGB color, and built-in effects where those capabilities exist.
 
