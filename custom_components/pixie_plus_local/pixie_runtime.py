@@ -523,7 +523,8 @@ class PixieAuthHandler:
         self.stored_username: Optional[str] = None
         self.stored_password: Optional[str] = None
         self.inventory_mode: str = "local_53216"
-        self._command_counter = 0x10  # Start at 0x10 to match app UI: 10, 11, 12, 13...
+        self._command_counter = 0x10  # App-style brightness/cover commands observed starting at 0x10.
+        self._mode_command_counter = 0x01  # Captured 3001 mode commands observed starting at 0x01.
         self._cached_cloud_home_obj: Optional[Dict[str, Any]] = None
         self._pending_bulk_ble_updates: List[Dict[str, Any]] = []
         self._pending_bulk_lock = threading.Lock()
@@ -697,6 +698,7 @@ class PixieAuthHandler:
         command_white: bool,
         command_effect: Optional[str],
         command_target: Optional[str],
+        command_mode: Optional[int],
         command_cover_action: Optional[str],
         command_cover_action_map: Optional[Dict[str, int]],
         command_cover_tilt_action_map: Optional[Dict[str, int]],
@@ -716,6 +718,7 @@ class PixieAuthHandler:
                 "command_white": command_white,
                 "command_effect": command_effect,
                 "command_target": command_target,
+                "command_mode": command_mode,
                 "command_cover_action": command_cover_action,
                 "command_cover_action_map": command_cover_action_map,
                 "command_cover_tilt_action_map": command_cover_tilt_action_map,
@@ -911,6 +914,7 @@ class PixieAuthHandler:
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
+        command_mode: Optional[int] = None,
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
@@ -937,6 +941,7 @@ class PixieAuthHandler:
             command_white=command_white,
             command_effect=command_effect,
             command_target=command_target,
+            command_mode=command_mode,
             command_cover_action=command_cover_action,
             command_cover_action_map=command_cover_action_map,
             command_cover_tilt_action_map=command_cover_tilt_action_map,
@@ -1031,6 +1036,7 @@ class PixieAuthHandler:
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
+        command_mode: Optional[int] = None,
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
@@ -1051,7 +1057,7 @@ class PixieAuthHandler:
             command_brightness: Optional brightness 0-100 for brightness command
             command_color_rgb: Optional RGB tuple for color command
             command_white: Whether color command was requested via --white
-            command_effect: Optional effect name command
+            command_mode: Optional mode command (0=manual, 1=sensor)
             command_target: Optional target endpoint for on/off command (relay|usb|left|right|both)
             command_cover_action: Optional cover action command
 
@@ -1120,6 +1126,7 @@ class PixieAuthHandler:
             command_white=command_white,
             command_effect=command_effect,
             command_target=command_target,
+            command_mode=command_mode,
             command_cover_action=command_cover_action,
             command_cover_action_map=command_cover_action_map,
             command_cover_tilt_action_map=command_cover_tilt_action_map,
@@ -1920,6 +1927,7 @@ class PixieAuthHandler:
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
+        command_mode: Optional[int] = None,
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
@@ -2132,6 +2140,31 @@ class PixieAuthHandler:
                     decoded["records"] = records
                     return decoded
 
+            # 3001 command-style c16969 payload carries mode/relay explicitly.
+            # Captured format:
+            # [seq3][src_le=0304][dst_le][c16969][03][mode][relay][00][00][00][01][1e][00][00]
+            mode_command = self._decode_sensor_mode_command(raw)
+            if mode_command is not None:
+                decoded["kind"] = "single"
+                decoded["opcode"] = "c16969"
+                decoded["device_id"] = mode_command["device_id"]
+                decoded["mode"] = mode_command["mode"]
+                decoded["relay"] = mode_command["relay"]
+                decoded["records"] = [{
+                    "id": decoded["device_id"],
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": 100 if decoded["relay"] else 0},
+                    "mode": decoded["mode"],
+                    "relay": decoded["relay"],
+                    "rgb": None,
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "sequence_or_counter": None,
+                }]
+                return decoded
+
             # Command-style c16969 payloads can carry RGB + brightness directly.
             # Format observed on local command path:
             # [seq3][src_le=0304][dst_le][00][c1][69][69][R][G][B][brightness]
@@ -2274,6 +2307,17 @@ class PixieAuthHandler:
                 if br_from_packet is not None:
                     update_kwargs["br"] = br_from_packet
 
+            mode_from_packet = first.get("mode")
+            relay_from_packet = first.get("relay")
+            motion_from_packet = first.get("motion")
+            if isinstance(mode_from_packet, int):
+                update_kwargs["mode"] = mode_from_packet
+            if isinstance(relay_from_packet, int):
+                update_kwargs["relay"] = relay_from_packet
+                update_kwargs["br"] = 100 if relay_from_packet else 0
+            if isinstance(motion_from_packet, bool):
+                update_kwargs["motion"] = motion_from_packet
+
             if isinstance(value_byte, int):
                 interpreted = decode_value_byte(rec.model_no, value_byte)
                 self._log_debug(
@@ -2303,6 +2347,17 @@ class PixieAuthHandler:
                     usb_on = bool(interpreted.get("usb_on"))
                     update_kwargs["r"] = (1 if relay_on else 0) | (2 if usb_on else 0)
                     update_kwargs["br"] = 100 if relay_on else 0
+                elif mode == "sensor_controller":
+                    mode_value = interpreted.get("mode_value")
+                    relay_on = interpreted.get("relay_on")
+                    motion = interpreted.get("motion")
+                    if isinstance(mode_value, int):
+                        update_kwargs["mode"] = mode_value
+                    if isinstance(relay_on, bool):
+                        update_kwargs["relay"] = 1 if relay_on else 0
+                        update_kwargs["br"] = 100 if relay_on else 0
+                    if isinstance(motion, bool):
+                        update_kwargs["motion"] = motion
                 elif mode == "raw":
                     # Raw on/off-only models use the value byte directly.
                     # Keep tail-derived fields for debugging only until their
@@ -2420,6 +2475,20 @@ class PixieAuthHandler:
             elif target == "cover":
                 # Cover commands are button presses, not authoritative state updates.
                 pass
+            elif target == "mode":
+                # Sensor controller mode command: 1=sensor, 0=manual.
+                # Both mode commands default relay to off.
+                mode_value = int(value)
+                update_kwargs["mode"] = mode_value
+                update_kwargs["relay"] = 0
+                update_kwargs["motion"] = False
+                update_kwargs["br"] = 0
+            elif target == "relay" and rec.capabilities.supports_mode:
+                # 3001 manual light control uses relay in manual mode.
+                update_kwargs["mode"] = 0
+                update_kwargs["relay"] = 1 if value else 0
+                update_kwargs["motion"] = False
+                update_kwargs["br"] = 100 if value else 0
             elif rec.model_no == "2213":
                 update_kwargs["br"] = 100 if value else 0
             elif rec.model_no == "0107":
@@ -2447,10 +2516,17 @@ class PixieAuthHandler:
                 update_kwargs["br"] = 100 if value else 0
 
             if target in ("left", "right", "both"):
+                current_r = rec.runtime.r if isinstance(rec.runtime.r, int) else 0
                 if target == "left":
-                    update_kwargs["r"] = 1 if value else 0
+                    if value:
+                        update_kwargs["r"] = current_r | 0x01
+                    else:
+                        update_kwargs["r"] = current_r & ~0x01
                 elif target == "right":
-                    update_kwargs["r"] = 2 if value else 0
+                    if value:
+                        update_kwargs["r"] = current_r | 0x02
+                    else:
+                        update_kwargs["r"] = current_r & ~0x02
                 else:
                     update_kwargs["r"] = 3 if value else 0
 
@@ -2459,7 +2535,11 @@ class PixieAuthHandler:
                     "opcode": opcode_name,
                     "device_id": int(device_id),
                     "target": target,
-                    "requested_state": f"{value}" if target in ("brightness", "color", "effect", "speed", "cover") else ("on" if value else "off"),
+                    "requested_state": (
+                        f"{value}"
+                        if target in ("brightness", "color", "effect", "speed", "cover", "mode")
+                        else ("on" if value else "off")
+                    ),
                     "command_hex": command_hex,
                     "brightness_level": brightness_level,
                     "rgb_color": list(rgb_color) if rgb_color is not None else None,
@@ -2477,20 +2557,29 @@ class PixieAuthHandler:
             if updated_runtime is None:
                 return
 
+            prev_mode = rec.runtime.mode
+            prev_relay = rec.runtime.relay
+            prev_motion = rec.runtime.motion
+            
+            summary_parts = [
+                f"br {prev_br}->{updated_runtime.br}",
+                f"rgb {prev_rgb}->{updated_runtime.rgb}",
+                f"effect {prev_effect}->{updated_runtime.effect}",
+                f"speed {prev_effect_speed}->{updated_runtime.effect_speed}",
+                f"r {prev_r}->{updated_runtime.r}",
+            ]
+            if prev_mode != updated_runtime.mode:
+                summary_parts.append(f"mode {prev_mode}->{updated_runtime.mode}")
+            if prev_relay != updated_runtime.relay:
+                summary_parts.append(f"relay {prev_relay}->{updated_runtime.relay}")
+            if prev_motion != updated_runtime.motion:
+                summary_parts.append(f"motion {prev_motion}->{updated_runtime.motion}")
+            
             self._log_debug(
-                "Inventory optimistic update: id=%s name=%s br %s->%s rgb %s->%s effect %s->%s speed %s->%s r %s->%s src %s->%s",
+                "Inventory optimistic update: id=%s name=%s %s src %s->%s",
                 rec.id,
                 rec.name,
-                prev_br,
-                updated_runtime.br,
-                prev_rgb,
-                updated_runtime.rgb,
-                prev_effect,
-                updated_runtime.effect,
-                prev_effect_speed,
-                updated_runtime.effect_speed,
-                prev_r,
-                updated_runtime.r,
+                " ".join(summary_parts),
                 prev_source,
                 updated_runtime.last_source,
             )
@@ -2518,6 +2607,7 @@ class PixieAuthHandler:
             command_color_rgb: Optional[Tuple[int, int, int]] = None,
             command_effect: Optional[str] = None,
             command_target: Optional[str] = None,
+            command_mode: Optional[int] = None,
             command_cover_action: Optional[str] = None,
             command_cover_action_map: Optional[Dict[str, int]] = None,
             command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
@@ -2555,6 +2645,7 @@ class PixieAuthHandler:
             is_effect_cmd = command_effect is not None
             is_color_cmd = command_color_rgb is not None
             is_brightness_cmd = (command_brightness is not None) and not is_color_cmd and not is_effect_cmd and not is_cover_cmd
+            is_mode_cmd = command_mode is not None
             state_byte_used = None
 
             rec = None
@@ -2566,6 +2657,9 @@ class PixieAuthHandler:
 
             if is_cover_cmd and rec and not rec.capabilities.supports_cover:
                 raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
+
+            if is_mode_cmd and rec and not rec.capabilities.supports_mode:
+                raise PixieAuthError(f"Model {rec.model_no} does not support mode commands")
 
             if is_effect_cmd and rec:
                 allowed_effects = rec.capabilities.effect_names or get_model_effect_names(rec.model_no)
@@ -2683,24 +2777,55 @@ class PixieAuthHandler:
                 if self.verbose:
                     self._log_debug("Brightness command hex: %s", command_hex)
                     self._print_local_command_debug(command_debug)
+            elif is_mode_cmd:
+                command_hex = self._build_mode_command_hex(
+                    command_device_id,
+                    mode=int(command_mode),
+                )
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug(
+                    "Sending mode command: device_id=%s mode=%s relay=0 opcode=c16969",
+                    command_device_id,
+                    command_mode,
+                )
+                if self.verbose:
+                    self._log_debug("Mode command hex: %s", command_hex)
+                    self._print_local_command_debug(command_debug)
             else:
                 effective_target = self._resolve_command_target_for_device(
                     command_device_id,
                     command_target,
                 )
-                command_spec = self._resolve_onoff_command_spec(effective_target)
-                if effective_target == "usb":
-                    command_hex, state_byte_used = self._build_0107_usb_command_hex(
+                if rec and rec.capabilities.supports_mode and effective_target == "relay":
+                    command_hex = self._build_mode_command_hex(
                         command_device_id,
-                        is_on=command_state,
+                        mode=0,
+                        relay=1 if bool(command_state) else 0,
                     )
+                    command_spec = {
+                        "label": "relay/main",
+                        "opcode_name": "c16969",
+                        "selector": 0,
+                    }
                 else:
-                    command_hex = self._build_6969_onoff_command_hex(
-                        command_device_id,
-                        is_on=command_state,
-                        opcode=command_spec["opcode"],
-                        selector=command_spec["selector"],
-                    )
+                    command_spec = self._resolve_onoff_command_spec(effective_target)
+                    if effective_target == "usb":
+                        command_hex, state_byte_used = self._build_0107_usb_command_hex(
+                            command_device_id,
+                            is_on=command_state,
+                        )
+                    else:
+                        command_hex = self._build_6969_onoff_command_hex(
+                            command_device_id,
+                            is_on=command_state,
+                            opcode=command_spec["opcode"],
+                            selector=command_spec["selector"],
+                        )
                 command_debug = self._build_local_bledata_command_debug(
                     key=extracted_key,
                     command_hex=command_hex,
@@ -2772,6 +2897,15 @@ class PixieAuthHandler:
                     effect_speed=effect_speed,
                 )
                 return {"target": "effect", "device_id": command_device_id}
+            if is_mode_cmd:
+                _apply_local_command_optimistic_update(
+                    command_device_id,
+                    int(command_mode),
+                    command_hex,
+                    target="mode",
+                    opcode_name="c16969",
+                )
+                return {"target": "mode", "device_id": command_device_id}
 
             _apply_local_command_optimistic_update(
                 command_device_id,
@@ -3005,7 +3139,14 @@ class PixieAuthHandler:
                 # Optional command send after the session is authenticated.
                 has_any_command = any(
                     value is not None
-                    for value in (command_state, command_brightness, command_color_rgb, command_effect, command_cover_action)
+                    for value in (
+                        command_state,
+                        command_brightness,
+                        command_color_rgb,
+                        command_effect,
+                        command_mode,
+                        command_cover_action,
+                    )
                 )
                 if command_device_id is not None and has_any_command:
                     try:
@@ -3016,6 +3157,7 @@ class PixieAuthHandler:
                             command_color_rgb=command_color_rgb,
                             command_effect=command_effect,
                             command_target=command_target,
+                            command_mode=command_mode,
                             command_cover_action=command_cover_action,
                             command_cover_action_map=command_cover_action_map,
                             command_cover_tilt_action_map=command_cover_tilt_action_map,
@@ -3134,30 +3276,53 @@ class PixieAuthHandler:
             self._command_counter = 0x10
         counter_byte = (self._command_counter & 0xFF).to_bytes(1, byteorder="little")
         self._command_counter = (self._command_counter + 1) & 0xFF
-        if self._command_counter > 0xFF:
+        if self._command_counter < 0x10:
             self._command_counter = 0x10
         cmd_type_byte = cmd_type.to_bytes(1, byteorder="little")
         return counter_byte + cmd_type_byte + bytes([0x04])
 
-    def _next_brightness_sequence(self) -> bytes:
-        """Return the captured 3-byte dimmer command prefix.
+    def _next_shifted_sequence(self, *, counter_attr: str, minimum_counter: int) -> bytes:
+        """Return the captured 3-byte rolling prefix [counter][counter>>1][counter>>2]."""
+        counter_value = int(getattr(self, counter_attr, minimum_counter)) & 0xFF
+        minimum = max(0x01, int(minimum_counter) & 0xFF)
+        if counter_value < minimum:
+            counter_value = minimum
 
-        Local dimmer brightness frames use [counter][counter>>1][counter>>2]
-        rather than the relay/USB [counter][cmd_type][04] prefix.
-        """
-        if self._command_counter < 0x10:
-            self._command_counter = 0x10
-
-        counter = self._command_counter & 0xFF
-        self._command_counter = (self._command_counter + 1) & 0xFF
-        if self._command_counter < 0x10:
-            self._command_counter = 0x10
+        next_counter = (counter_value + 1) & 0xFF
+        if next_counter < minimum:
+            next_counter = minimum
+        setattr(self, counter_attr, next_counter)
 
         return bytes([
-            counter,
-            (counter >> 1) & 0xFF,
-            (counter >> 2) & 0xFF,
+            counter_value,
+            (counter_value >> 1) & 0xFF,
+            (counter_value >> 2) & 0xFF,
         ])
+
+    def _next_brightness_sequence(self) -> bytes:
+        """Return the captured 3-byte dimmer/cover command prefix."""
+        return self._next_shifted_sequence(counter_attr="_command_counter", minimum_counter=0x10)
+
+    def _build_sensor_mode_payload(self, *, mode: int, relay: int) -> bytes:
+        """Return the captured 3001 mode payload after c16969."""
+        return bytes([0x03, int(mode) & 0xFF, int(relay) & 0xFF, 0x00, 0x00, 0x00, 0x01, 0x1E, 0x00, 0x00])
+
+    def _decode_sensor_mode_command(self, raw: bytes) -> Optional[Dict[str, int]]:
+        """Decode the captured 3001 c16969 mode command layout."""
+        if len(raw) != 20:
+            return None
+        if raw[7:10] != b"\xc1ii":
+            return None
+        if raw[10] != 0x03:
+            return None
+        if raw[13:] != b"\x00\x00\x00\x01\x1e\x00\x00":
+            return None
+
+        return {
+            "device_id": int(raw[5]),
+            "mode": int(raw[11]),
+            "relay": int(raw[12]),
+        }
 
     def _build_6969_onoff_command_hex(
         self,
@@ -3314,6 +3479,33 @@ class PixieAuthHandler:
         src_bytes = (1027).to_bytes(2, byteorder="little")
         dst_bytes = int(destination_id).to_bytes(2, byteorder="little", signed=False)
         payload = b"\x00\x00\x00" + bytes([(int(button_position) - 1) & 0xFF])
+        packet = sequence + src_bytes + dst_bytes + bytes([0xC1, 0x69, 0x69]) + payload
+        return packet.hex()
+
+    def _build_mode_command_hex(
+        self,
+        destination_id: int,
+        *,
+        mode: int,
+        relay: int = 0,
+    ) -> str:
+        """Build c16969 mode/relay command for sensor controllers (model 3001).
+
+        Captured payload bytes after c16969 are:
+        [0x03][mode][relay][00][00][00][01][1e][00][00]
+        where mode: 0=manual, 1=sensor and relay: 0=off, 1=on.
+
+        Captured prefix uses the rolling 3-byte form, starting 01 00 00.
+        """
+        if mode not in (0, 1):
+            raise PixieAuthError(f"Mode must be 0 (manual) or 1 (sensor), got {mode}")
+        if relay not in (0, 1):
+            raise PixieAuthError(f"Relay must be 0 (off) or 1 (on), got {relay}")
+
+        sequence = self._next_shifted_sequence(counter_attr="_mode_command_counter", minimum_counter=0x01)
+        src_bytes = (1027).to_bytes(2, byteorder="little")
+        dst_bytes = int(destination_id).to_bytes(2, byteorder="little", signed=False)
+        payload = self._build_sensor_mode_payload(mode=mode, relay=relay)
         packet = sequence + src_bytes + dst_bytes + bytes([0xC1, 0x69, 0x69]) + payload
         return packet.hex()
 

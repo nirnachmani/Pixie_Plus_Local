@@ -91,6 +91,16 @@
         "name": "Switch"
       }
     },
+    "select": {
+      "mode": {
+        "name": "Mode"
+      }
+    },
+    "binary_sensor": {
+      "sensor_light_state": {
+        "name": "Sensor light state"
+      }
+    },
     "cover": {
       "blind": {
         "name": "Blind"

@@ -25,7 +25,7 @@ LOGGER = logging.getLogger(__name__)
 DOMAIN = "pixie_plus_local"
 MANUFACTURER = "SAL - Pixie Plus"
 INTEGRATION_TITLE = "Pixie Plus Local"
-PLATFORMS: tuple[str, ...] = ("light", "switch", "cover")
+PLATFORMS: tuple[str, ...] = ("light", "switch", "cover", "select", "binary_sensor")
 
 CONF_HOME_ID = "home_id"
 CONF_HOME_NAME = "home_name"

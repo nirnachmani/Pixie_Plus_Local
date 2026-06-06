@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 import json
 
-from .pixie_value_profiles import get_model_capabilities, hardware_list
+from .pixie_value_profiles import decode_value_byte, get_model_capabilities, hardware_list
 
 
 STATE_UNSET = object()
@@ -27,18 +27,45 @@ def online_value_is_online(value: Any) -> bool:
         return False
 
 
+def _normalize_optional_int(value: Any) -> Optional[int]:
+    """Normalize optional numeric fields that may arrive as int-like strings."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+    return None
+
+
 def derive_is_on_from_state(
     capabilities: "DeviceCapabilities",
     br: Optional[int],
     r: Optional[int],
+    mode: Optional[int] = None,
+    relay: Optional[int] = None,
 ) -> Optional[bool]:
     """Derive an on/off state from the current runtime fields.
 
     The protocol does not expose a universal is_on field, so this mirrors the
     current model-family rules used elsewhere in the codebase.
+    
+    For sensor controllers (supports_mode), relay directly indicates on/off state.
     """
     if capabilities.supports_cover:
         return None
+
+    # Sensor controller devices (e.g., 3001) use relay field for on/off.
+    if capabilities.supports_mode and isinstance(relay, int):
+        return relay != 0
 
     if capabilities.supports_multi_channel or capabilities.supports_usb_subentity:
         if isinstance(r, int):
@@ -113,6 +140,9 @@ class RuntimeState:
     effect: Optional[str] = None
     effect_speed: Optional[int] = None
     r: Optional[int] = None
+    mode: Optional[int] = None
+    relay: Optional[int] = None
+    motion: Optional[bool] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     last_source: str = "cloud_seed"
     last_updated_ms: Optional[int] = None
@@ -127,6 +157,9 @@ class RuntimeState:
             "effect": self.effect,
             "effect_speed": self.effect_speed,
             "r": self.r,
+            "mode": self.mode,
+            "relay": self.relay,
+            "motion": self.motion,
             "raw": self.raw,
             "last_source": self.last_source,
             "last_updated_ms": self.last_updated_ms,
@@ -138,11 +171,14 @@ class RuntimeState:
             online=data.get("online"),
             presence=str(data.get("presence") or "offline"),
             is_on=data.get("is_on"),
-            br=data.get("br"),
+            br=_normalize_optional_int(data.get("br")),
             rgb=list(data.get("rgb")) if isinstance(data.get("rgb"), list) else None,
             effect=data.get("effect"),
             effect_speed=data.get("effect_speed"),
-            r=data.get("r"),
+            r=_normalize_optional_int(data.get("r")),
+            mode=_normalize_optional_int(data.get("mode")),
+            relay=_normalize_optional_int(data.get("relay")),
+            motion=data.get("motion"),
             raw=dict(data.get("raw") or {}),
             last_source=str(data.get("last_source") or "snapshot"),
             last_updated_ms=data.get("last_updated_ms"),
@@ -175,6 +211,9 @@ class DeviceStateStore:
         effect: Any = STATE_UNSET,
         effect_speed: Any = STATE_UNSET,
         r: Any = STATE_UNSET,
+        mode: Any = STATE_UNSET,
+        relay: Any = STATE_UNSET,
+        motion: Any = STATE_UNSET,
         raw: Any = STATE_UNSET,
         updated_ms: Optional[int] = None,
     ) -> Optional[RuntimeState]:
@@ -193,7 +232,7 @@ class DeviceStateStore:
             runtime.presence = "online" if online_value_is_online(online) else "offline"
 
         if br is not STATE_UNSET:
-            runtime.br = br
+            runtime.br = _normalize_optional_int(br)
         if rgb is not STATE_UNSET:
             runtime.rgb = list(rgb) if isinstance(rgb, list) else rgb
         if effect is not STATE_UNSET:
@@ -201,7 +240,13 @@ class DeviceStateStore:
         if effect_speed is not STATE_UNSET:
             runtime.effect_speed = effect_speed
         if r is not STATE_UNSET:
-            runtime.r = r
+            runtime.r = _normalize_optional_int(r)
+        if mode is not STATE_UNSET:
+            runtime.mode = _normalize_optional_int(mode)
+        if relay is not STATE_UNSET:
+            runtime.relay = _normalize_optional_int(relay)
+        if motion is not STATE_UNSET:
+            runtime.motion = motion
         if raw is not STATE_UNSET:
             runtime.raw = raw
 
@@ -209,6 +254,8 @@ class DeviceStateStore:
             inv_rec.capabilities,
             runtime.br,
             runtime.r,
+            runtime.mode,
+            runtime.relay,
         )
         runtime.last_source = source
         runtime.last_updated_ms = updated_ms if updated_ms is not None else int(datetime.now().timestamp() * 1000)
@@ -244,10 +291,39 @@ class DeviceStateStore:
             online_value = rec_data.get("online")
             update_br = STATE_UNSET
             update_r = STATE_UNSET
+            update_mode = STATE_UNSET
+            update_relay = STATE_UNSET
+            update_motion = STATE_UNSET
+
+            # Handle mode/relay for sensor controller devices (e.g., 3001).
+            mode_val = rec_data.get("mode")
+            if _normalize_optional_int(mode_val) is not None:
+                update_mode = mode_val
+
+            relay_val = rec_data.get("relay")
+            if _normalize_optional_int(relay_val) is not None:
+                update_relay = relay_val
 
             br_obj = rec_data.get("br")
             if isinstance(br_obj, dict):
-                if br_obj.get("type") == "single":
+                if inv_rec.model_no == "3001":
+                    raw_value = br_obj.get("raw")
+                    if isinstance(raw_value, int):
+                        interpreted = decode_value_byte(inv_rec.model_no, raw_value)
+                        if interpreted.get("mode") == "sensor_controller":
+                            mode_value = interpreted.get("mode_value")
+                            relay_on = interpreted.get("relay_on")
+                            motion = interpreted.get("motion")
+
+                            if update_mode is STATE_UNSET and isinstance(mode_value, int):
+                                update_mode = mode_value
+                            if update_relay is STATE_UNSET and isinstance(relay_on, bool):
+                                update_relay = 1 if relay_on else 0
+                            if isinstance(relay_on, bool):
+                                update_br = 100 if relay_on else 0
+                            if isinstance(motion, bool):
+                                update_motion = motion
+                elif br_obj.get("type") == "single":
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
                         update_br = max(0, min(100, int(pct)))
@@ -273,6 +349,9 @@ class DeviceStateStore:
                 online=online_value,
                 br=update_br,
                 r=update_r,
+                mode=update_mode,
+                relay=update_relay,
+                motion=update_motion,
                 updated_ms=now_ms,
             )
             if runtime is None:
@@ -322,6 +401,7 @@ class DeviceCapabilities:
     supports_multi_channel: bool = False
     supports_usb_subentity: bool = False
     supports_cover: bool = False
+    supports_mode: bool = False
     capability_hints: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -336,6 +416,7 @@ class DeviceCapabilities:
             "supports_multi_channel": self.supports_multi_channel,
             "supports_usb_subentity": self.supports_usb_subentity,
             "supports_cover": self.supports_cover,
+            "supports_mode": self.supports_mode,
             "capability_hints": dict(self.capability_hints),
         }
 
@@ -352,6 +433,7 @@ class DeviceCapabilities:
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
             supports_cover=bool(data.get("supports_cover", False)),
+            supports_mode=bool(data.get("supports_mode", False)),
             capability_hints=dict(data.get("capability_hints") or {}),
         )
 
@@ -450,6 +532,7 @@ class PixieInventory:
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
         cap.supports_cover = model_caps["supports_cover"]
+        cap.supports_mode = model_caps["supports_mode"]
 
         cap.capability_hints = {
             "model_no": model_no,
@@ -517,8 +600,10 @@ class PixieInventory:
             runtime_state = RuntimeState(
                 online=online_value,
                 presence="online" if is_online else "offline",
-                br=online.get("br"),
-                r=online.get("r"),
+                br=_normalize_optional_int(online.get("br")),
+                r=_normalize_optional_int(online.get("r")),
+                mode=_normalize_optional_int(online.get("mode")),
+                relay=_normalize_optional_int(online.get("relay")),
                 raw=dict(online),
                 last_source=source,
                 last_updated_ms=now_ms,
@@ -527,6 +612,8 @@ class PixieInventory:
                 rec.capabilities,
                 runtime_state.br,
                 runtime_state.r,
+                runtime_state.mode,
+                runtime_state.relay,
             )
             rec.runtime = inv.state_store.bind(rec.id, runtime_state)
 
@@ -628,9 +715,11 @@ class PixieInventory:
                 caps.append("usb_subentity")
             if d.capabilities.supports_cover:
                 caps.append("cover")
+            if d.capabilities.supports_mode:
+                caps.append("mode")
 
             lines.append(
-                " - id={id} model={model} name={name} caps=[{caps}] state_seed=(presence={presence}, is_on={is_on}, br={br}, r={r}) src={src}".format(
+                " - id={id} model={model} name={name} caps=[{caps}] state_seed=(presence={presence}, is_on={is_on}, br={br}, r={r}, mode={mode}, relay={relay}) src={src}".format(
                     id=d.id,
                     model=d.model_no,
                     name=d.name,
@@ -639,6 +728,8 @@ class PixieInventory:
                     is_on=d.runtime.is_on,
                     br=d.runtime.br,
                     r=d.runtime.r,
+                    mode=d.runtime.mode,
+                    relay=d.runtime.relay,
                     src=d.runtime.last_source,
                 )
             )
@@ -700,12 +791,14 @@ class PixieInventory:
                 f"   capability_hints: {json.dumps(d.capabilities.capability_hints, ensure_ascii=False, sort_keys=True)}"
             )
             lines.append(
-                "   runtime: presence={presence} online={online} is_on={is_on} br={br} r={r} src={src} last_updated_ms={ts}".format(
+                "   runtime: presence={presence} online={online} is_on={is_on} br={br} r={r} mode={mode} relay={relay} src={src} last_updated_ms={ts}".format(
                     presence=d.runtime.presence,
                     online=d.runtime.online,
                     is_on=d.runtime.is_on,
                     br=d.runtime.br,
                     r=d.runtime.r,
+                    mode=d.runtime.mode,
+                    relay=d.runtime.relay,
                     src=d.runtime.last_source,
                     ts=d.runtime.last_updated_ms,
                 )
