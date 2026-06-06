@@ -114,7 +114,13 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     @property
     def is_on(self) -> bool | None:
+        if self.record.capabilities.supports_mode and isinstance(self.record.runtime.relay, int):
+            return self.record.runtime.relay != 0
         return self.record.runtime.is_on
+
+    @property
+    def available(self) -> bool:
+        return super().available
 
     @property
     def brightness(self) -> int | None:
@@ -136,6 +142,9 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
         return self.record.runtime.effect
 
     async def async_turn_on(self, **kwargs: Any) -> None:
+        if self.record.capabilities.supports_mode and self.record.runtime.mode == 1:
+            raise HomeAssistantError("Manual light control is disabled while device mode is sensor")
+
         brightness_pct = ha_brightness_to_percent(kwargs.get(ATTR_BRIGHTNESS))
 
         try:
@@ -174,6 +183,9 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
             raise HomeAssistantError(str(err)) from err
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        if self.record.capabilities.supports_mode and self.record.runtime.mode == 1:
+            raise HomeAssistantError("Manual light control is disabled while device mode is sensor")
+
         try:
             await self.runtime_data.async_send_local_command(
                 self.hass,
