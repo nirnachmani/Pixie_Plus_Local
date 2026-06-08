@@ -27,6 +27,7 @@ hardware_list = {
     "2312": "Smart Dimmer G2 - SDD350BT",
     "2311": "Smart Dimmer G2 - SDD350BT",
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
+    "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",
 }
 
 # Unified model capability truth.
@@ -196,7 +197,23 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_multi_channel": False,
         "supports_usb_subentity": False,
         "supports_cover": False,
-        "supports_mode": True,
+        "supports_sensor": True,
+        "supports_motion_sensor": True,
+        "supports_photocell_sensor": False,
+    },
+    "3002": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+        "supports_sensor": True,
+        "supports_motion_sensor": True,
+        "supports_photocell_sensor": True,
     },
 }
 
@@ -215,13 +232,74 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_multi_channel": bool(caps.get("supports_multi_channel", False)),
         "supports_usb_subentity": bool(caps.get("supports_usb_subentity", False)),
         "supports_cover": bool(caps.get("supports_cover", False)),
-        "supports_mode": bool(caps.get("supports_mode", False)),
+        "supports_sensor": bool(caps.get("supports_sensor", caps.get("supports_mode", False))),
+        "supports_motion_sensor": bool(caps.get("supports_motion_sensor", False)),
+        "supports_photocell_sensor": bool(caps.get("supports_photocell_sensor", False)),
     }
 
 
 def get_model_effect_names(model_no: str) -> list[str]:
     """Return the supported effect names for a model number."""
     return get_model_capabilities(model_no)["effect_names"]
+
+
+def get_supported_sensor_mode_values(model_no: str) -> list[int]:
+    """Return supported normalized sensor mode values for a model."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_sensor"]:
+        return []
+
+    mode_values = [0]
+    if capabilities["supports_motion_sensor"]:
+        mode_values.append(1)
+    if capabilities["supports_photocell_sensor"]:
+        mode_values.append(2)
+    return mode_values
+
+
+def get_sensor_select_options(model_no: str) -> list[str]:
+    """Return ordered HA-facing select options for sensor-capable models."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_sensor"]:
+        return []
+
+    options: list[str] = []
+    if capabilities["supports_motion_sensor"]:
+        options.append("motion")
+    if capabilities["supports_photocell_sensor"]:
+        options.append("photocell")
+    options.append("switch")
+    return options
+
+
+def sensor_mode_value_to_option(model_no: str, mode_value: int) -> Optional[str]:
+    """Map a normalized sensor mode value into a HA-facing option string."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_sensor"]:
+        return None
+    if mode_value == 1 and capabilities["supports_motion_sensor"]:
+        return "motion"
+    if mode_value == 2 and capabilities["supports_photocell_sensor"]:
+        return "photocell"
+    if mode_value == 0:
+        return "switch"
+    return None
+
+
+def sensor_option_to_mode_value(model_no: str, option: str) -> Optional[int]:
+    """Map a HA-facing sensor option into a normalized mode value."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_sensor"]:
+        return None
+
+    normalized = str(option or "").strip().lower()
+    if normalized == "motion" and capabilities["supports_motion_sensor"]:
+        return 1
+    if normalized == "photocell" and capabilities["supports_photocell_sensor"]:
+        return 2
+    if normalized == "switch":
+        return 0
+    return None
 
 
 def get_all_effect_names() -> list[str]:
@@ -307,7 +385,7 @@ def _decode_mode_from_capabilities(model_no: str) -> str:
     """
     capabilities = get_model_capabilities(model_no)
 
-    if capabilities["supports_mode"]:
+    if capabilities["supports_sensor"]:
         return MODE_SENSOR_CONTROLLER
     if capabilities["supports_usb_subentity"]:
         return MODE_PLUG_WITH_USB
@@ -363,13 +441,19 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
         return result
 
     if mode == MODE_SENSOR_CONTROLLER:
-        # Value-byte bitfield observed for model 3001 updates:
-        # - bit 2: mode (1=sensor, 0=manual)
+        capabilities = get_model_capabilities(model_no)
+        # Sensor-controller bitfield:
         # - bit 0: relay/light state (1=on, 0=off)
-        # - bit 1: motion (1=detected, 0=clear)
-        sensor_mode = 1 if (value_byte & 0x04) else 0
+        # - bit 1: motion event
+        # - bit 2: motion mode
+        # - bit 3: photocell mode
+        sensor_mode = 0
+        if capabilities["supports_photocell_sensor"] and (value_byte & 0x08):
+            sensor_mode = 2
+        elif capabilities["supports_motion_sensor"] and (value_byte & 0x04):
+            sensor_mode = 1
         relay_on = bool(value_byte & 0x01)
-        motion = bool(value_byte & 0x02)
+        motion = bool(value_byte & 0x02) if capabilities["supports_motion_sensor"] else False
         result["mode_value"] = sensor_mode
         result["relay_on"] = relay_on
         result["motion"] = motion

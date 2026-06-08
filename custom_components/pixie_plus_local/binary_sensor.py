@@ -26,7 +26,7 @@ def _iter_binary_sensor_endpoints(inventory) -> list[PixieEndpoint]:
         record = inventory.devices_by_id[device_id]
         parent_identifier = physical_device_identifier(record)
 
-        if not record.capabilities.supports_mode:
+        if not record.capabilities.supports_sensor:
             continue
 
         endpoints.append(
@@ -73,16 +73,18 @@ class PixiePlusBinarySensorEntity(PixiePlusCoordinatorEntity, BinarySensorEntity
         if not super().available:
             return False
         mode = self.record.runtime.mode
-        # No sensor entity in manual mode.
+        # No sensor entity in switch/manual mode.
         if isinstance(mode, int):
-            return mode == 1
+            return mode != 0
         return False
 
     @property
     def is_on(self) -> bool | None:
         runtime = self.record.runtime
-        if isinstance(runtime.motion, bool):
+        if runtime.mode == 1 and isinstance(runtime.motion, bool):
             return runtime.motion
         if isinstance(runtime.relay, int):
             return runtime.relay != 0
+        if isinstance(runtime.motion, bool):
+            return runtime.motion
         return runtime.is_on

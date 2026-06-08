@@ -58,13 +58,13 @@ def derive_is_on_from_state(
     The protocol does not expose a universal is_on field, so this mirrors the
     current model-family rules used elsewhere in the codebase.
     
-    For sensor controllers (supports_mode), relay directly indicates on/off state.
+    For sensor-capable devices (supports_sensor), relay directly indicates on/off state.
     """
     if capabilities.supports_cover:
         return None
 
     # Sensor controller devices (e.g., 3001) use relay field for on/off.
-    if capabilities.supports_mode and isinstance(relay, int):
+    if capabilities.supports_sensor and isinstance(relay, int):
         return relay != 0
 
     if capabilities.supports_multi_channel or capabilities.supports_usb_subentity:
@@ -295,7 +295,7 @@ class DeviceStateStore:
             update_relay = STATE_UNSET
             update_motion = STATE_UNSET
 
-            # Handle mode/relay for sensor controller devices (e.g., 3001).
+            # Handle mode/relay for sensor-capable devices.
             mode_val = rec_data.get("mode")
             if _normalize_optional_int(mode_val) is not None:
                 update_mode = mode_val
@@ -306,7 +306,7 @@ class DeviceStateStore:
 
             br_obj = rec_data.get("br")
             if isinstance(br_obj, dict):
-                if inv_rec.model_no == "3001":
+                if inv_rec.capabilities.supports_sensor:
                     raw_value = br_obj.get("raw")
                     if isinstance(raw_value, int):
                         interpreted = decode_value_byte(inv_rec.model_no, raw_value)
@@ -401,7 +401,9 @@ class DeviceCapabilities:
     supports_multi_channel: bool = False
     supports_usb_subentity: bool = False
     supports_cover: bool = False
-    supports_mode: bool = False
+    supports_sensor: bool = False
+    supports_motion_sensor: bool = False
+    supports_photocell_sensor: bool = False
     capability_hints: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -416,7 +418,9 @@ class DeviceCapabilities:
             "supports_multi_channel": self.supports_multi_channel,
             "supports_usb_subentity": self.supports_usb_subentity,
             "supports_cover": self.supports_cover,
-            "supports_mode": self.supports_mode,
+            "supports_sensor": self.supports_sensor,
+            "supports_motion_sensor": self.supports_motion_sensor,
+            "supports_photocell_sensor": self.supports_photocell_sensor,
             "capability_hints": dict(self.capability_hints),
         }
 
@@ -433,7 +437,9 @@ class DeviceCapabilities:
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
             supports_cover=bool(data.get("supports_cover", False)),
-            supports_mode=bool(data.get("supports_mode", False)),
+            supports_sensor=bool(data.get("supports_sensor", data.get("supports_mode", False))),
+            supports_motion_sensor=bool(data.get("supports_motion_sensor", False)),
+            supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
             capability_hints=dict(data.get("capability_hints") or {}),
         )
 
@@ -532,7 +538,9 @@ class PixieInventory:
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
         cap.supports_cover = model_caps["supports_cover"]
-        cap.supports_mode = model_caps["supports_mode"]
+        cap.supports_sensor = model_caps["supports_sensor"]
+        cap.supports_motion_sensor = model_caps["supports_motion_sensor"]
+        cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
 
         cap.capability_hints = {
             "model_no": model_no,
@@ -715,8 +723,12 @@ class PixieInventory:
                 caps.append("usb_subentity")
             if d.capabilities.supports_cover:
                 caps.append("cover")
-            if d.capabilities.supports_mode:
-                caps.append("mode")
+            if d.capabilities.supports_sensor:
+                caps.append("sensor")
+            if d.capabilities.supports_motion_sensor:
+                caps.append("motion_sensor")
+            if d.capabilities.supports_photocell_sensor:
+                caps.append("photocell_sensor")
 
             lines.append(
                 " - id={id} model={model} name={name} caps=[{caps}] state_seed=(presence={presence}, is_on={is_on}, br={br}, r={r}, mode={mode}, relay={relay}) src={src}".format(
