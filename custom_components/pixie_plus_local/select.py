@@ -17,6 +17,7 @@ from . import (
     gateway_device_identifier,
     physical_device_identifier,
 )
+from .pixie_value_profiles import get_sensor_select_options, sensor_mode_value_to_option, sensor_option_to_mode_value
 
 
 def _iter_mode_select_endpoints(inventory) -> list[PixieEndpoint]:
@@ -27,7 +28,7 @@ def _iter_mode_select_endpoints(inventory) -> list[PixieEndpoint]:
         record = inventory.devices_by_id[device_id]
         parent_identifier = physical_device_identifier(record)
 
-        if not record.capabilities.supports_mode:
+        if not record.capabilities.supports_sensor:
             continue
 
         endpoints.append(
@@ -63,23 +64,24 @@ async def async_setup_entry(
 class PixiePlusModeSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
     """Representation of a Pixie Plus mode select entity."""
 
-    _attr_options = ["sensor", "manual"]
-
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
+        self._attr_options = get_sensor_select_options(self.record.model_no)
 
     @property
     def current_option(self) -> str | None:
         runtime = self.record.runtime
         if isinstance(runtime.mode, int):
-            return "sensor" if runtime.mode == 1 else "manual"
+            return sensor_mode_value_to_option(self.record.model_no, runtime.mode)
         return None
 
     async def async_select_option(self, option: str) -> None:
         """Change mode to the selected option."""
         if option not in self._attr_options:
             raise HomeAssistantError(f"Unsupported mode option: {option}")
-        mode_value = 1 if option == "sensor" else 0
+        mode_value = sensor_option_to_mode_value(self.record.model_no, option)
+        if mode_value is None:
+            raise HomeAssistantError(f"Unsupported mode option: {option}")
         try:
             await self.runtime_data.async_send_local_command(
                 self.hass,

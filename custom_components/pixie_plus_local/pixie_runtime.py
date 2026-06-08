@@ -45,6 +45,7 @@ from .pixie_value_profiles import (
     decode_value_byte,
     get_all_effect_names,
     get_model_effect_names,
+    get_supported_sensor_mode_values,
     resolve_cover_command_position,
 )
 
@@ -1057,7 +1058,7 @@ class PixieAuthHandler:
             command_brightness: Optional brightness 0-100 for brightness command
             command_color_rgb: Optional RGB tuple for color command
             command_white: Whether color command was requested via --white
-            command_mode: Optional mode command (0=manual, 1=sensor)
+            command_mode: Optional sensor mode command (0=switch, 1=motion, 2=photocell when supported)
             command_target: Optional target endpoint for on/off command (relay|usb|left|right|both)
             command_cover_action: Optional cover action command
 
@@ -2476,15 +2477,14 @@ class PixieAuthHandler:
                 # Cover commands are button presses, not authoritative state updates.
                 pass
             elif target == "mode":
-                # Sensor controller mode command: 1=sensor, 0=manual.
-                # Both mode commands default relay to off.
+                # Sensor mode commands normalize switch/manual to mode 0 and default relay to off.
                 mode_value = int(value)
                 update_kwargs["mode"] = mode_value
                 update_kwargs["relay"] = 0
                 update_kwargs["motion"] = False
                 update_kwargs["br"] = 0
-            elif target == "relay" and rec.capabilities.supports_mode:
-                # 3001 manual light control uses relay in manual mode.
+            elif target == "relay" and rec.capabilities.supports_sensor:
+                # Sensor-family manual light control uses relay in switch mode.
                 update_kwargs["mode"] = 0
                 update_kwargs["relay"] = 1 if value else 0
                 update_kwargs["motion"] = False
@@ -2658,8 +2658,16 @@ class PixieAuthHandler:
             if is_cover_cmd and rec and not rec.capabilities.supports_cover:
                 raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
 
-            if is_mode_cmd and rec and not rec.capabilities.supports_mode:
+            if is_mode_cmd and rec and not rec.capabilities.supports_sensor:
                 raise PixieAuthError(f"Model {rec.model_no} does not support mode commands")
+
+            if is_mode_cmd and rec:
+                allowed_sensor_modes = get_supported_sensor_mode_values(rec.model_no)
+                requested_sensor_mode = int(command_mode)
+                if requested_sensor_mode not in allowed_sensor_modes:
+                    raise PixieAuthError(
+                        f"Mode {requested_sensor_mode} not allowed for model {rec.model_no}: {allowed_sensor_modes}"
+                    )
 
             if is_effect_cmd and rec:
                 allowed_effects = rec.capabilities.effect_names or get_model_effect_names(rec.model_no)
@@ -2801,7 +2809,7 @@ class PixieAuthHandler:
                     command_device_id,
                     command_target,
                 )
-                if rec and rec.capabilities.supports_mode and effective_target == "relay":
+                if rec and rec.capabilities.supports_sensor and effective_target == "relay":
                     command_hex = self._build_mode_command_hex(
                         command_device_id,
                         mode=0,
@@ -3489,16 +3497,16 @@ class PixieAuthHandler:
         mode: int,
         relay: int = 0,
     ) -> str:
-        """Build c16969 mode/relay command for sensor controllers (model 3001).
+        """Build c16969 mode/relay command for sensor-capable devices.
 
         Captured payload bytes after c16969 are:
         [0x03][mode][relay][00][00][00][01][1e][00][00]
-        where mode: 0=manual, 1=sensor and relay: 0=off, 1=on.
+        where mode is a normalized sensor-family mode value and relay: 0=off, 1=on.
 
         Captured prefix uses the rolling 3-byte form, starting 01 00 00.
         """
-        if mode not in (0, 1):
-            raise PixieAuthError(f"Mode must be 0 (manual) or 1 (sensor), got {mode}")
+        if not 0 <= int(mode) <= 255:
+            raise PixieAuthError(f"Mode must fit in one byte, got {mode}")
         if relay not in (0, 1):
             raise PixieAuthError(f"Relay must be 0 (off) or 1 (on), got {relay}")
 
