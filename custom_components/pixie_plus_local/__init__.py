@@ -25,7 +25,7 @@ LOGGER = logging.getLogger(__name__)
 DOMAIN = "pixie_plus_local"
 MANUFACTURER = "SAL - Pixie Plus"
 INTEGRATION_TITLE = "Pixie Plus Local"
-PLATFORMS: tuple[str, ...] = ("light", "switch", "cover", "select", "binary_sensor")
+PLATFORMS: tuple[str, ...] = ("light", "switch", "cover", "select", "binary_sensor", "button", "number", "sensor")
 
 CONF_HOME_ID = "home_id"
 CONF_HOME_NAME = "home_name"
@@ -42,6 +42,7 @@ INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
 ISSUE_ID_MISSING_FALLBACK_CREDENTIALS = "missing_fallback_credentials"
 
 COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
+TIMER_POLL_INTERVAL_SECONDS = 10.0
 INVENTORY_STORE_VERSION = 1
 
 
@@ -329,7 +330,11 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
         self.runtime_manager: PixiePlusConfigEntryRuntimeData | None = None
 
     async def _async_update_data(self) -> PixieInventory:
-        """Return the current runtime inventory snapshot."""
+        """Return the current runtime inventory snapshot.
+
+        Also triggers timer countdown polls for active timer devices
+        that haven't been polled recently.
+        """
         if self.runtime_manager is not None:
             try:
                 await self.runtime_manager.async_ensure_runtime(self.hass, reason="coordinator_refresh")
@@ -343,6 +348,33 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
         runtime_session = self.pixie_runtime.runtime_session
         if runtime_session is not None and not runtime_session.is_alive() and runtime_session.error is not None:
             raise UpdateFailed(f"Pixie gateway runtime stopped: {runtime_session.error}") from runtime_session.error
+
+        # ── Timer countdown polling ──
+        # For every timer device that is active (mode=timer + light on),
+        # send an f96b69 poll if it has been more than 30 seconds since
+        # the last poll. The d36969 response updates timer_remaining_seconds
+        # via the normal bleData path.
+        if self.runtime_manager is not None:
+            import time as _time
+            now = _time.time()
+            for device_id in sorted(inventory.devices_by_id):
+                rec = inventory.devices_by_id[device_id]
+                if not rec.capabilities.supports_timer:
+                    continue
+                if rec.runtime.mode != 1 or not rec.runtime.is_on:
+                    continue
+                last_poll = rec.runtime.last_timer_poll_at
+                if last_poll is not None and (now - last_poll) < TIMER_POLL_INTERVAL_SECONDS:
+                    continue
+                # Fire-and-forget — don't block the coordinator update
+                self.hass.async_create_task(
+                    self.runtime_manager.async_send_local_command(
+                        self.hass,
+                        command_device_id=device_id,
+                        command_timer_action="poll",
+                    )
+                )
+                LOGGER.debug("Queued timer poll for device %s", device_id)
 
         return inventory
 
@@ -386,6 +418,22 @@ class PixiePlusConfigEntryRuntimeData:
             self.coordinator.hass.async_create_task,
             _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory),
         )
+        # If a timer device needs an immediate poll (external mode change or
+        # turn-on), schedule it now instead of waiting for the next coordinator
+        # cycle (which can be up to 10 s away).
+        for device_id in sorted(inventory.devices_by_id):
+            rec = inventory.devices_by_id[device_id]
+            if rec.capabilities.supports_timer and rec.runtime.timer_needs_poll:
+                rec.runtime.timer_needs_poll = False
+                self.coordinator.hass.loop.call_soon_threadsafe(
+                    self.coordinator.hass.async_create_task,
+                    self.async_send_local_command(
+                        self.coordinator.hass,
+                        command_device_id=device_id,
+                        command_timer_action="poll",
+                    ),
+                )
+                LOGGER.debug("Immediate timer poll for device %s (external change)", device_id)
 
     async def async_ensure_runtime(self, hass: HomeAssistant, *, reason: str):
         """Ensure there is one healthy live runtime session for this config entry."""
@@ -459,7 +507,12 @@ class PixiePlusConfigEntryRuntimeData:
             await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
 
     async def async_send_local_command(self, hass: HomeAssistant, **kwargs) -> None:
-        """Send a local command using the single shared 41578 runtime session."""
+        """Send a local command using the single shared 41578 runtime session.
+
+        Passes through all kwargs including timer-specific ones:
+        - command_timer_action: "restart", "override", "set_duration", "poll"
+        - command_timer_duration: int (seconds, 1-86400)
+        """
         runtime_session = await self.async_ensure_runtime(hass, reason="command_send")
         try:
             await hass.async_add_executor_job(runtime_session.send_command, dict(kwargs))
@@ -655,9 +708,6 @@ async def _async_build_runtime_data(
                 )
 
         coordinator = PixiePlusRuntimeCoordinator(hass, entry, pixie_runtime)
-        handler.set_inventory_update_callback(
-            lambda inventory: hass.loop.call_soon_threadsafe(coordinator.async_set_updated_data, inventory)
-        )
         await coordinator.async_config_entry_first_refresh()
         await _async_save_inventory_snapshot(hass, entry, pixie_runtime.inventory)
     except PixieAuthError as err:
@@ -675,6 +725,7 @@ async def _async_build_runtime_data(
         entry=entry,
     )
     coordinator.runtime_manager = runtime_data
+    handler.set_inventory_update_callback(runtime_data.push_inventory_update_from_thread)
     return runtime_data
 
 

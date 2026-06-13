@@ -28,6 +28,7 @@ hardware_list = {
     "2311": "Smart Dimmer G2 - SDD350BT",
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",
+    "2113": "Smart Timer Switch - STS600BTAM",
 }
 
 # Unified model capability truth.
@@ -200,6 +201,11 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_sensor": True,
         "supports_motion_sensor": True,
         "supports_photocell_sensor": False,
+        "supports_hold_time": True,
+        "supports_brightness_threshold": True,
+        "brightness_threshold_options": ["Dark", "Night", "Evening", "Dusk", "Day"],
+        "supports_motion_sensitivity": True,
+        "motion_sensitivity_options": ["Low", "Medium", "High"],
     },
     "3002": {
         "is_light": True,
@@ -214,6 +220,24 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_sensor": True,
         "supports_motion_sensor": True,
         "supports_photocell_sensor": True,
+        "supports_hold_time": True,
+        "supports_brightness_threshold": True,
+        "brightness_threshold_options": ["Dark", "Night", "Evening", "Dusk", "Day"],
+        "supports_motion_sensitivity": True,
+        "motion_sensitivity_options": ["Low", "Medium", "High"],
+    },
+    "2113": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+        "supports_timer": True,
+        "timer_modes": ["timer", "override"],
     },
 }
 
@@ -235,6 +259,13 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_sensor": bool(caps.get("supports_sensor", caps.get("supports_mode", False))),
         "supports_motion_sensor": bool(caps.get("supports_motion_sensor", False)),
         "supports_photocell_sensor": bool(caps.get("supports_photocell_sensor", False)),
+        "supports_timer": bool(caps.get("supports_timer", False)),
+        "timer_modes": [str(mode) for mode in caps.get("timer_modes", [])],
+        "supports_hold_time": bool(caps.get("supports_hold_time", False)),
+        "supports_brightness_threshold": bool(caps.get("supports_brightness_threshold", False)),
+        "brightness_threshold_options": [str(o) for o in caps.get("brightness_threshold_options", [])],
+        "supports_motion_sensitivity": bool(caps.get("supports_motion_sensitivity", False)),
+        "motion_sensitivity_options": [str(o) for o in caps.get("motion_sensitivity_options", [])],
     }
 
 
@@ -299,6 +330,33 @@ def sensor_option_to_mode_value(model_no: str, option: str) -> Optional[int]:
         return 2
     if normalized == "switch":
         return 0
+    return None
+
+
+def get_timer_select_options(model_no: str) -> list[str]:
+    """Return ordered HA-facing select options for timer-capable models."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_timer"]:
+        return []
+    return list(capabilities["timer_modes"])
+
+
+def timer_mode_value_to_option(mode_value: int) -> Optional[str]:
+    """Map a timer mode int value (1=timer, 2=override) into a HA-facing option string."""
+    if mode_value == 1:
+        return "timer"
+    if mode_value == 2:
+        return "override"
+    return None
+
+
+def timer_option_to_mode_value(option: str) -> Optional[int]:
+    """Map a HA-facing timer option string into the int mode value."""
+    normalized = str(option or "").strip().lower()
+    if normalized == "timer":
+        return 1
+    if normalized == "override":
+        return 2
     return None
 
 
@@ -376,6 +434,7 @@ MODE_BRIGHTNESS = "brightness"
 MODE_DUAL_CHANNEL = "dual_channel"
 MODE_PLUG_WITH_USB = "plug_with_usb"
 MODE_SENSOR_CONTROLLER = "sensor_controller"
+MODE_TIMER_SWITCH = "timer_switch"
 
 def _decode_mode_from_capabilities(model_no: str) -> str:
     """Resolve value-byte decoding mode from the model capability flags.
@@ -385,6 +444,8 @@ def _decode_mode_from_capabilities(model_no: str) -> str:
     """
     capabilities = get_model_capabilities(model_no)
 
+    if capabilities["supports_timer"]:
+        return MODE_TIMER_SWITCH
     if capabilities["supports_sensor"]:
         return MODE_SENSOR_CONTROLLER
     if capabilities["supports_usb_subentity"]:
@@ -438,6 +499,24 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
         # This corresponds to bit1 toggling USB state.
         result["main_relay_on"] = bool(value_byte & 0x01)
         result["usb_on"] = bool(value_byte & 0x02)
+        return result
+
+    if mode == MODE_TIMER_SWITCH:
+        # Timer switch value_byte encoding (observed values):
+        # 0x00 = off
+        # 0x01 = timer mode on (seen when switching from override, longer durations)
+        # 0x02 = override mode (light on, no timer)
+        # 0x04 = timer mode on (normal turn-on, shorter durations)
+        # 0x06 = timer restarting
+        result["is_on"] = value_byte != 0
+        if value_byte == 0x00:
+            result["timer_mode"] = None
+        elif value_byte == 0x02:
+            result["timer_mode"] = "override"
+        else:
+            # Any other non-zero value (0x01, 0x04, 0x06, etc.) = timer mode on
+            result["timer_mode"] = "timer"
+        result["restarting"] = value_byte == 0x06
         return result
 
     if mode == MODE_SENSOR_CONTROLLER:

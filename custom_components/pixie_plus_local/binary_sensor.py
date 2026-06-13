@@ -38,7 +38,7 @@ def _iter_binary_sensor_endpoints(inventory) -> list[PixieEndpoint]:
                 device_identifier=parent_identifier,
                 device_name=record.name,
                 via_device_identifier=gateway_identifier,
-                entity_translation_key="sensor_light_state",
+                entity_name="Motion",
             )
         )
 

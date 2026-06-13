@@ -94,6 +94,9 @@
     "select": {
       "mode": {
         "name": "Mode"
+      },
+      "timer_mode": {
+        "name": "Timer mode"
       }
     },
     "binary_sensor": {
@@ -104,6 +107,21 @@
     "cover": {
       "blind": {
         "name": "Blind"
+      }
+    },
+    "button": {
+      "restart_timer": {
+        "name": "Restart timer"
+      }
+    },
+    "sensor": {
+      "timer_remaining": {
+        "name": "Timer remaining"
+      }
+    },
+    "number": {
+      "timer_duration": {
+        "name": "Timer duration"
       }
     }
   },

@@ -63,6 +63,10 @@ def derive_is_on_from_state(
     if capabilities.supports_cover:
         return None
 
+    # Timer switch devices (e.g., 2113): br=0 means off, br>0 means on
+    if capabilities.supports_timer and isinstance(br, int):
+        return br > 0
+
     # Sensor controller devices (e.g., 3001) use relay field for on/off.
     if capabilities.supports_sensor and isinstance(relay, int):
         return relay != 0
@@ -143,6 +147,13 @@ class RuntimeState:
     mode: Optional[int] = None
     relay: Optional[int] = None
     motion: Optional[bool] = None
+    timer_total_seconds: Optional[int] = None
+    timer_remaining_seconds: Optional[int] = None
+    last_timer_poll_at: Optional[float] = None
+    timer_needs_poll: bool = False
+    hold_time_seconds: Optional[int] = None
+    brightness_threshold: Optional[int] = None
+    motion_sensitivity: Optional[int] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     last_source: str = "cloud_seed"
     last_updated_ms: Optional[int] = None
@@ -160,6 +171,13 @@ class RuntimeState:
             "mode": self.mode,
             "relay": self.relay,
             "motion": self.motion,
+            "timer_total_seconds": self.timer_total_seconds,
+            "timer_remaining_seconds": self.timer_remaining_seconds,
+            "last_timer_poll_at": self.last_timer_poll_at,
+            "timer_needs_poll": self.timer_needs_poll,
+            "hold_time_seconds": self.hold_time_seconds,
+            "brightness_threshold": self.brightness_threshold,
+            "motion_sensitivity": self.motion_sensitivity,
             "raw": self.raw,
             "last_source": self.last_source,
             "last_updated_ms": self.last_updated_ms,
@@ -179,6 +197,13 @@ class RuntimeState:
             mode=_normalize_optional_int(data.get("mode")),
             relay=_normalize_optional_int(data.get("relay")),
             motion=data.get("motion"),
+            timer_total_seconds=_normalize_optional_int(data.get("timer_total_seconds")),
+            timer_remaining_seconds=_normalize_optional_int(data.get("timer_remaining_seconds")),
+            last_timer_poll_at=data.get("last_timer_poll_at"),
+            timer_needs_poll=bool(data.get("timer_needs_poll", False)),
+            hold_time_seconds=_normalize_optional_int(data.get("hold_time_seconds")),
+            brightness_threshold=_normalize_optional_int(data.get("brightness_threshold")),
+            motion_sensitivity=_normalize_optional_int(data.get("motion_sensitivity")),
             raw=dict(data.get("raw") or {}),
             last_source=str(data.get("last_source") or "snapshot"),
             last_updated_ms=data.get("last_updated_ms"),
@@ -214,6 +239,13 @@ class DeviceStateStore:
         mode: Any = STATE_UNSET,
         relay: Any = STATE_UNSET,
         motion: Any = STATE_UNSET,
+        timer_total_seconds: Any = STATE_UNSET,
+        timer_remaining_seconds: Any = STATE_UNSET,
+        last_timer_poll_at: Any = STATE_UNSET,
+        timer_needs_poll: Any = STATE_UNSET,
+        hold_time_seconds: Any = STATE_UNSET,
+        brightness_threshold: Any = STATE_UNSET,
+        motion_sensitivity: Any = STATE_UNSET,
         raw: Any = STATE_UNSET,
         updated_ms: Optional[int] = None,
     ) -> Optional[RuntimeState]:
@@ -247,6 +279,20 @@ class DeviceStateStore:
             runtime.relay = _normalize_optional_int(relay)
         if motion is not STATE_UNSET:
             runtime.motion = motion
+        if timer_total_seconds is not STATE_UNSET:
+            runtime.timer_total_seconds = _normalize_optional_int(timer_total_seconds)
+        if timer_remaining_seconds is not STATE_UNSET:
+            runtime.timer_remaining_seconds = _normalize_optional_int(timer_remaining_seconds)
+        if last_timer_poll_at is not STATE_UNSET:
+            runtime.last_timer_poll_at = last_timer_poll_at
+        if timer_needs_poll is not STATE_UNSET:
+            runtime.timer_needs_poll = bool(timer_needs_poll)
+        if hold_time_seconds is not STATE_UNSET:
+            runtime.hold_time_seconds = _normalize_optional_int(hold_time_seconds)
+        if brightness_threshold is not STATE_UNSET:
+            runtime.brightness_threshold = _normalize_optional_int(brightness_threshold)
+        if motion_sensitivity is not STATE_UNSET:
+            runtime.motion_sensitivity = _normalize_optional_int(motion_sensitivity)
         if raw is not STATE_UNSET:
             runtime.raw = raw
 
@@ -323,6 +369,15 @@ class DeviceStateStore:
                                 update_br = 100 if relay_on else 0
                             if isinstance(motion, bool):
                                 update_motion = motion
+                elif inv_rec.capabilities.supports_timer:
+                    pct = br_obj.get("pct")
+                    if isinstance(pct, int):
+                        # Bulk br for timer: 0=off, 1=timer, 2=override
+                        update_br = 100 if pct > 0 else 0
+                        if pct == 1:
+                            update_mode = 1
+                        elif pct == 2:
+                            update_mode = 2
                 elif br_obj.get("type") == "single":
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
@@ -404,6 +459,13 @@ class DeviceCapabilities:
     supports_sensor: bool = False
     supports_motion_sensor: bool = False
     supports_photocell_sensor: bool = False
+    supports_timer: bool = False
+    timer_modes: List[str] = field(default_factory=list)
+    supports_hold_time: bool = False
+    supports_brightness_threshold: bool = False
+    brightness_threshold_options: List[str] = field(default_factory=list)
+    supports_motion_sensitivity: bool = False
+    motion_sensitivity_options: List[str] = field(default_factory=list)
     capability_hints: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -421,6 +483,13 @@ class DeviceCapabilities:
             "supports_sensor": self.supports_sensor,
             "supports_motion_sensor": self.supports_motion_sensor,
             "supports_photocell_sensor": self.supports_photocell_sensor,
+            "supports_timer": self.supports_timer,
+            "timer_modes": list(self.timer_modes),
+            "supports_hold_time": self.supports_hold_time,
+            "supports_brightness_threshold": self.supports_brightness_threshold,
+            "brightness_threshold_options": list(self.brightness_threshold_options),
+            "supports_motion_sensitivity": self.supports_motion_sensitivity,
+            "motion_sensitivity_options": list(self.motion_sensitivity_options),
             "capability_hints": dict(self.capability_hints),
         }
 
@@ -440,6 +509,13 @@ class DeviceCapabilities:
             supports_sensor=bool(data.get("supports_sensor", data.get("supports_mode", False))),
             supports_motion_sensor=bool(data.get("supports_motion_sensor", False)),
             supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
+            supports_timer=bool(data.get("supports_timer", False)),
+            timer_modes=list(data.get("timer_modes") or []),
+            supports_hold_time=bool(data.get("supports_hold_time", False)),
+            supports_brightness_threshold=bool(data.get("supports_brightness_threshold", False)),
+            brightness_threshold_options=list(data.get("brightness_threshold_options") or []),
+            supports_motion_sensitivity=bool(data.get("supports_motion_sensitivity", False)),
+            motion_sensitivity_options=list(data.get("motion_sensitivity_options") or []),
             capability_hints=dict(data.get("capability_hints") or {}),
         )
 
@@ -541,6 +617,13 @@ class PixieInventory:
         cap.supports_sensor = model_caps["supports_sensor"]
         cap.supports_motion_sensor = model_caps["supports_motion_sensor"]
         cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
+        cap.supports_timer = model_caps["supports_timer"]
+        cap.timer_modes = model_caps["timer_modes"]
+        cap.supports_hold_time = model_caps["supports_hold_time"]
+        cap.supports_brightness_threshold = model_caps["supports_brightness_threshold"]
+        cap.brightness_threshold_options = model_caps["brightness_threshold_options"]
+        cap.supports_motion_sensitivity = model_caps["supports_motion_sensitivity"]
+        cap.motion_sensitivity_options = model_caps["motion_sensitivity_options"]
 
         cap.capability_hints = {
             "model_no": model_no,
@@ -616,6 +699,17 @@ class PixieInventory:
                 last_source=source,
                 last_updated_ms=now_ms,
             )
+            # Seed timer duration from device state (already in seconds).
+            if rec.capabilities.supports_timer:
+                dev_state = d.get("state") if isinstance(d.get("state"), dict) else {}
+                timer_seconds = _normalize_optional_int(dev_state.get("second"))
+                if timer_seconds is not None and timer_seconds > 0:
+                    runtime_state.timer_total_seconds = timer_seconds
+                # Default to timer mode when light is off (matches device behaviour:
+                # turning on without explicitly selecting override always starts timer).
+                if runtime_state.mode is None:
+                    runtime_state.mode = 1
+
             runtime_state.is_on = derive_is_on_from_state(
                 rec.capabilities,
                 runtime_state.br,

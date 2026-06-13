@@ -1,14 +1,5 @@
 # Pixie Plus Local for Home Assistant
 
-## I need your help !! 
-
-### Can you please vote in the Discussions section regarding the presence of the message below in your log? 
-```
-Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup
-```
-
-##
-
 Pixie Plus Local is a Home Assistant custom integration for SAL Pixie Plus devices.
 
 Unlike the older Pixie Plus integration, this one controls the gateway locally over your LAN instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata required for local access, but after that the integration runs against the gateway directly. I attempted to implement Bluetooth support as well but Pixie Plus devices are not compatible with Home Assistant Bluetooth (Pixie devices ignore CCCD write which is required for a successful handshake.) As such, the integration still requires a Pixie Gateway to work. 
@@ -49,6 +40,7 @@ The current code includes support for these model families:
 - LED Strip Controller - LT8915DIM/BT
 - Smart Passive Infrared Motion Sensor - SMS861CD/BTAM
 - Smart Passive Infrared Motion Sensor - SMS862WF/WH/BTAM
+- Smart timer switch - STS600BTAM
 
 For compatible models, the integration supports on/off, dimming, RGB color, and built-in effects where those capabilities exist.
 
