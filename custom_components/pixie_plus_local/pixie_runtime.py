@@ -526,6 +526,7 @@ class PixieAuthHandler:
         self.inventory_mode: str = "local_53216"
         self._command_counter = 0x10  # App-style brightness/cover commands observed starting at 0x10.
         self._mode_command_counter = 0x01  # Captured 3001 mode commands observed starting at 0x01.
+        self._timer_command_counter = 0x01  # Captured timer switch commands observed starting at 0x01.
         self._cached_cloud_home_obj: Optional[Dict[str, Any]] = None
         self._pending_bulk_ble_updates: List[Dict[str, Any]] = []
         self._pending_bulk_lock = threading.Lock()
@@ -703,6 +704,10 @@ class PixieAuthHandler:
         command_cover_action: Optional[str],
         command_cover_action_map: Optional[Dict[str, int]],
         command_cover_tilt_action_map: Optional[Dict[str, int]],
+        command_timer_action: Optional[str] = None,
+        command_timer_duration: Optional[int] = None,
+        command_sensor_param: Optional[str] = None,
+        command_sensor_param_value: Optional[int] = None,
     ) -> PixieRuntimeSession:
         """Start the long-lived 41578 runtime session."""
         runtime_session = PixieRuntimeSession(
@@ -723,6 +728,10 @@ class PixieAuthHandler:
                 "command_cover_action": command_cover_action,
                 "command_cover_action_map": command_cover_action_map,
                 "command_cover_tilt_action_map": command_cover_tilt_action_map,
+                "command_timer_action": command_timer_action,
+                "command_timer_duration": command_timer_duration,
+                "command_sensor_param": command_sensor_param,
+                "command_sensor_param_value": command_sensor_param_value,
             },
         )
         runtime_session.start()
@@ -919,6 +928,10 @@ class PixieAuthHandler:
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
+        command_timer_action: Optional[str] = None,
+        command_timer_duration: Optional[int] = None,
+        command_sensor_param: Optional[str] = None,
+        command_sensor_param_value: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = False,
         wait_for_shutdown: bool = False,
@@ -946,6 +959,10 @@ class PixieAuthHandler:
             command_cover_action=command_cover_action,
             command_cover_action_map=command_cover_action_map,
             command_cover_tilt_action_map=command_cover_tilt_action_map,
+            command_timer_action=command_timer_action,
+            command_timer_duration=command_timer_duration,
+            command_sensor_param=command_sensor_param,
+            command_sensor_param_value=command_sensor_param_value,
             stop_event=stop_event,
             keep_control_alive=keep_control_alive,
             wait_for_shutdown=wait_for_shutdown,
@@ -1041,6 +1058,10 @@ class PixieAuthHandler:
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
+        command_timer_action: Optional[str] = None,
+        command_timer_duration: Optional[int] = None,
+        command_sensor_param: Optional[str] = None,
+        command_sensor_param_value: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = True,
         wait_for_shutdown: bool = True,
@@ -1131,6 +1152,10 @@ class PixieAuthHandler:
             command_cover_action=command_cover_action,
             command_cover_action_map=command_cover_action_map,
             command_cover_tilt_action_map=command_cover_tilt_action_map,
+            command_timer_action=command_timer_action,
+            command_timer_duration=command_timer_duration,
+            command_sensor_param=command_sensor_param,
+            command_sensor_param_value=command_sensor_param_value,
         )
 
         priming_timeout = 5.0
@@ -1147,6 +1172,65 @@ class PixieAuthHandler:
                 sync_timeout=sync_timeout,
                 cloud_home_cached=cloud_home_cached,
             )
+
+        # One-time startup poll for timer devices to populate timer_total_seconds
+        # from the gateway (the device-list seed value may be stale).  Space
+        # requests so the gateway has time to respond to each.
+        if (
+            hydrate_inventory
+            and self.inventory is not None
+            and runtime_session.is_alive()
+        ):
+            for device_id in sorted(self.inventory.devices_by_id):
+                rec = self.inventory.devices_by_id[device_id]
+                if not rec.capabilities.supports_timer:
+                    continue
+                self._log_debug(
+                    "Startup timer poll: dev_id=%s name=%s",
+                    device_id,
+                    rec.name,
+                )
+                try:
+                    runtime_session.send_command({
+                        "command_device_id": device_id,
+                        "command_timer_action": "poll",
+                    })
+                except Exception as exc:
+                    self._log_warning(
+                        "Startup timer poll failed for dev_id=%s: %s",
+                        device_id,
+                        exc,
+                    )
+                time.sleep(0.5)
+
+            # One-time startup poll for sensor devices to populate params
+            for device_id in sorted(self.inventory.devices_by_id):
+                rec = self.inventory.devices_by_id[device_id]
+                if not rec.capabilities.supports_sensor:
+                    continue
+                if not (
+                    rec.capabilities.supports_hold_time
+                    or rec.capabilities.supports_brightness_threshold
+                    or rec.capabilities.supports_motion_sensitivity
+                ):
+                    continue
+                self._log_debug(
+                    "Startup sensor poll: dev_id=%s name=%s",
+                    device_id,
+                    rec.name,
+                )
+                try:
+                    runtime_session.send_command({
+                        "command_device_id": device_id,
+                        "command_timer_action": "poll",
+                    })
+                except Exception as exc:
+                    self._log_warning(
+                        "Startup sensor poll failed for dev_id=%s: %s",
+                        device_id,
+                        exc,
+                    )
+                time.sleep(0.5)
 
         if keep_control_alive and wait_for_shutdown:
             self._log_debug("Control channel remains active on port %s awaiting shutdown", TCP_CONTROL_PORT)
@@ -1932,6 +2016,10 @@ class PixieAuthHandler:
         command_cover_action: Optional[str] = None,
         command_cover_action_map: Optional[Dict[str, int]] = None,
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
+        command_timer_action: Optional[str] = None,
+        command_timer_duration: Optional[int] = None,
+        command_sensor_param: Optional[str] = None,
+        command_sensor_param_value: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Perform full client-mode TCP handshake sequence (matches Java app flow).
@@ -2190,6 +2278,72 @@ class PixieAuthHandler:
                 }]
                 return decoded
 
+            # d36969 response — opcode d3 69 69 at a variable offset (the zero-padding
+            # between the device-id and the opcode varies).  Search for it dynamically.
+            # Format: 01 02 03 [dev_le:2] [zeros:N] [d3 69 69] [flag] [data...]
+            d3_pos = raw.find(b"\xd3\x69\x69")
+            if d3_pos >= 0 and len(raw) >= d3_pos + 10:
+                flag_byte = raw[d3_pos + 3]
+                dev_id = int.from_bytes(raw[3:5], byteorder="little")
+                data_start = d3_pos + 4  # first byte after the flag
+
+                # Only flag 0xb9 carries data we parse.  Other flags (0x94 = edit
+                # mode entered, 0x99 = timer edit ack, 0xbd = value ack) are
+                # acknowledgments with no data we need.
+                if flag_byte != 0xb9:
+                    return None
+
+                rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
+                if rec and rec.capabilities.supports_timer:
+                    decoded["kind"] = "timer_status"
+                    decoded["device_id"] = dev_id
+                    try:
+                        decoded["timer_total_seconds"] = int.from_bytes(raw[data_start + 1 : data_start + 5], byteorder="little")
+                        decoded["timer_remaining_seconds"] = int.from_bytes(raw[data_start + 5 : data_start + 9], byteorder="little")
+                    except Exception:
+                        decoded["timer_total_seconds"] = None
+                        decoded["timer_remaining_seconds"] = None
+                elif rec and rec.capabilities.supports_sensor:
+                        # 3001 sensor params (flag 0xb9):
+                        # [10] [?] [brightness] [00] [hold_sec_le:2] [sensitivity] [???:2]
+                        decoded["kind"] = "sensor_params"
+                        decoded["device_id"] = dev_id
+                        try:
+                            decoded["brightness_threshold"] = int(raw[data_start + 2])
+                            decoded["hold_time_seconds"] = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
+                            decoded["motion_sensitivity"] = int(raw[data_start + 6])
+                        except Exception:
+                            decoded["brightness_threshold"] = None
+                            decoded["hold_time_seconds"] = None
+                            decoded["motion_sensitivity"] = None
+                        decoded["records"] = [{
+                            "id": dev_id,
+                            "online": None,
+                            "br_raw": None,
+                            "br": {"type": "single", "raw": None, "pct": None},
+                            "hold_time_seconds": decoded.get("hold_time_seconds"),
+                            "brightness_threshold": decoded.get("brightness_threshold"),
+                            "motion_sensitivity": decoded.get("motion_sensitivity"),
+                            "value_byte": None,
+                            "tail_flag": None,
+                            "is_on_from_tail": None,
+                            "sequence_or_counter": None,
+                        }]
+                        return decoded
+                decoded["records"] = [{
+                    "id": decoded["device_id"],
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "timer_total_seconds": decoded["timer_total_seconds"],
+                    "timer_remaining_seconds": decoded["timer_remaining_seconds"],
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "sequence_or_counter": None,
+                }]
+                return decoded
+
             # Observed switch/light BLE payload shape currently appears to be:
             # [.. .. .. .. .. .. .. .. .. .. dev_id seq level tail]
             # with examples like:
@@ -2245,6 +2399,7 @@ class PixieAuthHandler:
                 return
 
             kind = decoded.get("kind")
+            self._log_debug("BLE apply: kind=%s hex_preview=%s", kind, ble_hex[:40] if ble_hex else "none")
             records = decoded.get("records") if isinstance(decoded.get("records"), list) else []
 
             if kind == "bulk":
@@ -2261,6 +2416,53 @@ class PixieAuthHandler:
                         full_snapshot=full_snapshot,
                     )
                     self._log_debug("Inventory bulk update: applied=%s", applied)
+                return
+
+            if kind == "timer_status":
+                if not self.inventory:
+                    return
+                first = records[0] if records else {}
+                dev_id = first.get("id")
+                timer_total = first.get("timer_total_seconds")
+                timer_remaining = first.get("timer_remaining_seconds")
+                if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                    import time as _time
+                    self.inventory.apply_device_update(
+                        dev_id,
+                        source="hub_update",
+                        timer_total_seconds=timer_total,
+                        timer_remaining_seconds=timer_remaining,
+                        last_timer_poll_at=_time.time(),
+                    )
+                    self._log_debug(
+                        "Timer status update: dev_id=%s total=%s remaining=%s",
+                        dev_id,
+                        timer_total,
+                        timer_remaining,
+                    )
+                    self._notify_inventory_updated()
+                return
+
+            if kind == "sensor_params":
+                if not self.inventory:
+                    return
+                dev_id = decoded.get("device_id")
+                if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                    self.inventory.apply_device_update(
+                        dev_id,
+                        source="hub_update",
+                        hold_time_seconds=decoded.get("hold_time_seconds"),
+                        brightness_threshold=decoded.get("brightness_threshold"),
+                        motion_sensitivity=decoded.get("motion_sensitivity"),
+                    )
+                    self._log_debug(
+                        "Sensor params update: dev_id=%s hold=%s bright=%s sens=%s",
+                        dev_id,
+                        decoded.get("hold_time_seconds"),
+                        decoded.get("brightness_threshold"),
+                        decoded.get("motion_sensitivity"),
+                    )
+                    self._notify_inventory_updated()
                 return
 
             if not records:
@@ -2282,6 +2484,14 @@ class PixieAuthHandler:
             value_byte = first.get("value_byte")
             tail = first.get("tail_flag")
             on_tail = first.get("is_on_from_tail")
+            if rec.capabilities.supports_timer:
+                self._log_debug(
+                    "TIMER bleData: dev_id=%s model=%s value=0x%02x tail=0x%02x",
+                    dev_id,
+                    rec.model_no,
+                    value_byte if isinstance(value_byte, int) else 0,
+                    tail if isinstance(tail, int) else 0,
+                )
             self._log_debug(
                 "BLE decode: dev_id=%s seq=%s value=0x%02x tail=0x%02x on_tail=%s",
                 dev_id,
@@ -2359,6 +2569,45 @@ class PixieAuthHandler:
                         update_kwargs["br"] = 100 if relay_on else 0
                     if isinstance(motion, bool):
                         update_kwargs["motion"] = motion
+                elif mode == "timer_switch":
+                    timer_mode = interpreted.get("timer_mode")
+                    restarting = interpreted.get("restarting")
+                    self._log_debug(
+                        "TIMER interpreted: dev_id=%s value=0x%02x timer_mode=%s restart=%s",
+                        dev_id,
+                        value_byte,
+                        timer_mode,
+                        restarting,
+                    )
+                    if timer_mode == "timer":
+                        update_kwargs["mode"] = 1
+                        update_kwargs["br"] = 100
+                        # If mode changed to timer externally (was override/None),
+                        # or the light just turned on in timer mode externally,
+                        # estimate remaining = total and flag that a poll is needed.
+                        prev_mode = rec.runtime.mode
+                        prev_on = rec.runtime.is_on
+                        if prev_mode != 1 or (not prev_on and timer_mode == "timer"):
+                            import time as _time
+                            if rec.runtime.timer_total_seconds is not None:
+                                update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+                            update_kwargs["last_timer_poll_at"] = _time.time()
+                            update_kwargs["timer_needs_poll"] = True
+                    elif timer_mode == "override":
+                        update_kwargs["mode"] = 2
+                        update_kwargs["br"] = 100
+                    elif timer_mode is None:
+                        # Light is off — only update br; keep the last known mode
+                        # so the select entity doesn't flip to "unknown"
+                        update_kwargs["br"] = 0
+                    if restarting:
+                        # Reset local countdown estimation so the sensor shows
+                        # the full duration immediately, and flag for an early poll.
+                        import time as _time
+                        if rec.runtime.timer_total_seconds is not None:
+                            update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+                        update_kwargs["last_timer_poll_at"] = _time.time()
+                        update_kwargs["timer_needs_poll"] = True
                 elif mode == "raw":
                     # Raw on/off-only models use the value byte directly.
                     # Keep tail-derived fields for debugging only until their
@@ -2387,6 +2636,17 @@ class PixieAuthHandler:
             )
             if updated_runtime is None:
                 return
+
+            if rec.capabilities.supports_timer:
+                self._log_debug(
+                    "TIMER state after update: dev_id=%s br=%s mode=%s is_on=%s total=%s remaining=%s",
+                    dev_id,
+                    updated_runtime.br,
+                    updated_runtime.mode,
+                    updated_runtime.is_on,
+                    updated_runtime.timer_total_seconds,
+                    updated_runtime.timer_remaining_seconds,
+                )
 
             self._notify_inventory_updated()
 
@@ -2476,6 +2736,37 @@ class PixieAuthHandler:
             elif target == "cover":
                 # Cover commands are button presses, not authoritative state updates.
                 pass
+            elif target == "timer_relay":
+                update_kwargs["br"] = 100 if value else 0
+                if value:
+                    update_kwargs["mode"] = 1  # Timer mode on turn-on; on turn-off leave mode unchanged
+            elif target == "timer_override":
+                update_kwargs["br"] = 100
+                update_kwargs["mode"] = 2  # Override mode
+            elif target == "timer_restart":
+                update_kwargs["br"] = 100
+                update_kwargs["mode"] = 1  # Timer mode
+                # Reset local countdown estimation
+                update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+            elif target == "timer_mode":
+                mode_value = int(value) if value is not None else 1
+                update_kwargs["mode"] = mode_value
+                if mode_value == 2:
+                    update_kwargs["br"] = 100
+                elif mode_value == 1:
+                    update_kwargs["br"] = 100
+            elif target == "timer_duration":
+                pass  # Duration changes are confirmed by hub response
+            elif target == "hold_time":
+                update_kwargs["hold_time_seconds"] = int(value) if value is not None else None
+            elif target == "brightness_threshold":
+                update_kwargs["brightness_threshold"] = int(value) if value is not None else None
+            elif target == "motion_sensitivity":
+                update_kwargs["motion_sensitivity"] = int(value) if value is not None else None
+            elif target == "timer_poll_stamp":
+                # Record poll timestamp for countdown estimation
+                import time as _time
+                update_kwargs["last_timer_poll_at"] = _time.time()
             elif target == "mode":
                 # Sensor mode commands normalize switch/manual to mode 0 and default relay to off.
                 mode_value = int(value)
@@ -2599,6 +2890,27 @@ class PixieAuthHandler:
         def _default_effect_speed(rec: Optional[Any]) -> int:
             return 0x04
 
+        def _send_edit_sequence(command_list, from_email):
+            """Send a list of (hex, repeat) edit-mode commands with 200 ms delays.
+
+            Used before parameter changes (timer set-duration, sensor hold time /
+            brightness / sensitivity) so the hub has time to process each command
+            before the next one arrives.
+            """
+            for ch, repeat in command_list:
+                cmd_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=ch,
+                    from_email=from_email,
+                    repeat=repeat,
+                )
+                self._log_debug("Edit sequence cmd hex: %s", ch)
+                sock.sendall(cmd_debug["base64"].encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+                _drain_incoming()
+                time.sleep(0.2)
+
         def _send_requested_local_command(
             *,
             command_device_id: int,
@@ -2611,6 +2923,10 @@ class PixieAuthHandler:
             command_cover_action: Optional[str] = None,
             command_cover_action_map: Optional[Dict[str, int]] = None,
             command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
+            command_timer_action: Optional[str] = None,
+            command_timer_duration: Optional[int] = None,
+            command_sensor_param: Optional[str] = None,
+            command_sensor_param_value: Optional[int] = None,
         ) -> Dict[str, Any]:
             """Send one local command on the already-authenticated TCP socket."""
             if not readiness["ready_signaled"]:
@@ -2658,10 +2974,10 @@ class PixieAuthHandler:
             if is_cover_cmd and rec and not rec.capabilities.supports_cover:
                 raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
 
-            if is_mode_cmd and rec and not rec.capabilities.supports_sensor:
+            if is_mode_cmd and rec and not rec.capabilities.supports_sensor and not rec.capabilities.supports_timer:
                 raise PixieAuthError(f"Model {rec.model_no} does not support mode commands")
 
-            if is_mode_cmd and rec:
+            if is_mode_cmd and rec and rec.capabilities.supports_sensor:
                 allowed_sensor_modes = get_supported_sensor_mode_values(rec.model_no)
                 requested_sensor_mode = int(command_mode)
                 if requested_sensor_mode not in allowed_sensor_modes:
@@ -2675,6 +2991,292 @@ class PixieAuthHandler:
                     raise PixieAuthError(f"Model {rec.model_no} does not support effects")
                 if command_effect.strip().lower() not in allowed_effects:
                     raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
+
+            # ── Sensor (3001/3002) poll dispatch ──
+            if command_timer_action == "poll" and rec and rec.capabilities.supports_sensor:
+                command_hex = self._build_sensor_poll_command_hex(command_device_id)
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                    repeat=1,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug("Sending sensor poll: dev_id=%s opcode=f96b69", command_device_id)
+                if self.verbose:
+                    self._print_local_command_debug(command_debug)
+                command_parsed = _parse_message(command_b64, extracted_key)
+                command_route, command_match = _classify_message("out", command_parsed)
+                _log_message("out", command_parsed, command_route, command_match)
+                sock.sendall(command_b64.encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+                _drain_incoming()
+                return {"target": "sensor_poll", "device_id": command_device_id}
+
+            # ── Sensor (3001/3002) parameter command dispatch ──
+            if command_sensor_param is not None and rec and rec.capabilities.supports_sensor:
+                param_map = {
+                    "hold_time": 5,
+                    "brightness_threshold": 4,
+                    "motion_sensitivity": 2,
+                }
+                param_id = param_map.get(command_sensor_param)
+                if param_id is None:
+                    raise PixieAuthError(f"Unknown sensor param: {command_sensor_param}")
+                if command_sensor_param_value is None:
+                    raise PixieAuthError(f"Missing value for sensor param: {command_sensor_param}")
+
+                # Enter edit mode before changing parameters (same 3-command
+                # sequence the app uses), then send the parameter change.
+                ka = {"counter_attr": "_timer_command_counter", "minimum_counter": 0x01}
+                edit_list: list[tuple[str, int]] = [
+                    (self._build_shifted_prefix_command_hex(
+                        command_device_id, opcode=b"\xd9\x6b\x69", payload=b"\x77\x00", **ka,
+                    ), 1),
+                    (self._build_shifted_prefix_command_hex(
+                        command_device_id, opcode=b"\xf9\x6b\x69", payload=b"\x01\x00" + b"\x00" * 8, **ka,
+                    ), 1),
+                    (self._build_shifted_prefix_command_hex(
+                        command_device_id, opcode=b"\xfd\x6b\x69", payload=b"\x10\x00", **ka,
+                    ), 1),
+                ]
+                _send_edit_sequence(edit_list, sender_identity)
+
+                command_hex = self._build_sensor_param_command_hex(
+                    command_device_id, param_id, command_sensor_param_value
+                )
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug(
+                    "Sending sensor param: dev_id=%s param=%s(%s) value=%s opcode=d26c69",
+                    command_device_id,
+                    command_sensor_param,
+                    param_id,
+                    command_sensor_param_value,
+                )
+                if self.verbose:
+                    self._print_local_command_debug(command_debug)
+
+                command_parsed = _parse_message(command_b64, extracted_key)
+                command_route, command_match = _classify_message("out", command_parsed)
+                _log_message("out", command_parsed, command_route, command_match)
+                sock.sendall(command_b64.encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+                _drain_incoming()
+
+                _apply_local_command_optimistic_update(
+                    command_device_id,
+                    command_sensor_param_value,
+                    command_hex,
+                    target=command_sensor_param,
+                    opcode_name="d26c69",
+                )
+                return {"target": command_sensor_param, "device_id": command_device_id}
+
+            # ── Timer switch (2113) command dispatch ──
+            is_timer_cmd = rec and rec.capabilities.supports_timer and (
+                command_timer_action is not None
+                or command_timer_duration is not None
+                or (is_mode_cmd and not rec.capabilities.supports_sensor)
+                or (command_state is not None and not is_cover_cmd and not is_effect_cmd and not is_color_cmd and not is_brightness_cmd and not is_mode_cmd)
+            )
+
+            if is_timer_cmd:
+                self._log_debug(
+                    "TIMER dispatch: dev_id=%s action=%s state=%s mode=%s duration=%s",
+                    command_device_id,
+                    command_timer_action,
+                    command_state,
+                    command_mode,
+                    command_timer_duration,
+                )
+                if command_timer_action == "restart":
+                    command_hex = self._build_timer_restart_command_hex(command_device_id)
+                    self._log_debug("Sending timer restart command: device_id=%s opcode=c16969", command_device_id)
+                elif command_timer_action == "override":
+                    command_hex = self._build_timer_override_command_hex(command_device_id)
+                    self._log_debug("Sending timer override command: device_id=%s opcode=c16969", command_device_id)
+                elif command_timer_action == "set_duration":
+                    duration = int(command_timer_duration) if command_timer_duration is not None else 60
+                    command_hex_list = self._build_timer_set_duration_commands(command_device_id, duration)
+                    self._log_debug(
+                        "Sending timer set-duration sequence (%s commands): device_id=%s duration=%s",
+                        len(command_hex_list),
+                        command_device_id,
+                        duration,
+                    )
+                    _send_edit_sequence(command_hex_list, sender_identity)
+                    # Wait for the save to take effect, then poll for the new value
+                    time.sleep(0.1)
+                    # Send a poll after save to read back the updated timer_total_seconds
+                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
+                    poll_debug = self._build_local_bledata_command_debug(
+                        key=extracted_key,
+                        command_hex=poll_hex,
+                        from_email=sender_identity,
+                        repeat=1,
+                    )
+                    sock.sendall(poll_debug["base64"].encode("utf-8"))
+                    if runtime_session is not None:
+                        runtime_session.mark_command_sent()
+                    _drain_incoming()
+
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        duration,
+                        "",
+                        target="timer_duration",
+                        opcode_name="c46969",
+                    )
+                    return {"target": "timer_duration", "device_id": command_device_id}
+                elif command_timer_action == "poll":
+                    command_hex = self._build_timer_poll_command_hex(command_device_id)
+                    self._log_debug("Sending timer poll command: device_id=%s opcode=f96b69", command_device_id)
+                    # Stamp poll time before send so the sensor can estimate elapsed time
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        None,
+                        command_hex,
+                        target="timer_poll_stamp",
+                        opcode_name="f96b69",
+                    )
+                elif command_mode is not None:
+                    # Mode switch: mode=1→timer, mode=2→override
+                    if command_mode == 2:
+                        command_hex = self._build_timer_override_command_hex(command_device_id)
+                        self._log_debug("Sending timer mode switch (override): device_id=%s", command_device_id)
+                    else:
+                        # Mode=timer: turn on with timer mode (ed6969)
+                        command_hex = self._build_timer_onoff_command_hex(command_device_id, is_on=True)
+                        self._log_debug("Sending timer mode switch (timer, light on): device_id=%s", command_device_id)
+                elif command_state is not None:
+                    command_hex = self._build_timer_onoff_command_hex(command_device_id, is_on=command_state)
+                    self._log_debug(
+                        "Sending timer on/off command: device_id=%s state=%s opcode=ed6969",
+                        command_device_id,
+                        "on" if command_state else "off",
+                    )
+                else:
+                    # Fallback: treat as poll
+                    command_hex = self._build_timer_poll_command_hex(command_device_id)
+
+                cmd_repeat = 1 if command_timer_action == "poll" else 0
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                    repeat=cmd_repeat,
+                )
+                command_b64 = command_debug["base64"]
+                if self.verbose:
+                    self._log_debug("Timer command hex: %s", command_hex)
+                    self._print_local_command_debug(command_debug)
+
+                command_parsed = _parse_message(command_b64, extracted_key)
+                command_route, command_match = _classify_message("out", command_parsed)
+                _log_message("out", command_parsed, command_route, command_match)
+                sock.sendall(command_b64.encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+
+                _drain_incoming()
+
+                if command_timer_action == "restart":
+                    # After restart, poll immediately for fresh countdown
+                    time.sleep(0.2)
+                    _drain_incoming()
+                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
+                    poll_debug = self._build_local_bledata_command_debug(
+                        key=extracted_key,
+                        command_hex=poll_hex,
+                        from_email=sender_identity,
+                        repeat=1,
+                    )
+                    sock.sendall(poll_debug["base64"].encode("utf-8"))
+                    if runtime_session is not None:
+                        runtime_session.mark_command_sent()
+                    _drain_incoming()
+
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        True,
+                        command_hex,
+                        target="timer_restart",
+                        opcode_name="c16969",
+                    )
+                    return {"target": "timer_restart", "device_id": command_device_id}
+                if command_timer_action == "override":
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        True,
+                        command_hex,
+                        target="timer_override",
+                        opcode_name="c16969",
+                    )
+                    return {"target": "timer_override", "device_id": command_device_id}
+                if command_timer_action == "poll":
+                    return {"target": "timer_poll", "device_id": command_device_id}
+                if command_mode is not None:
+                    # After switching to timer mode (mode=1), poll for countdown.
+                    if command_mode == 1:
+                        time.sleep(0.2)
+                        _drain_incoming()
+                        poll_hex = self._build_timer_poll_command_hex(command_device_id)
+                        poll_debug = self._build_local_bledata_command_debug(
+                            key=extracted_key,
+                            command_hex=poll_hex,
+                            from_email=sender_identity,
+                            repeat=1,
+                        )
+                        sock.sendall(poll_debug["base64"].encode("utf-8"))
+                        if runtime_session is not None:
+                            runtime_session.mark_command_sent()
+                        _drain_incoming()
+
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        int(command_mode),
+                        command_hex,
+                        target="timer_mode",
+                        opcode_name="ed6969" if command_mode == 1 else "c16969",
+                    )
+                    return {"target": "timer_mode", "device_id": command_device_id}
+                # After turning on in timer mode, poll for initial countdown.
+                # Brief delay so the hub finishes processing the turn-on first.
+                if command_state:
+                    time.sleep(0.2)
+                    _drain_incoming()
+                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
+                    self._log_debug(
+                        "TIMER post-on poll: dev_id=%s hex=%s",
+                        command_device_id,
+                        poll_hex,
+                    )
+                    poll_debug = self._build_local_bledata_command_debug(
+                        key=extracted_key,
+                        command_hex=poll_hex,
+                        from_email=sender_identity,
+                        repeat=1,
+                    )
+                    sock.sendall(poll_debug["base64"].encode("utf-8"))
+                    if runtime_session is not None:
+                        runtime_session.mark_command_sent()
+                    _drain_incoming()
+
+                _apply_local_command_optimistic_update(
+                    command_device_id,
+                    command_state,
+                    command_hex,
+                    target="timer_relay",
+                    opcode_name="ed6969",
+                )
+                return {"target": "timer_relay", "device_id": command_device_id}
 
             if is_effect_cmd:
                 effect_name = command_effect.strip().lower()
@@ -3154,6 +3756,8 @@ class PixieAuthHandler:
                         command_effect,
                         command_mode,
                         command_cover_action,
+                        command_timer_action,
+                        command_sensor_param,
                     )
                 )
                 if command_device_id is not None and has_any_command:
@@ -3169,6 +3773,10 @@ class PixieAuthHandler:
                             command_cover_action=command_cover_action,
                             command_cover_action_map=command_cover_action_map,
                             command_cover_tilt_action_map=command_cover_tilt_action_map,
+                            command_timer_action=command_timer_action,
+                            command_timer_duration=command_timer_duration,
+                            command_sensor_param=command_sensor_param,
+                            command_sensor_param_value=command_sensor_param_value,
                         )
                     except Exception as exc:
                         self._log_warning("Local command not sent: %s", exc)
@@ -3310,6 +3918,22 @@ class PixieAuthHandler:
     def _next_brightness_sequence(self) -> bytes:
         """Return the captured 3-byte dimmer/cover command prefix."""
         return self._next_shifted_sequence(counter_attr="_command_counter", minimum_counter=0x10)
+
+    def _build_shifted_prefix_command_hex(
+        self,
+        destination_id: int,
+        opcode: bytes,
+        payload: bytes,
+        *,
+        counter_attr: str,
+        minimum_counter: int,
+    ) -> str:
+        """Build a command with the shifted-sequence prefix: [c|c>>1|c>>2][0304][dst_le][opcode:3][payload]."""
+        sequence = self._next_shifted_sequence(counter_attr=counter_attr, minimum_counter=minimum_counter)
+        src_bytes = (1027).to_bytes(2, byteorder="little")
+        dst_bytes = int(destination_id).to_bytes(2, byteorder="little", signed=False)
+        packet = sequence + src_bytes + dst_bytes + opcode + payload
+        return packet.hex()
 
     def _build_sensor_mode_payload(self, *, mode: int, relay: int) -> bytes:
         """Return the captured 3001 mode payload after c16969."""
@@ -3543,13 +4167,127 @@ class PixieAuthHandler:
             raise PixieAuthError(f"Unsupported command target: {target}")
         return spec_map[normalized]
 
-    def _build_local_bledata_command_debug(self, *, key: str, command_hex: str, from_email: str) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Sensor (3001/3002) parameter commands
+    # ------------------------------------------------------------------
+
+    def _build_sensor_poll_command_hex(self, device_id: int) -> str:
+        """Build the 3001-specific f96b69 poll to query hold time, brightness, sensitivity."""
+        payload = b"\x01\x00" + b"\x00" * 8
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xf9\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_sensor_param_command_hex(self, device_id: int, param_id: int, value: int) -> str:
+        """Build a d26c69 parameter-setting command.
+
+        param_id: 2=sensitivity, 4=brightness threshold, 5=hold time (seconds).
+        Payload: [param_id] [value_le:2] [zeros:7] = 10 bytes (matches capture).
+        """
+        payload = bytes([param_id]) + int(value).to_bytes(2, byteorder="little") + b"\x00" * 7
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xd2\x6c\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    # ------------------------------------------------------------------
+    # Timer switch (2113) command builders
+    # ------------------------------------------------------------------
+
+    def _build_timer_onoff_command_hex(self, device_id: int, *, is_on: bool) -> str:
+        """Build ed6969 on/off command for timer switch using shifted-sequence prefix."""
+        state_byte = b"\x01" if is_on else b"\x00"
+        payload = state_byte + b"\x00" * 9
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xed\x69\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_timer_override_command_hex(self, device_id: int) -> str:
+        """Build c46969 override command (payload 0x02)."""
+        payload = b"\x02" + b"\x00" * 7
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xc4\x69\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_timer_restart_command_hex(self, device_id: int) -> str:
+        """Build c46969 restart command (payload 0x06)."""
+        payload = b"\x06" + b"\x00" * 7
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xc4\x69\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_timer_poll_command_hex(self, device_id: int) -> str:
+        """Build f96b69 timer poll command to request countdown status."""
+        payload = b"\x05\x00\x00\x00\x00\x77\x00"
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xf9\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_timer_set_duration_commands(self, device_id: int, duration_seconds: int) -> list[tuple[str, int]]:
+        """Build the 4-command sequence to set timer duration on the device.
+
+        Sequence: d96b69 enter edit → f96b69 ack → fd6b69 value → c46969 save.
+        Duration is in seconds (1-86400, matching the device's 1 sec to 24 hour range).
+        Returns a list of (hex, repeat) tuples to send in order.
+        """
+        if not (1 <= duration_seconds <= 86400):
+            raise PixieAuthError(f"Timer duration must be 1-86400 seconds, got {duration_seconds}")
+
+        ka = {"counter_attr": "_timer_command_counter", "minimum_counter": 0x01}
+        commands: list[tuple[str, int]] = []
+
+        # 1. Enter edit mode: d96b69 (repeat=1)
+        commands.append((self._build_shifted_prefix_command_hex(
+            device_id, opcode=b"\xd9\x6b\x69", payload=b"\x00\x00\x00", **ka,
+        ), 1))
+
+        # 2. Timer ack/poll: f96b69 (repeat=1)
+        commands.append((self._build_timer_poll_command_hex(device_id), 1))
+
+        # 3. Timer duration value: fd6b69 (repeat=1)
+        commands.append((self._build_shifted_prefix_command_hex(
+            device_id, opcode=b"\xfd\x6b\x69", payload=b"\x10\x00", **ka,
+        ), 1))
+
+        # 4. Save timer: c46969 (repeat=0)
+        dur_bytes = int(duration_seconds).to_bytes(2, byteorder="little")
+        payload = b"\x04" + dur_bytes + b"\x00" * 4
+        commands.append((self._build_shifted_prefix_command_hex(
+            device_id, opcode=b"\xc4\x69\x69", payload=payload, **ka,
+        ), 0))
+
+        return commands
+
+    def _build_local_bledata_command_debug(self, *, key: str, command_hex: str, from_email: str, repeat: int = 0) -> Dict[str, Any]:
         """Build a local bleData command and return all debug stages."""
         payload = {
             "data": {
                 "type": "bleData",
                 "data": command_hex,
-                "repeat": 0,
+                "repeat": repeat,
             },
             "from": from_email,
         }
