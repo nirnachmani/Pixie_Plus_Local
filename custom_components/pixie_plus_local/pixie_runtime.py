@@ -1916,6 +1916,43 @@ class PixieAuthHandler:
                 meshnet,
             )
 
+            # Fallback: many Pixie accounts do not include `curHome` in the login
+            # response, leaving homeid/meshNet/netID unresolved ("unknown"). In that
+            # case, query the Home class directly and adopt the account's home.
+            if homeid is None or str(homeid) in ("", "unknown", "None"):
+                try:
+                    home_list_headers = {
+                        "x-parse-session-token": sessiontoken,
+                        "x-parse-application-id": APPLICATION_ID,
+                        "x-parse-client-key": CLIENT_KEY,
+                    }
+                    home_list_resp = httpx.get(
+                        API_URL["home"], params={"limit": 10}, headers=home_list_headers
+                    )
+                    home_list_resp.raise_for_status()
+                    home_results = home_list_resp.json().get("results", [])
+                    if home_results:
+                        home0 = home_results[0]
+                        homeid = home0.get("objectId", homeid)
+                        if home0.get("name"):
+                            home_name = str(home0.get("name"))
+                        if home0.get("meshNet") is not None:
+                            meshnet = str(home0.get("meshNet"))
+                        if home0.get("meshNet2") is not None:
+                            meshnet2 = str(home0.get("meshNet2"))
+                        if home0.get("netID") is not None:
+                            netid = str(home0.get("netID"))
+                        self._log_debug(
+                            "Resolved home via Home-class fallback: home=%s meshNet=%s meshNet2=%s netID=%s",
+                            homeid, meshnet, meshnet2, netid,
+                        )
+                    else:
+                        self._log_warning(
+                            "Home-class fallback returned no homes for this account"
+                        )
+                except Exception as exc:
+                    self._log_debug("Home-class fallback failed: %s", exc)
+
             # Try to get meshNet from LiveGroup
             try:
                 headers = {
