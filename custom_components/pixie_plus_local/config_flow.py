@@ -506,7 +506,7 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize the options flow."""
-        self.config_entry = config_entry
+        super().__init__(config_entry=config_entry)
         self._selected_cover_controller_id: str | None = None
 
     def _cover_devices(self) -> dict[str, str]:
