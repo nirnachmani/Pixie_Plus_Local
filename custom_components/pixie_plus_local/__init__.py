@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -744,6 +745,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Clean up entity and device registry entries that are no longer in the
+    # live inventory (e.g. devices deleted from the Pixie app).
+    if runtime_data.pixie_runtime.inventory is not None:
+        inv = runtime_data.pixie_runtime.inventory
+        endpoint_keys = (
+            "main", "mode", "timer_mode", "restart", "timer_remaining",
+            "timer_duration", "hold_time", "brightness_threshold",
+            "motion_sensitivity", "refresh_params", "left", "right",
+            "usb", "sensor_light_state",
+        )
+        valid_entity_ids: set[str] = set()
+        valid_device_ids: set[str] = {gateway_device_identifier(inv)}
+        for device_id in inv.devices_by_id:
+            record = inv.devices_by_id[device_id]
+            valid_device_ids.add(physical_device_identifier(record))
+            for key in endpoint_keys:
+                valid_entity_ids.add(endpoint_unique_identifier(record, key))
+
+        # Remove orphaned entities
+        ent_reg = er.async_get(hass)
+        stale_entities = [
+            entity.entity_id
+            for entity in ent_reg.entities.values()
+            if entity.config_entry_id == entry.entry_id
+            and entity.unique_id not in valid_entity_ids
+        ]
+        for entity_id in stale_entities:
+            ent_reg.async_remove(entity_id)
+            LOGGER.debug("Removed orphaned entity: %s", entity_id)
+
+        # Remove orphaned devices
+        dev_reg = dr.async_get(hass)
+        stale_devices = [
+            device.id
+            for device in dev_reg.devices.values()
+            if entry.entry_id in device.config_entries
+            and not any(
+                ident in valid_device_ids
+                for ident_set in device.identifiers
+                for ident in ident_set
+            )
+        ]
+        for device_id in stale_devices:
+            dev_reg.async_remove_device(device_id)
+            LOGGER.debug("Removed orphaned device: %s", device_id)
 
     return True
 
