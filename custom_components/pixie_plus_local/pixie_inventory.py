@@ -12,11 +12,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import json
+import logging
 
-from .pixie_value_profiles import decode_value_byte, get_model_capabilities, hardware_list
+from .pixie_value_profiles import decode_gate_state_byte, decode_value_byte, get_model_capabilities, hardware_list
 
 
 STATE_UNSET = object()
+LOGGER = logging.getLogger(__name__)
 
 
 def online_value_is_online(value: Any) -> bool:
@@ -154,6 +156,16 @@ class RuntimeState:
     hold_time_seconds: Optional[int] = None
     brightness_threshold: Optional[int] = None
     motion_sensitivity: Optional[int] = None
+    door1_state: Optional[int] = None
+    door2_state: Optional[int] = None
+    door1_decoded: Optional[Dict[str, Any]] = None
+    door2_decoded: Optional[Dict[str, Any]] = None
+    door1_motion_plan: Optional[Dict[str, Any]] = None
+    door2_motion_plan: Optional[Dict[str, Any]] = None
+    door1_open_duration_ms: Optional[int] = None
+    door1_close_duration_ms: Optional[int] = None
+    door2_open_duration_ms: Optional[int] = None
+    door2_close_duration_ms: Optional[int] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     last_source: str = "cloud_seed"
     last_updated_ms: Optional[int] = None
@@ -178,6 +190,16 @@ class RuntimeState:
             "hold_time_seconds": self.hold_time_seconds,
             "brightness_threshold": self.brightness_threshold,
             "motion_sensitivity": self.motion_sensitivity,
+            "door1_state": self.door1_state,
+            "door2_state": self.door2_state,
+            "door1_decoded": self.door1_decoded,
+            "door2_decoded": self.door2_decoded,
+            "door1_motion_plan": self.door1_motion_plan,
+            "door2_motion_plan": self.door2_motion_plan,
+            "door1_open_duration_ms": self.door1_open_duration_ms,
+            "door1_close_duration_ms": self.door1_close_duration_ms,
+            "door2_open_duration_ms": self.door2_open_duration_ms,
+            "door2_close_duration_ms": self.door2_close_duration_ms,
             "raw": self.raw,
             "last_source": self.last_source,
             "last_updated_ms": self.last_updated_ms,
@@ -204,6 +226,16 @@ class RuntimeState:
             hold_time_seconds=_normalize_optional_int(data.get("hold_time_seconds")),
             brightness_threshold=_normalize_optional_int(data.get("brightness_threshold")),
             motion_sensitivity=_normalize_optional_int(data.get("motion_sensitivity")),
+            door1_state=_normalize_optional_int(data.get("door1_state")),
+            door2_state=_normalize_optional_int(data.get("door2_state")),
+            door1_decoded=dict(data.get("door1_decoded") or {}) or None,
+            door2_decoded=dict(data.get("door2_decoded") or {}) or None,
+            door1_motion_plan=dict(data.get("door1_motion_plan") or {}) or None,
+            door2_motion_plan=dict(data.get("door2_motion_plan") or {}) or None,
+            door1_open_duration_ms=_normalize_optional_int(data.get("door1_open_duration_ms")),
+            door1_close_duration_ms=_normalize_optional_int(data.get("door1_close_duration_ms")),
+            door2_open_duration_ms=_normalize_optional_int(data.get("door2_open_duration_ms")),
+            door2_close_duration_ms=_normalize_optional_int(data.get("door2_close_duration_ms")),
             raw=dict(data.get("raw") or {}),
             last_source=str(data.get("last_source") or "snapshot"),
             last_updated_ms=data.get("last_updated_ms"),
@@ -246,6 +278,16 @@ class DeviceStateStore:
         hold_time_seconds: Any = STATE_UNSET,
         brightness_threshold: Any = STATE_UNSET,
         motion_sensitivity: Any = STATE_UNSET,
+        door1_state: Any = STATE_UNSET,
+        door2_state: Any = STATE_UNSET,
+        door1_decoded: Any = STATE_UNSET,
+        door2_decoded: Any = STATE_UNSET,
+        door1_motion_plan: Any = STATE_UNSET,
+        door2_motion_plan: Any = STATE_UNSET,
+        door1_open_duration_ms: Any = STATE_UNSET,
+        door1_close_duration_ms: Any = STATE_UNSET,
+        door2_open_duration_ms: Any = STATE_UNSET,
+        door2_close_duration_ms: Any = STATE_UNSET,
         raw: Any = STATE_UNSET,
         updated_ms: Optional[int] = None,
     ) -> Optional[RuntimeState]:
@@ -293,6 +335,26 @@ class DeviceStateStore:
             runtime.brightness_threshold = _normalize_optional_int(brightness_threshold)
         if motion_sensitivity is not STATE_UNSET:
             runtime.motion_sensitivity = _normalize_optional_int(motion_sensitivity)
+        if door1_state is not STATE_UNSET:
+            runtime.door1_state = _normalize_optional_int(door1_state)
+        if door2_state is not STATE_UNSET:
+            runtime.door2_state = _normalize_optional_int(door2_state)
+        if door1_decoded is not STATE_UNSET:
+            runtime.door1_decoded = dict(door1_decoded) if isinstance(door1_decoded, dict) else None
+        if door2_decoded is not STATE_UNSET:
+            runtime.door2_decoded = dict(door2_decoded) if isinstance(door2_decoded, dict) else None
+        if door1_motion_plan is not STATE_UNSET:
+            runtime.door1_motion_plan = dict(door1_motion_plan) if isinstance(door1_motion_plan, dict) else None
+        if door2_motion_plan is not STATE_UNSET:
+            runtime.door2_motion_plan = dict(door2_motion_plan) if isinstance(door2_motion_plan, dict) else None
+        if door1_open_duration_ms is not STATE_UNSET:
+            runtime.door1_open_duration_ms = _normalize_optional_int(door1_open_duration_ms)
+        if door1_close_duration_ms is not STATE_UNSET:
+            runtime.door1_close_duration_ms = _normalize_optional_int(door1_close_duration_ms)
+        if door2_open_duration_ms is not STATE_UNSET:
+            runtime.door2_open_duration_ms = _normalize_optional_int(door2_open_duration_ms)
+        if door2_close_duration_ms is not STATE_UNSET:
+            runtime.door2_close_duration_ms = _normalize_optional_int(door2_close_duration_ms)
         if raw is not STATE_UNSET:
             runtime.raw = raw
 
@@ -340,6 +402,10 @@ class DeviceStateStore:
             update_mode = STATE_UNSET
             update_relay = STATE_UNSET
             update_motion = STATE_UNSET
+            update_door1 = STATE_UNSET
+            update_door2 = STATE_UNSET
+            update_door1_decoded = STATE_UNSET
+            update_door2_decoded = STATE_UNSET
 
             # Handle mode/relay for sensor-capable devices.
             mode_val = rec_data.get("mode")
@@ -369,6 +435,30 @@ class DeviceStateStore:
                                 update_br = 100 if relay_on else 0
                             if isinstance(motion, bool):
                                 update_motion = motion
+                elif inv_rec.capabilities.supports_gate:
+                    # Gate repurposes br=door1_state, rssi=door2_state
+                    update_door1 = _normalize_optional_int(br_obj.get("raw"))
+                    if isinstance(update_door1, int):
+                        update_door1_decoded = decode_gate_state_byte(0, update_door1)
+                        if not update_door1_decoded.get("known"):
+                            LOGGER.debug(
+                                "Gate unknown GwData byte: dev_id=%s door=1 raw=0x%02x source=%s",
+                                dev_id,
+                                update_door1,
+                                source,
+                            )
+                    rssi_raw = rec_data.get("rssi_raw")
+                    if rssi_raw is not None:
+                        update_door2 = _normalize_optional_int(rssi_raw)
+                        if isinstance(update_door2, int):
+                            update_door2_decoded = decode_gate_state_byte(1, update_door2)
+                            if not update_door2_decoded.get("known"):
+                                LOGGER.debug(
+                                    "Gate unknown GwData byte: dev_id=%s door=2 raw=0x%02x source=%s",
+                                    dev_id,
+                                    update_door2,
+                                    source,
+                                )
                 elif inv_rec.capabilities.supports_timer:
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
@@ -407,6 +497,10 @@ class DeviceStateStore:
                 mode=update_mode,
                 relay=update_relay,
                 motion=update_motion,
+                door1_state=update_door1,
+                door2_state=update_door2,
+                door1_decoded=update_door1_decoded,
+                door2_decoded=update_door2_decoded,
                 updated_ms=now_ms,
             )
             if runtime is None:
@@ -466,6 +560,8 @@ class DeviceCapabilities:
     brightness_threshold_options: List[str] = field(default_factory=list)
     supports_motion_sensitivity: bool = False
     motion_sensitivity_options: List[str] = field(default_factory=list)
+    supports_gate: bool = False
+    gate_doors: int = 0
     capability_hints: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -490,6 +586,8 @@ class DeviceCapabilities:
             "brightness_threshold_options": list(self.brightness_threshold_options),
             "supports_motion_sensitivity": self.supports_motion_sensitivity,
             "motion_sensitivity_options": list(self.motion_sensitivity_options),
+            "supports_gate": self.supports_gate,
+            "gate_doors": self.gate_doors,
             "capability_hints": dict(self.capability_hints),
         }
 
@@ -516,6 +614,8 @@ class DeviceCapabilities:
             brightness_threshold_options=list(data.get("brightness_threshold_options") or []),
             supports_motion_sensitivity=bool(data.get("supports_motion_sensitivity", False)),
             motion_sensitivity_options=list(data.get("motion_sensitivity_options") or []),
+            supports_gate=bool(data.get("supports_gate", False)),
+            gate_doors=int(data.get("gate_doors", 0)),
             capability_hints=dict(data.get("capability_hints") or {}),
         )
 
@@ -624,6 +724,8 @@ class PixieInventory:
         cap.brightness_threshold_options = model_caps["brightness_threshold_options"]
         cap.supports_motion_sensitivity = model_caps["supports_motion_sensitivity"]
         cap.motion_sensitivity_options = model_caps["motion_sensitivity_options"]
+        cap.supports_gate = model_caps["supports_gate"]
+        cap.gate_doors = int(model_caps["gate_doors"])
 
         cap.capability_hints = {
             "model_no": model_no,

@@ -6,10 +6,10 @@ Unlike the older Pixie Plus integration, this one controls the gateway locally o
 
 ## Features
 
-- Automatic gateway discovery
+- Automatic gateway discovery with manual IP option (e.g. if gateway is on another subnet) 
 - Local control through the Pixie Plus gateway
 - Local push-style state updates from the live gateway session
-- Lights, dimmers, switches, smart plugs, RGB strip control, and blinds
+- Lights, dimmers, switches, smart plugs, RGB strip control, blinds, timer, sensors and gate control
 - Blind button mapping is now done through the UI
 
 The integration intentionally does not implement Pixie Plus groups, scenes, schedules, or timers. Home Assistant already covers those use cases more cleanly.
@@ -40,7 +40,8 @@ The current code includes support for these model families:
 - LED Strip Controller - LT8915DIM/BT
 - Smart Passive Infrared Motion Sensor - SMS861CD/BTAM
 - Smart Passive Infrared Motion Sensor - SMS862WF/WH/BTAM
-- Smart timer switch - STS600BTAM
+- Smart timer switch - STS600BTAM - timer duration setting and countdown might not work - see Issues 
+- Gate & Door Control - PC206GD/R/BTAM
 
 For compatible models, the integration supports on/off, dimming, RGB color, and built-in effects where those capabilities exist.
 
