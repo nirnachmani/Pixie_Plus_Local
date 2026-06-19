@@ -10,12 +10,42 @@
           "password": "Password"
         }
       },
+      "gateway_ip": {
+        "title": "Enter gateway IP",
+        "description": "Auto-discovery did not find a Pixie gateway within 10 seconds. Enter the gateway IPv4 address to continue.",
+        "data": {
+          "gateway_ip": "Gateway IP address"
+        }
+      },
       "reconfigure": {
+        "title": "Reconfigure Pixie entry",
+        "description": "Choose what you want to update for this Pixie integration.",
+        "data": {},
+        "menu_options": {
+          "reconfigure_credentials": "Update fallback credentials",
+          "reconfigure_gateway_connection": "Gateway connection settings"
+        }
+      },
+      "reconfigure_credentials": {
         "title": "Add Pixie credentials",
         "description": "Direct local inventory is unavailable. Enter your Pixie account credentials so the integration can use cloud fallback when needed.",
         "data": {
           "username": "Username",
           "password": "Password"
+        }
+      },
+      "reconfigure_gateway_connection": {
+        "title": "Gateway connection",
+        "description": "Choose whether this entry should discover the gateway automatically over UDP or use a stored manual IP address.",
+        "data": {
+          "gateway_connection_mode": "Gateway connection mode"
+        }
+      },
+      "reconfigure_gateway_ip": {
+        "title": "Manual gateway IP",
+        "description": "Enter the Pixie gateway IPv4 address to store in this config entry.",
+        "data": {
+          "gateway_ip": "Gateway IP address"
         }
       },
       "cover_mapping": {
@@ -41,6 +71,7 @@
     },
     "error": {
       "invalid_auth": "Authentication failed.",
+      "invalid_gateway_ip": "Enter a valid IPv4 address.",
       "cannot_connect": "Could not connect to the Pixie gateway.",
       "unknown": "Unexpected error. Check the logs."
     },
@@ -54,6 +85,10 @@
     "missing_fallback_credentials": {
       "title": "Pixie credentials required for fallback",
       "description": "Direct local inventory is unavailable for {entry_title}. The integration is running from the stored inventory snapshot. Reconfigure the integration and enter your Pixie username and password so it can use cloud fallback when direct local inventory is unavailable."
+    },
+    "gateway_ip_required": {
+      "title": "Pixie gateway connection requires attention",
+      "description": "The integration could not reach the Pixie gateway for {entry_title}. Reconfigure the integration to enter a working gateway IP address or switch back to UDP discovery."
     }
   },
   "options": {

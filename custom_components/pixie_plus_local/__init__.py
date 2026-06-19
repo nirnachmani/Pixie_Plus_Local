@@ -18,7 +18,14 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .pixie_inventory import DeviceRecord, PixieInventory
-from .pixie_runtime import CloudParams, PixieAuthError, PixieAuthHandler, PixieRuntimeData
+from .pixie_runtime import (
+    CloudParams,
+    PixieAuthError,
+    PixieAuthHandler,
+    PixieGatewayConnectionError,
+    PixieGatewayResolutionError,
+    PixieRuntimeData,
+)
 from .pixie_value_profiles import hardware_list
 
 LOGGER = logging.getLogger(__name__)
@@ -35,12 +42,15 @@ CONF_MESHNET = "meshnet"
 CONF_MESHNET2 = "meshnet2"
 CONF_NETID = "netid"
 CONF_INVENTORY_MODE = "inventory_mode"
+CONF_GATEWAY_IP = "gateway_ip"
+CONF_GATEWAY_IP_REQUIRED = "gateway_ip_required"
 CONF_PIXIE_USERNAME = "pixie_username"
 CONF_PIXIE_PASSWORD = "pixie_password"
 
 INVENTORY_MODE_LOCAL_53216 = "local_53216"
 INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
 ISSUE_ID_MISSING_FALLBACK_CREDENTIALS = "missing_fallback_credentials"
+ISSUE_ID_GATEWAY_IP_REQUIRED = "gateway_ip_required"
 
 COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
 TIMER_POLL_INTERVAL_SECONDS = 10.0
@@ -102,6 +112,18 @@ def _entry_password(entry: ConfigEntry) -> str:
     return str(entry.data.get(CONF_PIXIE_PASSWORD) or "")
 
 
+def _entry_gateway_ip(entry: ConfigEntry) -> str | None:
+    value = str(entry.data.get(CONF_GATEWAY_IP) or "").strip()
+    return value or None
+
+
+def _entry_gateway_ip_required(entry: ConfigEntry) -> bool:
+    value = entry.data.get(CONF_GATEWAY_IP_REQUIRED)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 async def _async_update_entry_runtime_data(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -110,6 +132,8 @@ async def _async_update_entry_runtime_data(
     inventory_mode: str,
     username: str,
     password: str,
+    gateway_ip_required: bool,
+    gateway_ip: str | None,
 ) -> None:
     data = dict(entry.data)
     data.update(
@@ -121,8 +145,13 @@ async def _async_update_entry_runtime_data(
             CONF_MESHNET2: cloud_params.meshnet2,
             CONF_NETID: cloud_params.netid,
             CONF_INVENTORY_MODE: inventory_mode,
+            CONF_GATEWAY_IP_REQUIRED: gateway_ip_required,
         }
     )
+    if gateway_ip_required and gateway_ip:
+        data[CONF_GATEWAY_IP] = gateway_ip
+    else:
+        data.pop(CONF_GATEWAY_IP, None)
     if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
         data[CONF_PIXIE_USERNAME] = username
         data[CONF_PIXIE_PASSWORD] = password
@@ -159,6 +188,29 @@ def _async_create_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEn
 
 def _async_delete_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
     ir.async_delete_issue(hass, DOMAIN, _credentials_issue_id(entry))
+
+
+def _gateway_ip_issue_id(entry: ConfigEntry) -> str:
+    return f"{ISSUE_ID_GATEWAY_IP_REQUIRED}_{entry.entry_id}"
+
+
+def _async_create_gateway_ip_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _gateway_ip_issue_id(entry),
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=ISSUE_ID_GATEWAY_IP_REQUIRED,
+        translation_placeholders={
+            "entry_title": entry.title or INTEGRATION_TITLE,
+        },
+    )
+
+
+def _async_delete_gateway_ip_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, _gateway_ip_issue_id(entry))
 
 
 def _handler_cloud_params(handler: PixieAuthHandler, fallback: CloudParams) -> CloudParams:
@@ -465,16 +517,28 @@ class PixiePlusConfigEntryRuntimeData:
             username = _entry_username(self.entry)
             password = _entry_password(self.entry)
             inventory_mode = _entry_inventory_mode(self.entry)
+            gateway_ip = _entry_gateway_ip(self.entry) if _entry_gateway_ip_required(self.entry) else None
+
+            if _entry_gateway_ip_required(self.entry) and gateway_ip is None:
+                _async_create_gateway_ip_issue(hass, self.entry)
+                raise ConfigEntryError("Pixie gateway requires a stored manual IP address")
 
             try:
                 restarted_runtime = await restart_handler.async_bootstrap_gateway(
                     self.cloud_params,
                     username=username,
                     password=password,
+                    gateway_ip=gateway_ip,
                     keep_control_alive=True,
                     wait_for_shutdown=False,
                     hydrate_inventory=False,
                 )
+            except (PixieGatewayResolutionError, PixieGatewayConnectionError):
+                restart_session = restart_handler.runtime_session
+                if restart_session is not None:
+                    await hass.async_add_executor_job(restart_session.stop_and_join, 5.0)
+                _async_create_gateway_ip_issue(hass, self.entry)
+                raise
             except Exception:
                 restart_session = restart_handler.runtime_session
                 if restart_session is not None:
@@ -490,6 +554,7 @@ class PixiePlusConfigEntryRuntimeData:
             self.pixie_runtime.inventory_mode = inventory_mode
             if restarted_runtime.inventory is not None:
                 self.pixie_runtime.inventory = restarted_runtime.inventory
+            _async_delete_gateway_ip_issue(hass, self.entry)
 
             LOGGER.info(
                 "Pixie runtime ready after %s: %s",
@@ -576,6 +641,12 @@ async def _async_build_runtime_data(
     persisted_inventory = await _async_load_inventory_snapshot(hass, entry)
     username = _entry_username(entry)
     password = _entry_password(entry)
+    gateway_ip_required = _entry_gateway_ip_required(entry)
+    gateway_ip = _entry_gateway_ip(entry) if gateway_ip_required else None
+
+    if gateway_ip_required and gateway_ip is None:
+        _async_create_gateway_ip_issue(hass, entry)
+        raise ConfigEntryError("Pixie gateway requires a stored manual IP address")
 
     LOGGER.debug(
         "Bootstrapping Pixie entry %s in %s mode%s",
@@ -604,6 +675,7 @@ async def _async_build_runtime_data(
             cloud_params,
             username="",
             password="",
+            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
             hydrate_inventory=False,
@@ -618,6 +690,7 @@ async def _async_build_runtime_data(
             cloud_params,
             username="",
             password="",
+            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
         )
@@ -635,6 +708,7 @@ async def _async_build_runtime_data(
             refreshed_cloud_params,
             username=username,
             password=password,
+            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
             hydrate_inventory=False,
@@ -659,6 +733,8 @@ async def _async_build_runtime_data(
                     inventory_mode=INVENTORY_MODE_LOCAL_53216,
                     username="",
                     password="",
+                    gateway_ip_required=gateway_ip_required,
+                    gateway_ip=gateway_ip,
                 )
             pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
         else:
@@ -681,6 +757,8 @@ async def _async_build_runtime_data(
                         inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
                         username=username,
                         password=password,
+                        gateway_ip_required=gateway_ip_required,
+                        gateway_ip=gateway_ip,
                     )
                     cloud_params = _handler_cloud_params(handler, cloud_params)
                 except Exception as err:
@@ -708,9 +786,14 @@ async def _async_build_runtime_data(
                     runtime_mode=inventory_mode,
                 )
 
+        _async_delete_gateway_ip_issue(hass, entry)
         coordinator = PixiePlusRuntimeCoordinator(hass, entry, pixie_runtime)
         await coordinator.async_config_entry_first_refresh()
         await _async_save_inventory_snapshot(hass, entry, pixie_runtime.inventory)
+    except (PixieGatewayResolutionError, PixieGatewayConnectionError) as err:
+        await _shutdown_runtime(handler)
+        _async_create_gateway_ip_issue(hass, entry)
+        raise ConfigEntryError(str(err)) from err
     except PixieAuthError as err:
         await _shutdown_runtime(handler)
         raise ConfigEntryNotReady(str(err)) from err
@@ -754,7 +837,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "main", "mode", "timer_mode", "restart", "timer_remaining",
             "timer_duration", "hold_time", "brightness_threshold",
             "motion_sensitivity", "refresh_params", "left", "right",
-            "usb", "sensor_light_state",
+            "usb", "sensor_light_state", "door1", "door2",
         )
         valid_entity_ids: set[str] = set()
         valid_device_ids: set[str] = {gateway_device_identifier(inv)}

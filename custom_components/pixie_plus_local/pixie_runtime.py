@@ -42,7 +42,13 @@ from Crypto.Util.Padding import pad, unpad
 from .pixie_protocol import PixieEnvelope, PixieMessage, PixieCrypto
 from .pixie_inventory import GatewayIdentity, PixieInventory
 from .pixie_value_profiles import (
+    build_gate_motion_plan,
+    build_gate_motion_plan_from_learned_duration,
+    decode_gate_command_reply,
+    decode_gate_state_byte,
     decode_value_byte,
+    sync_gate_motion_plan,
+    gate_can_run_action,
     get_all_effect_names,
     get_model_effect_names,
     get_supported_sensor_mode_values,
@@ -74,6 +80,14 @@ class PixieHub:
 class PixieAuthError(Exception):
     """Base exception for Pixie authentication errors"""
     pass
+
+
+class PixieGatewayResolutionError(PixieAuthError):
+    """Gateway discovery could not resolve a single usable host."""
+
+
+class PixieGatewayConnectionError(PixieAuthError):
+    """Gateway host was selected but could not be reached successfully."""
 
 
 @dataclass(frozen=True)
@@ -666,7 +680,7 @@ class PixieAuthHandler:
             "hub_port": hub_port,
         }
 
-    def _resolve_gateway_ip(self, gateway_ip: Optional[str]) -> Optional[str]:
+    def _resolve_gateway_ip(self, gateway_ip: Optional[str]) -> str:
         """Resolve a gateway IP either from the caller or via UDP discovery."""
         if gateway_ip:
             self._log_debug("Using explicit gateway IP: %s", gateway_ip)
@@ -677,7 +691,9 @@ class PixieAuthHandler:
 
         if not discovered_hubs:
             self._log_warning("No gateways discovered via UDP broadcast")
-            return None
+            raise PixieGatewayResolutionError(
+                "No Pixie gateway was discovered via UDP within 10 seconds"
+            )
 
         if len(discovered_hubs) == 1 and discovered_hubs[0].is_valid:
             resolved_host = discovered_hubs[0].host
@@ -685,7 +701,9 @@ class PixieAuthHandler:
             return resolved_host
 
         self._log_warning("Multiple gateways discovered; unable to choose automatically")
-        return None
+        raise PixieGatewayResolutionError(
+            "Multiple Pixie gateways were discovered; enter the gateway IP explicitly"
+        )
 
     def _start_runtime_session(
         self,
@@ -708,6 +726,7 @@ class PixieAuthHandler:
         command_timer_duration: Optional[int] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_door: Optional[int] = None,
     ) -> PixieRuntimeSession:
         """Start the long-lived 41578 runtime session."""
         runtime_session = PixieRuntimeSession(
@@ -732,6 +751,7 @@ class PixieAuthHandler:
                 "command_timer_duration": command_timer_duration,
                 "command_sensor_param": command_sensor_param,
                 "command_sensor_param_value": command_sensor_param_value,
+                "command_gate_door": command_gate_door,
             },
         )
         runtime_session.start()
@@ -932,6 +952,7 @@ class PixieAuthHandler:
         command_timer_duration: Optional[int] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_door: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = False,
         wait_for_shutdown: bool = False,
@@ -963,6 +984,7 @@ class PixieAuthHandler:
             command_timer_duration=command_timer_duration,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
+            command_gate_door=command_gate_door,
             stop_event=stop_event,
             keep_control_alive=keep_control_alive,
             wait_for_shutdown=wait_for_shutdown,
@@ -1062,6 +1084,7 @@ class PixieAuthHandler:
         command_timer_duration: Optional[int] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_door: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = True,
         wait_for_shutdown: bool = True,
@@ -1132,8 +1155,6 @@ class PixieAuthHandler:
         self._log_debug("Bootstrap metadata: meshNet=%s meshNet2=%s netID=%s", self.meshnet, self.meshnet2, self.netid_seed)
 
         hub_ip = self._resolve_gateway_ip(hub_ip)
-        if not hub_ip:
-            return None
 
         # Step 3: Start 41578 control loop in background and keep it alive.
         self._log_debug("Starting TCP control channel on %s:%s", hub_ip, TCP_CONTROL_PORT)
@@ -1156,6 +1177,7 @@ class PixieAuthHandler:
             command_timer_duration=command_timer_duration,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
+            command_gate_door=command_gate_door,
         )
 
         priming_timeout = 5.0
@@ -1248,12 +1270,12 @@ class PixieAuthHandler:
             runtime_session.stop_and_join(timeout=5.0)
 
         if runtime_session.error is not None:
-            raise PixieAuthError(f"Control channel failed: {runtime_session.error}")
+            raise PixieGatewayConnectionError(f"Control channel failed: {runtime_session.error}")
 
         if wait_for_shutdown or not keep_control_alive:
             auth_result = runtime_session.result
             if not auth_result:
-                raise PixieAuthError("Handshake capture failed - ensure hub is reachable")
+                raise PixieGatewayConnectionError("Handshake capture failed - ensure the gateway is reachable")
             return auth_result
 
         auth_snapshot = self._build_auth_result_snapshot(hub_ip, TCP_CONTROL_PORT)
@@ -2057,6 +2079,7 @@ class PixieAuthHandler:
         command_timer_duration: Optional[int] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_door: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Perform full client-mode TCP handshake sequence (matches Java app flow).
@@ -2252,6 +2275,7 @@ class PixieAuthHandler:
                     dev_id = int(raw[i])
                     online = int(raw[i + 1])
                     br_raw = int(raw[i + 2])
+                    rssi_raw = int(raw[i + 3])
                     if dev_id in (0, 255):
                         continue
                     records.append({
@@ -2259,6 +2283,7 @@ class PixieAuthHandler:
                         "online": online,
                         "br_raw": br_raw,
                         "br": self._decode_bulk_br(br_raw),
+                        "rssi_raw": rssi_raw,
                     })
 
                 if len(records) >= 2:
@@ -2367,6 +2392,37 @@ class PixieAuthHandler:
                             "sequence_or_counter": None,
                         }]
                         return decoded
+                elif rec and rec.capabilities.supports_gate:
+                    decoded["kind"] = "gate_status"
+                    decoded["device_id"] = dev_id
+                    try:
+                        door_index = int(raw[data_start + 1])
+                        state_byte = int(raw[data_start + 3])
+                        position_raw = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
+                        runtime_ms = int.from_bytes(raw[data_start + 6 : data_start + 9], byteorder="little")
+                        decoded_state = decode_gate_command_reply(door_index, state_byte, position_raw, runtime_ms)
+                    except Exception:
+                        door_index = None
+                        state_byte = None
+                        position_raw = None
+                        runtime_ms = None
+                        decoded_state = None
+                    decoded["records"] = [{
+                        "id": dev_id,
+                        "online": None,
+                        "br_raw": None,
+                        "br": {"type": "single", "raw": None, "pct": None},
+                        "gate_door": door_index,
+                        "door_state": state_byte,
+                        "door_decoded": decoded_state,
+                        "position_raw": position_raw,
+                        "runtime_ms": runtime_ms,
+                        "value_byte": None,
+                        "tail_flag": None,
+                        "is_on_from_tail": None,
+                        "sequence_or_counter": None,
+                    }]
+                    return decoded
                 decoded["records"] = [{
                     "id": decoded["device_id"],
                     "online": None,
@@ -2502,6 +2558,80 @@ class PixieAuthHandler:
                     self._notify_inventory_updated()
                 return
 
+            if kind == "gate_status":
+                if not self.inventory or not records:
+                    return
+                first = records[0]
+                dev_id = first.get("id")
+                door_index = first.get("gate_door")
+                door_state = first.get("door_state")
+                door_decoded = first.get("door_decoded")
+                if not isinstance(dev_id, int) or not isinstance(door_index, int) or not isinstance(door_state, int):
+                    return
+
+                rec = self.inventory.devices_by_id.get(dev_id)
+                if rec is None:
+                    return
+
+                previous = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
+                previous_motion_plan = rec.runtime.door1_motion_plan if door_index == 0 else rec.runtime.door2_motion_plan
+                updated_ms = int(time.time() * 1000)
+                if not isinstance(door_decoded, dict) or not door_decoded.get("known"):
+                    self._log_debug(
+                        "Gate unknown d36969 byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
+                        dev_id,
+                        door_index + 1,
+                        door_state,
+                        previous.get("state") if isinstance(previous, dict) else None,
+                        previous.get("position_percent") if isinstance(previous, dict) else None,
+                        previous.get("value_byte") if isinstance(previous, dict) else None,
+                    )
+
+                update_kwargs: Dict[str, Any] = {
+                    "online": 1,
+                    "presence": "online",
+                    "raw": {
+                        "hub_type": payload.get("type"),
+                        "hub_data": ble_hex,
+                        "hub_utc": payload.get("UTC"),
+                        "ble_decoded": decoded,
+                        "ble_interpreted": door_decoded,
+                    },
+                }
+                if door_index == 0:
+                    update_kwargs["door1_state"] = door_state
+                    if isinstance(door_decoded, dict) and door_decoded.get("known"):
+                        update_kwargs["door1_decoded"] = door_decoded
+                        update_kwargs["door1_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
+                        if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
+                            update_kwargs["door1_open_duration_ms"] = door_decoded.get("runtime_ms")
+                        elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
+                            update_kwargs["door1_close_duration_ms"] = door_decoded.get("runtime_ms")
+                elif door_index == 1:
+                    update_kwargs["door2_state"] = door_state
+                    if isinstance(door_decoded, dict) and door_decoded.get("known"):
+                        update_kwargs["door2_decoded"] = door_decoded
+                        update_kwargs["door2_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
+                        if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
+                            update_kwargs["door2_open_duration_ms"] = door_decoded.get("runtime_ms")
+                        elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
+                            update_kwargs["door2_close_duration_ms"] = door_decoded.get("runtime_ms")
+
+                if isinstance(door_decoded, dict) and not door_decoded.get("known"):
+                    if door_index == 0:
+                        update_kwargs["door1_motion_plan"] = previous_motion_plan
+                    else:
+                        update_kwargs["door2_motion_plan"] = previous_motion_plan
+
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source="hub_update",
+                    updated_ms=updated_ms,
+                    **update_kwargs,
+                )
+                self._notify_inventory_updated()
+                return
+
             if not records:
                 return
 
@@ -2541,8 +2671,13 @@ class PixieAuthHandler:
             prev_br = rec.runtime.br
             prev_rgb = rec.runtime.rgb
             prev_r = rec.runtime.r
+            prev_gate_decoded = {
+                0: rec.runtime.door1_decoded if isinstance(rec.runtime.door1_decoded, dict) else None,
+                1: rec.runtime.door2_decoded if isinstance(rec.runtime.door2_decoded, dict) else None,
+            }
 
             interpreted = None
+            mode = None
             rgb_from_packet = first.get("rgb") if isinstance(first.get("rgb"), list) else None
             br_from_packet = decoded.get("brightness_0_100") if isinstance(decoded.get("brightness_0_100"), int) else None
             update_kwargs: Dict[str, Any] = {
@@ -2645,6 +2780,54 @@ class PixieAuthHandler:
                             update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
                         update_kwargs["last_timer_poll_at"] = _time.time()
                         update_kwargs["timer_needs_poll"] = True
+                elif mode == "gate":
+                    # Gate device: value_byte = door1 position, tail = door2 position
+                    if isinstance(value_byte, int):
+                        update_kwargs["door1_state"] = value_byte
+                        door1_decoded = decode_gate_state_byte(0, value_byte)
+                        if door1_decoded.get("known"):
+                            update_kwargs["door1_decoded"] = door1_decoded
+                            now_ms = int(time.time() * 1000)
+                            motion_plan = sync_gate_motion_plan(
+                                rec.runtime.door1_motion_plan,
+                                door1_decoded,
+                                now_ms,
+                            )
+                            if motion_plan is None:
+                                learned_duration_ms = (
+                                    rec.runtime.door1_open_duration_ms
+                                    if door1_decoded.get("state") == "opening"
+                                    else rec.runtime.door1_close_duration_ms
+                                )
+                                motion_plan = build_gate_motion_plan_from_learned_duration(
+                                    door1_decoded,
+                                    now_ms,
+                                    learned_duration_ms,
+                                )
+                            update_kwargs["door1_motion_plan"] = motion_plan
+                    if isinstance(tail, int) and rec.capabilities.gate_doors >= 2:
+                        update_kwargs["door2_state"] = tail
+                        door2_decoded = decode_gate_state_byte(1, tail)
+                        if door2_decoded.get("known"):
+                            update_kwargs["door2_decoded"] = door2_decoded
+                            now_ms = int(time.time() * 1000)
+                            motion_plan = sync_gate_motion_plan(
+                                rec.runtime.door2_motion_plan,
+                                door2_decoded,
+                                now_ms,
+                            )
+                            if motion_plan is None:
+                                learned_duration_ms = (
+                                    rec.runtime.door2_open_duration_ms
+                                    if door2_decoded.get("state") == "opening"
+                                    else rec.runtime.door2_close_duration_ms
+                                )
+                                motion_plan = build_gate_motion_plan_from_learned_duration(
+                                    door2_decoded,
+                                    now_ms,
+                                    learned_duration_ms,
+                                )
+                            update_kwargs["door2_motion_plan"] = motion_plan
                 elif mode == "raw":
                     # Raw on/off-only models use the value byte directly.
                     # Keep tail-derived fields for debugging only until their
@@ -2671,6 +2854,22 @@ class PixieAuthHandler:
                 source="hub_update",
                 **update_kwargs,
             )
+            if mode == "gate":
+                for door_index, raw_state, decoded_state in (
+                    (0, value_byte if isinstance(value_byte, int) else None, update_kwargs.get("door1_decoded")),
+                    (1, tail if isinstance(tail, int) else None, update_kwargs.get("door2_decoded")),
+                ):
+                    if isinstance(raw_state, int) and (not isinstance(decoded_state, dict)):
+                        previous = prev_gate_decoded.get(door_index)
+                        self._log_debug(
+                            "Gate unknown bleData byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
+                            dev_id,
+                            door_index + 1,
+                            raw_state,
+                            previous.get("state") if isinstance(previous, dict) else None,
+                            previous.get("position_percent") if isinstance(previous, dict) else None,
+                            previous.get("value_byte") if isinstance(previous, dict) else None,
+                        )
             if updated_runtime is None:
                 return
 
@@ -2964,6 +3163,7 @@ class PixieAuthHandler:
             command_timer_duration: Optional[int] = None,
             command_sensor_param: Optional[str] = None,
             command_sensor_param_value: Optional[int] = None,
+            command_gate_door: Optional[int] = None,
         ) -> Dict[str, Any]:
             """Send one local command on the already-authenticated TCP socket."""
             if not readiness["ready_signaled"]:
@@ -3028,6 +3228,47 @@ class PixieAuthHandler:
                     raise PixieAuthError(f"Model {rec.model_no} does not support effects")
                 if command_effect.strip().lower() not in allowed_effects:
                     raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
+
+            # ── Gate (1217) command dispatch ──
+            is_gate_cmd = (
+                command_cover_action is not None
+                and rec
+                and rec.capabilities.supports_gate
+            )
+            if is_gate_cmd:
+                door_index = command_gate_door if command_gate_door is not None else 0
+                gate_state = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
+                if not gate_can_run_action(gate_state, command_cover_action):
+                    gate_state_name = gate_state.get("state") if isinstance(gate_state, dict) else "unknown"
+                    next_action = gate_state.get("next_action") if isinstance(gate_state, dict) else None
+                    raise PixieAuthError(
+                        f"Gate action '{command_cover_action}' is not allowed for door {door_index + 1} while state is {gate_state_name}"
+                        + (f" (next action: {next_action})" if next_action else "")
+                    )
+                command_hex = self._build_gate_command_hex(command_device_id, door_index)
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                    repeat=1,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug(
+                    "Sending gate command: dev_id=%s door=%s action=%s opcode=f96b69",
+                    command_device_id,
+                    door_index,
+                    command_cover_action,
+                )
+                if self.verbose:
+                    self._print_local_command_debug(command_debug)
+                command_parsed = _parse_message(command_b64, extracted_key)
+                command_route, command_match = _classify_message("out", command_parsed)
+                _log_message("out", command_parsed, command_route, command_match)
+                sock.sendall(command_b64.encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+                _drain_incoming()
+                return {"target": "gate", "device_id": command_device_id, "door": door_index}
 
             # ── Sensor (3001/3002) poll dispatch ──
             if command_timer_action == "poll" and rec and rec.capabilities.supports_sensor:
@@ -3225,6 +3466,14 @@ class PixieAuthHandler:
                 _drain_incoming()
 
                 if command_timer_action == "restart":
+                    _apply_local_command_optimistic_update(
+                        command_device_id,
+                        True,
+                        command_hex,
+                        target="timer_restart",
+                        opcode_name="c16969",
+                    )
+
                     # After restart, poll immediately for fresh countdown
                     time.sleep(0.2)
                     _drain_incoming()
@@ -3239,14 +3488,6 @@ class PixieAuthHandler:
                     if runtime_session is not None:
                         runtime_session.mark_command_sent()
                     _drain_incoming()
-
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        True,
-                        command_hex,
-                        target="timer_restart",
-                        opcode_name="c16969",
-                    )
                     return {"target": "timer_restart", "device_id": command_device_id}
                 if command_timer_action == "override":
                     _apply_local_command_optimistic_update(
@@ -3814,6 +4055,7 @@ class PixieAuthHandler:
                             command_timer_duration=command_timer_duration,
                             command_sensor_param=command_sensor_param,
                             command_sensor_param_value=command_sensor_param_value,
+                            command_gate_door=command_gate_door,
                         )
                     except Exception as exc:
                         self._log_warning("Local command not sent: %s", exc)
@@ -4205,6 +4447,25 @@ class PixieAuthHandler:
         return spec_map[normalized]
 
     # ------------------------------------------------------------------
+    # Gate (1217) command
+    # ------------------------------------------------------------------
+
+    def _build_gate_command_hex(self, device_id: int, door_index: int) -> str:
+        """Build f96b69 gate cycle command for one door.
+
+        Same command cycles open→pause→close→open based on current state.
+        Payload: 03 [door_index] 00 00 00 00 00 0c 02 00 00 (10 bytes, matches capture).
+        """
+        payload = bytes([0x03, door_index & 0xFF]) + b"\x00" * 4 + b"\x0c\x02\x00\x00"
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xf9\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    # ------------------------------------------------------------------
     # Sensor (3001/3002) parameter commands
     # ------------------------------------------------------------------
 
@@ -4355,6 +4616,5 @@ class PixieAuthHandler:
 
 # Removed: PixieCrypto, _pkcs7_pad, _pkcs7_unpad - now in pixie_protocol.py
 # Removed: bytes_to_hex - not needed
-
 
 

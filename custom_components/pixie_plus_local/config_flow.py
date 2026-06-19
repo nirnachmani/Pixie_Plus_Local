@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from ipaddress import IPv4Address
 import logging
 from typing import Any
 
@@ -22,6 +23,8 @@ from homeassistant.helpers.selector import (
 )
 
 from . import (
+    CONF_GATEWAY_IP,
+    CONF_GATEWAY_IP_REQUIRED,
     CONF_HOME_ID,
     CONF_HOME_NAME,
     CONF_INVENTORY_MODE,
@@ -34,8 +37,14 @@ from . import (
     DOMAIN,
     INVENTORY_MODE_CLOUD_FALLBACK,
     _async_delete_missing_credentials_issue,
+    _async_delete_gateway_ip_issue,
 )
-from .pixie_runtime import CloudParams, PixieAuthError, PixieAuthHandler
+from .pixie_runtime import (
+    CloudParams,
+    PixieAuthError,
+    PixieAuthHandler,
+    PixieGatewayResolutionError,
+)
 from .pixie_value_profiles import (
     COVER_ACTION_TO_POSITION_DEFAULT,
     COVER_TILT_ACTION_TO_POSITION_DEFAULT,
@@ -56,6 +65,10 @@ CONF_COVER_CLOSE_POSITION = "cover_close_position"
 CONF_COVER_OPEN_TILT_POSITION = "cover_open_tilt_position"
 CONF_COVER_STOP_TILT_POSITION = "cover_stop_tilt_position"
 CONF_COVER_CLOSE_TILT_POSITION = "cover_close_tilt_position"
+CONF_GATEWAY_CONNECTION_MODE = "gateway_connection_mode"
+
+GATEWAY_CONNECTION_MODE_AUTO = "auto"
+GATEWAY_CONNECTION_MODE_MANUAL = "manual"
 
 
 class InvalidAuth(Exception):
@@ -64,6 +77,10 @@ class InvalidAuth(Exception):
 
 class CannotConnect(Exception):
     """Connection or bootstrap failed."""
+
+
+class GatewayIpRequired(Exception):
+    """Auto-discovery did not resolve a gateway host."""
 
 
 @dataclass
@@ -119,7 +136,7 @@ def _cover_controller_choices(inventory) -> dict[str, str]:
     choices: dict[str, str] = {}
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
-        if not record.capabilities.supports_cover:
+        if record.model_no != "1102":
             continue
         choices[str(record.id)] = f"{record.name} ({record.id})"
     return choices
@@ -224,7 +241,7 @@ def _has_cover_devices(handler: PixieAuthHandler) -> bool:
     if inventory is None:
         return False
 
-    return any(device.capabilities.supports_cover for device in inventory.devices_by_id.values())
+    return any(device.model_no == "1102" for device in inventory.devices_by_id.values())
 
 
 def _build_entry_title(handler: PixieAuthHandler, cloud_params: CloudParams) -> str:
@@ -254,16 +271,52 @@ def _build_entry_data_with_mode(
     inventory_mode: str,
     username: str,
     password: str,
+    gateway_ip_required: bool,
+    gateway_ip: str | None,
 ) -> dict[str, Any]:
     data = _build_entry_data(cloud_params)
     data[CONF_INVENTORY_MODE] = inventory_mode
+    data[CONF_GATEWAY_IP_REQUIRED] = gateway_ip_required
+    if gateway_ip_required and gateway_ip:
+        data[CONF_GATEWAY_IP] = gateway_ip
     if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
         data[CONF_PIXIE_USERNAME] = username
         data[CONF_PIXIE_PASSWORD] = password
     return data
 
 
-async def _async_validate_setup_input(user_input: dict[str, Any]) -> ValidatedSetup:
+def _normalize_gateway_ip(value: Any) -> str:
+    return str(IPv4Address(str(value).strip()))
+
+
+def _entry_gateway_ip_required(entry: ConfigEntry) -> bool:
+    value = entry.data.get(CONF_GATEWAY_IP_REQUIRED)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _entry_gateway_ip(entry: ConfigEntry) -> str | None:
+    value = str(entry.data.get(CONF_GATEWAY_IP) or "").strip()
+    return value or None
+
+
+def _entry_cloud_params(entry: ConfigEntry) -> CloudParams:
+    return CloudParams(
+        home_id=str(entry.data[CONF_HOME_ID]),
+        home_name=str(entry.data.get(CONF_HOME_NAME) or entry.title or INTEGRATION_TITLE),
+        user_id=str(entry.data[CONF_USER_ID]),
+        meshnet=str(entry.data[CONF_MESHNET]),
+        meshnet2=str(entry.data[CONF_MESHNET2]),
+        netid=str(entry.data[CONF_NETID]),
+    )
+
+
+async def _async_validate_setup_input(
+    user_input: dict[str, Any],
+    *,
+    gateway_ip: str | None = None,
+) -> ValidatedSetup:
     """Validate credentials, derive runtime params, and verify local bootstrap."""
     username = str(user_input[CONF_USERNAME]).strip()
     password = str(user_input[CONF_PASSWORD])
@@ -294,9 +347,14 @@ async def _async_validate_setup_input(user_input: dict[str, Any]) -> ValidatedSe
             cloud_params,
             username=username,
             password=password,
+            gateway_ip=gateway_ip,
             keep_control_alive=False,
             wait_for_shutdown=False,
         )
+    except PixieGatewayResolutionError as err:
+        if gateway_ip is None:
+            raise GatewayIpRequired from err
+        raise CannotConnect from err
     except PixieAuthError as err:
         raise CannotConnect from err
     except Exception as err:
@@ -321,6 +379,8 @@ async def _async_validate_setup_input(user_input: dict[str, Any]) -> ValidatedSe
             inventory_mode=handler.inventory_mode,
             username=username,
             password=password,
+            gateway_ip_required=gateway_ip is not None,
+            gateway_ip=gateway_ip,
         ),
         options=options,
         has_cover_devices=has_cover_devices,
@@ -338,20 +398,41 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._validated_setup: ValidatedSetup | None = None
         self._selected_cover_controller_id: str | None = None
+        self._pending_user_input: dict[str, Any] | None = None
+
+    async def _async_finish_validated_setup(self):
+        """Continue to the remaining setup steps after validation succeeds."""
+        if self._validated_setup is None:
+            return await self.async_step_user()
+
+        await self.async_set_unique_id(self._validated_setup.data[CONF_HOME_ID])
+        self._abort_if_unique_id_configured()
+
+        if self._validated_setup.has_cover_devices:
+            return await self.async_step_cover_controller()
+
+        return self.async_create_entry(
+            title=self._validated_setup.title,
+            data=self._validated_setup.data,
+            options=self._validated_setup.options,
+        )
 
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> PixiePlusLocalOptionsFlow:
         """Create the options flow."""
-        return PixiePlusLocalOptionsFlow(config_entry)
+        return PixiePlusLocalOptionsFlow()
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Handle the initial setup step."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._pending_user_input = dict(user_input)
             try:
                 self._validated_setup = await _async_validate_setup_input(user_input)
+            except GatewayIpRequired:
+                return await self.async_step_gateway_ip()
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
             except CannotConnect:
@@ -360,17 +441,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 LOGGER.exception("Unexpected Pixie Plus Local setup failure")
                 errors["base"] = "unknown"
             else:
-                await self.async_set_unique_id(self._validated_setup.data[CONF_HOME_ID])
-                self._abort_if_unique_id_configured()
-
-                if self._validated_setup.has_cover_devices:
-                    return await self.async_step_cover_controller()
-
-                return self.async_create_entry(
-                    title=self._validated_setup.title,
-                    data=self._validated_setup.data,
-                    options=self._validated_setup.options,
-                )
+                return await self._async_finish_validated_setup()
 
         data_schema = vol.Schema(
             {
@@ -390,7 +461,53 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
 
+    async def async_step_gateway_ip(self, user_input: dict[str, Any] | None = None):
+        """Collect a manual gateway IP when UDP discovery does not find a gateway."""
+        if self._pending_user_input is None:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                gateway_ip = _normalize_gateway_ip(user_input[CONF_GATEWAY_IP])
+            except ValueError:
+                errors[CONF_GATEWAY_IP] = "invalid_gateway_ip"
+            else:
+                try:
+                    self._validated_setup = await _async_validate_setup_input(
+                        self._pending_user_input,
+                        gateway_ip=gateway_ip,
+                    )
+                except InvalidAuth:
+                    errors["base"] = "invalid_auth"
+                except CannotConnect:
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    LOGGER.exception("Unexpected Pixie Plus Local manual-IP setup failure")
+                    errors["base"] = "unknown"
+                else:
+                    return await self._async_finish_validated_setup()
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_GATEWAY_IP): TextSelector(
+                    TextSelectorConfig(
+                        type=TextSelectorType.TEXT,
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(step_id="gateway_ip", data_schema=data_schema, errors=errors)
+
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
+        """Present reconfiguration actions for the config entry."""
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["reconfigure_credentials", "reconfigure_gateway_connection"],
+        )
+
+    async def async_step_reconfigure_credentials(self, user_input: dict[str, Any] | None = None):
         """Store Pixie credentials so the entry can use cloud fallback when local inventory fails."""
         errors: dict[str, str] = {}
         entry = self._get_reconfigure_entry()
@@ -420,6 +537,8 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                         inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
                         username=username,
                         password=password,
+                        gateway_ip_required=_entry_gateway_ip_required(entry),
+                        gateway_ip=_entry_gateway_ip(entry),
                     ),
                 )
 
@@ -439,7 +558,118 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 ),
             }
         )
-        return self.async_show_form(step_id="reconfigure", data_schema=data_schema, errors=errors)
+        return self.async_show_form(step_id="reconfigure_credentials", data_schema=data_schema, errors=errors)
+
+    async def async_step_reconfigure_gateway_connection(self, user_input: dict[str, Any] | None = None):
+        """Switch between UDP discovery and a stored manual gateway IP."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            mode = str(user_input[CONF_GATEWAY_CONNECTION_MODE])
+            if mode == GATEWAY_CONNECTION_MODE_MANUAL:
+                return await self.async_step_reconfigure_gateway_ip()
+
+            handler = PixieAuthHandler()
+            try:
+                await handler.async_bootstrap_gateway(
+                    _entry_cloud_params(entry),
+                    username="",
+                    password="",
+                    keep_control_alive=False,
+                    wait_for_shutdown=False,
+                    hydrate_inventory=False,
+                )
+            except PixieAuthError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                LOGGER.exception("Unexpected Pixie Plus Local gateway-mode reconfigure failure")
+                errors["base"] = "unknown"
+            finally:
+                if handler.runtime_session is not None:
+                    await asyncio.to_thread(handler.runtime_session.stop_and_join, 5.0)
+
+            if not errors:
+                data = dict(entry.data)
+                data[CONF_GATEWAY_IP_REQUIRED] = False
+                data.pop(CONF_GATEWAY_IP, None)
+                _async_delete_gateway_ip_issue(self.hass, entry)
+                return self.async_update_reload_and_abort(entry, data=data)
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_GATEWAY_CONNECTION_MODE,
+                    default=GATEWAY_CONNECTION_MODE_MANUAL if _entry_gateway_ip_required(entry) else GATEWAY_CONNECTION_MODE_AUTO,
+                ): vol.In(
+                    {
+                        GATEWAY_CONNECTION_MODE_AUTO: "Use UDP discovery",
+                        GATEWAY_CONNECTION_MODE_MANUAL: "Use a manual gateway IP",
+                    }
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="reconfigure_gateway_connection",
+            data_schema=data_schema,
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_gateway_ip(self, user_input: dict[str, Any] | None = None):
+        """Validate and persist a manual gateway IP."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                gateway_ip = _normalize_gateway_ip(user_input[CONF_GATEWAY_IP])
+            except ValueError:
+                errors[CONF_GATEWAY_IP] = "invalid_gateway_ip"
+            else:
+                handler = PixieAuthHandler()
+                try:
+                    await handler.async_bootstrap_gateway(
+                        _entry_cloud_params(entry),
+                        username="",
+                        password="",
+                        gateway_ip=gateway_ip,
+                        keep_control_alive=False,
+                        wait_for_shutdown=False,
+                        hydrate_inventory=False,
+                    )
+                except PixieAuthError:
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    LOGGER.exception("Unexpected Pixie Plus Local manual gateway reconfigure failure")
+                    errors["base"] = "unknown"
+                finally:
+                    if handler.runtime_session is not None:
+                        await asyncio.to_thread(handler.runtime_session.stop_and_join, 5.0)
+
+                if not errors:
+                    data = dict(entry.data)
+                    data[CONF_GATEWAY_IP_REQUIRED] = True
+                    data[CONF_GATEWAY_IP] = gateway_ip
+                    _async_delete_gateway_ip_issue(self.hass, entry)
+                    return self.async_update_reload_and_abort(entry, data=data)
+
+        data_schema = self.add_suggested_values_to_schema(
+            vol.Schema(
+                {
+                    vol.Required(CONF_GATEWAY_IP): TextSelector(
+                        TextSelectorConfig(
+                            type=TextSelectorType.TEXT,
+                        )
+                    ),
+                }
+            ),
+            {CONF_GATEWAY_IP: _entry_gateway_ip(entry) or ""},
+        )
+        return self.async_show_form(
+            step_id="reconfigure_gateway_ip",
+            data_schema=data_schema,
+            errors=errors,
+        )
 
     async def async_step_cover_controller(self, user_input: dict[str, Any] | None = None):
         """Select which blind controller to configure."""
@@ -504,9 +734,8 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
 class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
     """Handle Pixie Plus Local mutable options."""
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
+    def __init__(self) -> None:
         """Initialize the options flow."""
-        super().__init__(config_entry=config_entry)
         self._selected_cover_controller_id: str | None = None
 
     def _cover_devices(self) -> dict[str, str]:
