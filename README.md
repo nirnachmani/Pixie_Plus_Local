@@ -42,6 +42,8 @@ The current code includes support for these model families:
 - Smart Passive Infrared Motion Sensor - SMS862WF/WH/BTAM
 - Smart timer switch - STS600BTAM - timer duration setting and countdown might not work - see Issues 
 - Gate & Door Control - PC206GD/R/BTAM
+- Smart Dimmer rippleSHIELD - SDD400RS/BTAM
+- SFI Dimmer - SDD400SFI
 
 For compatible models, the integration supports on/off, dimming, RGB color, and built-in effects where those capabilities exist.
 
