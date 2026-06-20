@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_RGB_COLOR,
     ColorMode,
@@ -44,6 +45,24 @@ def percent_to_ha_brightness(percent: int | None) -> int | None:
     if percent <= 0:
         return None
     return max(1, min(255, round((int(percent) / 100) * 255)))
+
+
+def _raw_cct_to_kelvin(raw_cct: int | None, min_kelvin: int, max_kelvin: int, raw_min: int, raw_max: int) -> int | None:
+    """Convert a device 0..255 tunable-white value into Kelvin."""
+    if raw_cct is None or raw_max <= raw_min or max_kelvin <= min_kelvin:
+        return None
+    bounded = max(raw_min, min(raw_max, int(raw_cct)))
+    fraction = (bounded - raw_min) / float(raw_max - raw_min)
+    return int(round(min_kelvin + ((max_kelvin - min_kelvin) * fraction)))
+
+
+def _kelvin_to_raw_cct(kelvin: int, min_kelvin: int, max_kelvin: int, raw_min: int, raw_max: int) -> int:
+    """Convert Kelvin into the device 0..255 tunable-white scale."""
+    bounded = max(min_kelvin, min(max_kelvin, int(kelvin)))
+    if raw_max <= raw_min or max_kelvin <= min_kelvin:
+        return raw_min
+    fraction = (bounded - min_kelvin) / float(max_kelvin - min_kelvin)
+    return int(round(raw_min + ((raw_max - raw_min) * fraction)))
 
 
 def _iter_light_endpoints(inventory) -> list[PixieEndpoint]:
@@ -88,6 +107,10 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
+        if self.record.capabilities.supports_color_temp:
+            self._attr_min_color_temp_kelvin = self.record.capabilities.color_temp_min_kelvin
+            self._attr_max_color_temp_kelvin = self.record.capabilities.color_temp_max_kelvin
+
         features = LightEntityFeature(0)
         if self.record.capabilities.supports_effects:
             features |= LightEntityFeature.EFFECT
@@ -98,6 +121,8 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     @property
     def supported_color_modes(self) -> set[ColorMode]:
+        if self.record.capabilities.supports_color_temp:
+            return {ColorMode.COLOR_TEMP}
         if self.record.capabilities.supports_color:
             return {ColorMode.RGB}
         if self.record.capabilities.supports_dimming:
@@ -106,6 +131,8 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     @property
     def color_mode(self) -> ColorMode:
+        if self.record.capabilities.supports_color_temp:
+            return ColorMode.COLOR_TEMP
         if self.record.capabilities.supports_color:
             return ColorMode.RGB
         if self.record.capabilities.supports_dimming:
@@ -124,9 +151,37 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     @property
     def brightness(self) -> int | None:
-        if not (self.record.capabilities.supports_dimming or self.record.capabilities.supports_color):
+        if not (
+            self.record.capabilities.supports_dimming
+            or self.record.capabilities.supports_color
+            or self.record.capabilities.supports_color_temp
+        ):
             return None
         return percent_to_ha_brightness(self.record.runtime.br)
+
+    @property
+    def min_color_temp_kelvin(self) -> int | None:
+        if not self.record.capabilities.supports_color_temp:
+            return None
+        return self.record.capabilities.color_temp_min_kelvin or None
+
+    @property
+    def max_color_temp_kelvin(self) -> int | None:
+        if not self.record.capabilities.supports_color_temp:
+            return None
+        return self.record.capabilities.color_temp_max_kelvin or None
+
+    @property
+    def color_temp_kelvin(self) -> int | None:
+        if not self.record.capabilities.supports_color_temp:
+            return None
+        return _raw_cct_to_kelvin(
+            self.record.runtime.cct,
+            self.record.capabilities.color_temp_min_kelvin,
+            self.record.capabilities.color_temp_max_kelvin,
+            self.record.capabilities.color_temp_cct_min,
+            self.record.capabilities.color_temp_cct_max,
+        )
 
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
@@ -148,6 +203,23 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
         brightness_pct = ha_brightness_to_percent(kwargs.get(ATTR_BRIGHTNESS))
 
         try:
+            if self.record.capabilities.supports_color_temp and ATTR_COLOR_TEMP_KELVIN in kwargs:
+                color_temp_kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+                raw_cct = _kelvin_to_raw_cct(
+                    color_temp_kelvin,
+                    self.record.capabilities.color_temp_min_kelvin,
+                    self.record.capabilities.color_temp_max_kelvin,
+                    self.record.capabilities.color_temp_cct_min,
+                    self.record.capabilities.color_temp_cct_max,
+                )
+                await self.runtime_data.async_send_local_command(
+                    self.hass,
+                    command_device_id=self.record.id,
+                    command_color_temp_cct=raw_cct,
+                    command_brightness=brightness_pct,
+                )
+                return
+
             if self.record.capabilities.supports_color and ATTR_RGB_COLOR in kwargs:
                 await self.runtime_data.async_send_local_command(
                     self.hass,
@@ -174,6 +246,14 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
                 )
                 return
 
+            if self.record.capabilities.supports_color_temp:
+                await self.runtime_data.async_send_local_command(
+                    self.hass,
+                    command_device_id=self.record.id,
+                    command_brightness=brightness_pct if brightness_pct is not None else 100,
+                )
+                return
+
             await self.runtime_data.async_send_local_command(
                 self.hass,
                 command_device_id=self.record.id,
@@ -187,6 +267,14 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
             raise HomeAssistantError("Manual light control is disabled while device mode is sensor")
 
         try:
+            if self.record.capabilities.supports_color_temp:
+                await self.runtime_data.async_send_local_command(
+                    self.hass,
+                    command_device_id=self.record.id,
+                    command_brightness=0,
+                )
+                return
+
             await self.runtime_data.async_send_local_command(
                 self.hass,
                 command_device_id=self.record.id,

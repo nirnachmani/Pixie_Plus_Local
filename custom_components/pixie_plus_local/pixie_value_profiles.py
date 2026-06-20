@@ -16,6 +16,7 @@ hardware_list = {
     "2213": "Smart Switch G3 - SWL600BTAM",
     "2211": "Smart Switch - Unknown Model",
     "2313": "Smart dimmer G3 - SDD300BTAM",
+    "2013": "rippleSHIELD DIMMER - SDD400SFI",
     "0107": "Smart plug - ESS105/BT",
     "2702": "Flexi smart LED strip - FLP12V2M/RGBBT",
     "2402": "Flexi Streamline - FLP24V2M",
@@ -29,6 +30,7 @@ hardware_list = {
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",
     "2113": "Smart Timer Switch - STS600BTAM",
+    "2552": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
     "1217": "Gate & Door Control - PC206GD/R/BTAM",
 }
 
@@ -123,6 +125,17 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
     },
     "2313": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2013": {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
@@ -240,6 +253,22 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_timer": True,
         "timer_modes": ["timer", "override"],
     },
+    "2552": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": False,
+        "supports_color_temp": True,
+        "color_temp_min_kelvin": 3000,
+        "color_temp_max_kelvin": 6500,
+        "color_temp_cct_min": 0,
+        "color_temp_cct_max": 255,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
     "1217": {
         "is_light": False,
         "is_switch": False,
@@ -265,6 +294,11 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_onoff": bool(caps.get("supports_onoff", False)),
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),
+        "supports_color_temp": bool(caps.get("supports_color_temp", False)),
+        "color_temp_min_kelvin": int(caps.get("color_temp_min_kelvin", 0)),
+        "color_temp_max_kelvin": int(caps.get("color_temp_max_kelvin", 0)),
+        "color_temp_cct_min": int(caps.get("color_temp_cct_min", 0)),
+        "color_temp_cct_max": int(caps.get("color_temp_cct_max", 255)),
         "supports_effects": bool(caps.get("supports_effects", False)),
         "effect_names": [str(effect_name) for effect_name in caps.get("effect_names", [])],
         "supports_multi_channel": bool(caps.get("supports_multi_channel", False)),
@@ -447,6 +481,7 @@ def resolve_cover_command_position(
 # Decoder modes are intentionally small/explicit.
 MODE_RAW = "raw"
 MODE_BRIGHTNESS = "brightness"
+MODE_TUNABLE_WHITE = "tunable_white"
 MODE_DUAL_CHANNEL = "dual_channel"
 MODE_PLUG_WITH_USB = "plug_with_usb"
 MODE_SENSOR_CONTROLLER = "sensor_controller"
@@ -842,6 +877,8 @@ def _decode_mode_from_capabilities(model_no: str) -> str:
         return MODE_PLUG_WITH_USB
     if capabilities["supports_multi_channel"]:
         return MODE_DUAL_CHANNEL
+    if capabilities["supports_color_temp"]:
+        return MODE_TUNABLE_WHITE
     if capabilities["supports_dimming"]:
         return MODE_BRIGHTNESS
     return MODE_RAW
@@ -864,6 +901,12 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
     if mode == MODE_BRIGHTNESS:
         result["brightness_0_100"] = value_byte
         result["is_on"] = value_byte > 0
+        return result
+
+    if mode == MODE_TUNABLE_WHITE:
+        brightness = max(0, min(100, value_byte - 0x80))
+        result["brightness_0_100"] = brightness
+        result["is_on"] = value_byte > 0x80
         return result
 
     if mode == MODE_DUAL_CHANNEL:

@@ -715,6 +715,7 @@ class PixieAuthHandler:
         command_state: Optional[bool],
         command_brightness: Optional[int],
         command_color_rgb: Optional[Tuple[int, int, int]],
+        command_color_temp_cct: Optional[int],
         command_white: bool,
         command_effect: Optional[str],
         command_target: Optional[str],
@@ -740,6 +741,7 @@ class PixieAuthHandler:
                 "command_state": command_state,
                 "command_brightness": command_brightness,
                 "command_color_rgb": command_color_rgb,
+                "command_color_temp_cct": command_color_temp_cct,
                 "command_white": command_white,
                 "command_effect": command_effect,
                 "command_target": command_target,
@@ -941,6 +943,7 @@ class PixieAuthHandler:
         command_state: Optional[bool] = None,
         command_brightness: Optional[int] = None,
         command_color_rgb: Optional[Tuple[int, int, int]] = None,
+        command_color_temp_cct: Optional[int] = None,
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
@@ -973,6 +976,7 @@ class PixieAuthHandler:
             command_state=command_state,
             command_brightness=command_brightness,
             command_color_rgb=command_color_rgb,
+            command_color_temp_cct=command_color_temp_cct,
             command_white=command_white,
             command_effect=command_effect,
             command_target=command_target,
@@ -1073,6 +1077,7 @@ class PixieAuthHandler:
         command_state: Optional[bool] = None,
         command_brightness: Optional[int] = None,
         command_color_rgb: Optional[Tuple[int, int, int]] = None,
+        command_color_temp_cct: Optional[int] = None,
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
@@ -1101,6 +1106,7 @@ class PixieAuthHandler:
             command_state: Optional target on/off state for local command
             command_brightness: Optional brightness 0-100 for brightness command
             command_color_rgb: Optional RGB tuple for color command
+            command_color_temp_cct: Optional 0-255 tunable-white position
             command_white: Whether color command was requested via --white
             command_mode: Optional sensor mode command (0=switch, 1=motion, 2=photocell when supported)
             command_target: Optional target endpoint for on/off command (relay|usb|left|right|both)
@@ -1166,6 +1172,7 @@ class PixieAuthHandler:
             command_state=command_state,
             command_brightness=command_brightness,
             command_color_rgb=command_color_rgb,
+            command_color_temp_cct=command_color_temp_cct,
             command_white=command_white,
             command_effect=command_effect,
             command_target=command_target,
@@ -2068,6 +2075,7 @@ class PixieAuthHandler:
         command_state: Optional[bool] = None,
         command_brightness: Optional[int] = None,
         command_color_rgb: Optional[Tuple[int, int, int]] = None,
+        command_color_temp_cct: Optional[int] = None,
         command_white: bool = False,
         command_effect: Optional[str] = None,
         command_target: Optional[str] = None,
@@ -2091,6 +2099,7 @@ class PixieAuthHandler:
             command_state: Optional target on/off state for local command
             command_brightness: Optional brightness 0-100 for brightness command
             command_color_rgb: Optional RGB tuple for color command
+            command_color_temp_cct: Optional 0-255 tunable-white position
             command_white: Whether color command was requested via --white
             command_effect: Optional effect name command
             command_target: Optional target endpoint for on/off command
@@ -2669,6 +2678,7 @@ class PixieAuthHandler:
             )
 
             prev_br = rec.runtime.br
+            prev_cct = rec.runtime.cct
             prev_rgb = rec.runtime.rgb
             prev_r = rec.runtime.r
             prev_gate_decoded = {
@@ -2780,6 +2790,12 @@ class PixieAuthHandler:
                             update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
                         update_kwargs["last_timer_poll_at"] = _time.time()
                         update_kwargs["timer_needs_poll"] = True
+                elif mode == "tunable_white":
+                    brightness = interpreted.get("brightness_0_100")
+                    if isinstance(brightness, int):
+                        update_kwargs["br"] = brightness
+                    if isinstance(tail, int):
+                        update_kwargs["cct"] = tail
                 elif mode == "gate":
                     # Gate device: value_byte = door1 position, tail = door2 position
                     if isinstance(value_byte, int):
@@ -2899,6 +2915,9 @@ class PixieAuthHandler:
             elif interpreted and interpreted.get("mode") == "raw" and isinstance(on_tail, bool):
                 summary_parts.append(f"on_tail={on_tail}")
                 summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+            elif interpreted and interpreted.get("mode") == "tunable_white":
+                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+                summary_parts.append(f"cct {prev_cct}->{updated_runtime.cct}")
             else:
                 summary_parts.append(f"value={value_byte}")
 
@@ -2943,6 +2962,7 @@ class PixieAuthHandler:
                 return
 
             prev_br = rec.runtime.br
+            prev_cct = rec.runtime.cct
             prev_rgb = rec.runtime.rgb
             prev_effect = rec.runtime.effect
             prev_effect_speed = rec.runtime.effect_speed
@@ -2959,6 +2979,10 @@ class PixieAuthHandler:
                     update_kwargs["br"] = brightness_level
                 if rgb_color is not None:
                     update_kwargs["rgb"] = [int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2])]
+            elif target == "color_temp":
+                if isinstance(brightness_level, int):
+                    update_kwargs["br"] = brightness_level
+                update_kwargs["cct"] = int(value) if value is not None else None
             elif target == "effect":
                 if isinstance(brightness_level, int):
                     update_kwargs["br"] = brightness_level
@@ -3064,11 +3088,12 @@ class PixieAuthHandler:
                     "target": target,
                     "requested_state": (
                         f"{value}"
-                        if target in ("brightness", "color", "effect", "speed", "cover", "mode")
+                        if target in ("brightness", "color", "color_temp", "effect", "speed", "cover", "mode")
                         else ("on" if value else "off")
                     ),
                     "command_hex": command_hex,
                     "brightness_level": brightness_level,
+                    "cct": update_kwargs.get("cct"),
                     "rgb_color": list(rgb_color) if rgb_color is not None else None,
                     "effect_name": effect_name,
                     "effect_speed": effect_speed,
@@ -3090,6 +3115,7 @@ class PixieAuthHandler:
             
             summary_parts = [
                 f"br {prev_br}->{updated_runtime.br}",
+                f"cct {prev_cct}->{updated_runtime.cct}",
                 f"rgb {prev_rgb}->{updated_runtime.rgb}",
                 f"effect {prev_effect}->{updated_runtime.effect}",
                 f"speed {prev_effect_speed}->{updated_runtime.effect_speed}",
@@ -3153,6 +3179,7 @@ class PixieAuthHandler:
             command_state: Optional[bool] = None,
             command_brightness: Optional[int] = None,
             command_color_rgb: Optional[Tuple[int, int, int]] = None,
+            command_color_temp_cct: Optional[int] = None,
             command_effect: Optional[str] = None,
             command_target: Optional[str] = None,
             command_mode: Optional[int] = None,
@@ -3197,7 +3224,14 @@ class PixieAuthHandler:
             is_cover_cmd = command_cover_action is not None
             is_effect_cmd = command_effect is not None
             is_color_cmd = command_color_rgb is not None
-            is_brightness_cmd = (command_brightness is not None) and not is_color_cmd and not is_effect_cmd and not is_cover_cmd
+            is_color_temp_cmd = command_color_temp_cct is not None
+            is_brightness_cmd = (
+                (command_brightness is not None)
+                and not is_color_cmd
+                and not is_color_temp_cmd
+                and not is_effect_cmd
+                and not is_cover_cmd
+            )
             is_mode_cmd = command_mode is not None
             state_byte_used = None
 
@@ -3207,6 +3241,9 @@ class PixieAuthHandler:
 
             if is_color_cmd and rec and not rec.capabilities.supports_color:
                 raise PixieAuthError(f"Model {rec.model_no} does not support color")
+
+            if is_color_temp_cmd and rec and not rec.capabilities.supports_color_temp:
+                raise PixieAuthError(f"Model {rec.model_no} does not support color temperature")
 
             if is_cover_cmd and rec and not rec.capabilities.supports_cover:
                 raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
@@ -3646,6 +3683,34 @@ class PixieAuthHandler:
                 if self.verbose:
                     self._log_debug("Color command hex: %s", command_hex)
                     self._print_local_command_debug(command_debug)
+            elif is_color_temp_cmd:
+                if command_brightness is not None:
+                    color_brightness = max(0, min(100, int(command_brightness)))
+                else:
+                    color_brightness = _default_brightness_percent(rec)
+                if color_brightness == 0:
+                    color_brightness = 100
+
+                command_hex = self._build_tunable_white_command_hex(
+                    command_device_id,
+                    cct=int(command_color_temp_cct),
+                    brightness_level=color_brightness,
+                )
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug(
+                    "Sending tunable-white command: device_id=%s cct=%s brightness=%s opcode=c16969",
+                    command_device_id,
+                    command_color_temp_cct,
+                    color_brightness,
+                )
+                if self.verbose:
+                    self._log_debug("Tunable-white command hex: %s", command_hex)
+                    self._print_local_command_debug(command_debug)
             elif is_brightness_cmd:
                 command_hex = self._build_brightness_command_hex(
                     command_device_id,
@@ -3773,6 +3838,16 @@ class PixieAuthHandler:
                     rgb_color=command_color_rgb,
                 )
                 return {"target": "color", "device_id": command_device_id}
+            if is_color_temp_cmd:
+                _apply_local_command_optimistic_update(
+                    command_device_id,
+                    int(command_color_temp_cct),
+                    command_hex,
+                    target="color_temp",
+                    opcode_name="c16969",
+                    brightness_level=color_brightness,
+                )
+                return {"target": "color_temp", "device_id": command_device_id}
             if is_effect_cmd:
                 _apply_local_command_optimistic_update(
                     command_device_id,
@@ -4031,6 +4106,7 @@ class PixieAuthHandler:
                         command_state,
                         command_brightness,
                         command_color_rgb,
+                        command_color_temp_cct,
                         command_effect,
                         command_mode,
                         command_cover_action,
@@ -4045,6 +4121,7 @@ class PixieAuthHandler:
                             command_state=command_state,
                             command_brightness=command_brightness,
                             command_color_rgb=command_color_rgb,
+                            command_color_temp_cct=command_color_temp_cct,
                             command_effect=command_effect,
                             command_target=command_target,
                             command_mode=command_mode,
@@ -4290,6 +4367,56 @@ class PixieAuthHandler:
 
         packet = sequence + src_bytes + destination_marker + bytes([0xE7, 0x69, 0x69]) + payload
         return packet.hex()
+
+    @staticmethod
+    def _tunable_white_payload_from_cct(cct: int) -> Tuple[int, int, int]:
+        """Map a 0..255 tunable-white position to the observed c16969 payload bytes.
+
+        Captures indicate the rippleSHIELD dimmer uses a piecewise white-temperature
+        ramp with a fixed middle byte and varying warm/cool bytes:
+        - WW (0)   -> ff b8 80
+        - CW (~125)-> ff b8 fd
+        - DL (255) -> 80 b8 ff
+        """
+        cct = max(0, min(255, int(cct)))
+        if cct <= 125:
+            blue = 0x80 + round((0xFD - 0x80) * (cct / 125.0))
+            return (0xFF, 0xB8, max(0x80, min(0xFD, int(blue))))
+
+        fraction = (cct - 125) / 130.0
+        red = 0xFF + round((0x80 - 0xFF) * fraction)
+        return (max(0x80, min(0xFF, int(red))), 0xB8, 0xFF)
+
+    def _build_tunable_white_command_hex(
+        self,
+        destination_id: int,
+        *,
+        cct: int,
+        brightness_level: int,
+    ) -> str:
+        """Build app-style tunable-white command using observed c16969 payload bytes."""
+        if not (0 <= brightness_level <= 100):
+            raise PixieAuthError(f"Brightness must be 0-100, got {brightness_level}")
+
+        warm, center, cool = self._tunable_white_payload_from_cct(cct)
+
+        cmd_num = (self._command_counter & 0xFF)
+        self._command_counter = (self._command_counter + 1) & 0xFF
+        if self._command_counter < 0x10:
+            self._command_counter = 0x10
+
+        dev_id_byte = int(destination_id) & 0xFF
+        brightness_byte = min(0xFF, max(0x00, round((brightness_level * 256) / 100)))
+
+        command_hex = (
+            f"{cmd_num:02x}"
+            "00000304"
+            f"{dev_id_byte:02x}"
+            "00c16969"
+            f"{warm:02x}{center:02x}{cool:02x}"
+            f"{brightness_byte:02x}"
+        )
+        return command_hex
 
     def _build_color_command_hex(
         self,
@@ -4616,5 +4743,3 @@ class PixieAuthHandler:
 
 # Removed: PixieCrypto, _pkcs7_pad, _pkcs7_unpad - now in pixie_protocol.py
 # Removed: bytes_to_hex - not needed
-
-

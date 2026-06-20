@@ -87,6 +87,7 @@ def derive_is_on_from_state(
         capabilities.supports_onoff
         or capabilities.supports_dimming
         or capabilities.supports_color
+        or capabilities.supports_color_temp
         or capabilities.supports_effects
     ):
         return r != 0
@@ -142,6 +143,7 @@ class RuntimeState:
     presence: str = "offline"
     is_on: Optional[bool] = None
     br: Optional[int] = None
+    cct: Optional[int] = None
     rgb: Optional[List[int]] = None
     effect: Optional[str] = None
     effect_speed: Optional[int] = None
@@ -176,6 +178,7 @@ class RuntimeState:
             "presence": self.presence,
             "is_on": self.is_on,
             "br": self.br,
+            "cct": self.cct,
             "rgb": self.rgb,
             "effect": self.effect,
             "effect_speed": self.effect_speed,
@@ -212,6 +215,7 @@ class RuntimeState:
             presence=str(data.get("presence") or "offline"),
             is_on=data.get("is_on"),
             br=_normalize_optional_int(data.get("br")),
+            cct=_normalize_optional_int(data.get("cct")),
             rgb=list(data.get("rgb")) if isinstance(data.get("rgb"), list) else None,
             effect=data.get("effect"),
             effect_speed=data.get("effect_speed"),
@@ -264,6 +268,7 @@ class DeviceStateStore:
         online: Any = STATE_UNSET,
         presence: Any = STATE_UNSET,
         br: Any = STATE_UNSET,
+        cct: Any = STATE_UNSET,
         rgb: Any = STATE_UNSET,
         effect: Any = STATE_UNSET,
         effect_speed: Any = STATE_UNSET,
@@ -307,6 +312,8 @@ class DeviceStateStore:
 
         if br is not STATE_UNSET:
             runtime.br = _normalize_optional_int(br)
+        if cct is not STATE_UNSET:
+            runtime.cct = _normalize_optional_int(cct)
         if rgb is not STATE_UNSET:
             runtime.rgb = list(rgb) if isinstance(rgb, list) else rgb
         if effect is not STATE_UNSET:
@@ -398,6 +405,7 @@ class DeviceStateStore:
             present_ids.add(dev_id)
             online_value = rec_data.get("online")
             update_br = STATE_UNSET
+            update_cct = STATE_UNSET
             update_r = STATE_UNSET
             update_mode = STATE_UNSET
             update_relay = STATE_UNSET
@@ -468,6 +476,16 @@ class DeviceStateStore:
                             update_mode = 1
                         elif pct == 2:
                             update_mode = 2
+                elif inv_rec.capabilities.supports_color_temp:
+                    raw_value = _normalize_optional_int(br_obj.get("raw"))
+                    if isinstance(raw_value, int):
+                        interpreted = decode_value_byte(inv_rec.model_no, raw_value)
+                        brightness = interpreted.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_br = brightness
+                    rssi_raw = rec_data.get("rssi_raw")
+                    if rssi_raw is not None:
+                        update_cct = _normalize_optional_int(rssi_raw)
                 elif br_obj.get("type") == "single":
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
@@ -493,6 +511,7 @@ class DeviceStateStore:
                 source=source,
                 online=online_value,
                 br=update_br,
+                cct=update_cct,
                 r=update_r,
                 mode=update_mode,
                 relay=update_relay,
@@ -545,6 +564,11 @@ class DeviceCapabilities:
     supports_onoff: bool = True
     supports_dimming: bool = False
     supports_color: bool = False
+    supports_color_temp: bool = False
+    color_temp_min_kelvin: int = 0
+    color_temp_max_kelvin: int = 0
+    color_temp_cct_min: int = 0
+    color_temp_cct_max: int = 255
     supports_effects: bool = False
     effect_names: List[str] = field(default_factory=list)
     supports_multi_channel: bool = False
@@ -571,6 +595,11 @@ class DeviceCapabilities:
             "supports_onoff": self.supports_onoff,
             "supports_dimming": self.supports_dimming,
             "supports_color": self.supports_color,
+            "supports_color_temp": self.supports_color_temp,
+            "color_temp_min_kelvin": self.color_temp_min_kelvin,
+            "color_temp_max_kelvin": self.color_temp_max_kelvin,
+            "color_temp_cct_min": self.color_temp_cct_min,
+            "color_temp_cct_max": self.color_temp_cct_max,
             "supports_effects": self.supports_effects,
             "effect_names": list(self.effect_names),
             "supports_multi_channel": self.supports_multi_channel,
@@ -599,6 +628,11 @@ class DeviceCapabilities:
             supports_onoff=bool(data.get("supports_onoff", True)),
             supports_dimming=bool(data.get("supports_dimming", False)),
             supports_color=bool(data.get("supports_color", False)),
+            supports_color_temp=bool(data.get("supports_color_temp", False)),
+            color_temp_min_kelvin=int(data.get("color_temp_min_kelvin", 0)),
+            color_temp_max_kelvin=int(data.get("color_temp_max_kelvin", 0)),
+            color_temp_cct_min=int(data.get("color_temp_cct_min", 0)),
+            color_temp_cct_max=int(data.get("color_temp_cct_max", 255)),
             supports_effects=bool(data.get("supports_effects", False)),
             effect_names=list(data.get("effect_names") or []),
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
@@ -709,6 +743,11 @@ class PixieInventory:
         cap.supports_onoff = model_caps["supports_onoff"]
         cap.supports_dimming = model_caps["supports_dimming"]
         cap.supports_color = model_caps["supports_color"]
+        cap.supports_color_temp = model_caps["supports_color_temp"]
+        cap.color_temp_min_kelvin = int(model_caps["color_temp_min_kelvin"])
+        cap.color_temp_max_kelvin = int(model_caps["color_temp_max_kelvin"])
+        cap.color_temp_cct_min = int(model_caps["color_temp_cct_min"])
+        cap.color_temp_cct_max = int(model_caps["color_temp_cct_max"])
         cap.supports_effects = model_caps["supports_effects"]
         cap.effect_names = model_caps["effect_names"]
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
@@ -794,6 +833,7 @@ class PixieInventory:
                 online=online_value,
                 presence="online" if is_online else "offline",
                 br=_normalize_optional_int(online.get("br")),
+                cct=_normalize_optional_int(online.get("cct")) if rec.capabilities.supports_color_temp else None,
                 r=_normalize_optional_int(online.get("r")),
                 mode=_normalize_optional_int(online.get("mode")),
                 relay=_normalize_optional_int(online.get("relay")),
@@ -911,6 +951,8 @@ class PixieInventory:
                 caps.append("dimming")
             if d.capabilities.supports_color:
                 caps.append("color")
+            if d.capabilities.supports_color_temp:
+                caps.append("color_temp")
             if d.capabilities.supports_effects:
                 caps.append("effects")
             if d.capabilities.supports_multi_channel:
@@ -927,7 +969,7 @@ class PixieInventory:
                 caps.append("photocell_sensor")
 
             lines.append(
-                " - id={id} model={model} name={name} caps=[{caps}] state_seed=(presence={presence}, is_on={is_on}, br={br}, r={r}, mode={mode}, relay={relay}) src={src}".format(
+                " - id={id} model={model} name={name} caps=[{caps}] state_seed=(presence={presence}, is_on={is_on}, br={br}, cct={cct}, r={r}, mode={mode}, relay={relay}) src={src}".format(
                     id=d.id,
                     model=d.model_no,
                     name=d.name,
@@ -935,6 +977,7 @@ class PixieInventory:
                     presence=d.runtime.presence,
                     is_on=d.runtime.is_on,
                     br=d.runtime.br,
+                    cct=d.runtime.cct,
                     r=d.runtime.r,
                     mode=d.runtime.mode,
                     relay=d.runtime.relay,
@@ -983,12 +1026,13 @@ class PixieInventory:
                 )
             )
             lines.append(
-                "   capabilities: light={light} switch={switch} onoff={onoff} dimming={dim} color={color} effects={effects} multi_channel={multi} usb_subentity={usb} supports_cover={cover}".format(
+                "   capabilities: light={light} switch={switch} onoff={onoff} dimming={dim} color={color} color_temp={color_temp} effects={effects} multi_channel={multi} usb_subentity={usb} supports_cover={cover}".format(
                     light=d.capabilities.is_light,
                     switch=d.capabilities.is_switch,
                     onoff=d.capabilities.supports_onoff,
                     dim=d.capabilities.supports_dimming,
                     color=d.capabilities.supports_color,
+                    color_temp=d.capabilities.supports_color_temp,
                     effects=d.capabilities.supports_effects,
                     multi=d.capabilities.supports_multi_channel,
                     usb=d.capabilities.supports_usb_subentity,
@@ -999,11 +1043,12 @@ class PixieInventory:
                 f"   capability_hints: {json.dumps(d.capabilities.capability_hints, ensure_ascii=False, sort_keys=True)}"
             )
             lines.append(
-                "   runtime: presence={presence} online={online} is_on={is_on} br={br} r={r} mode={mode} relay={relay} src={src} last_updated_ms={ts}".format(
+                "   runtime: presence={presence} online={online} is_on={is_on} br={br} cct={cct} r={r} mode={mode} relay={relay} src={src} last_updated_ms={ts}".format(
                     presence=d.runtime.presence,
                     online=d.runtime.online,
                     is_on=d.runtime.is_on,
                     br=d.runtime.br,
+                    cct=d.runtime.cct,
                     r=d.runtime.r,
                     mode=d.runtime.mode,
                     relay=d.runtime.relay,
