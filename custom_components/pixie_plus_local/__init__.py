@@ -442,6 +442,7 @@ class PixiePlusConfigEntryRuntimeData:
     coordinator: PixiePlusRuntimeCoordinator
     entry: ConfigEntry
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending_contact_resets: dict[int, asyncio.Handle] = field(default_factory=dict)
 
     @staticmethod
     def _describe_runtime_session(runtime_session) -> str:
@@ -476,6 +477,11 @@ class PixiePlusConfigEntryRuntimeData:
         # cycle (which can be up to 10 s away).
         for device_id in sorted(inventory.devices_by_id):
             rec = inventory.devices_by_id[device_id]
+            if rec.capabilities.supports_contact_sensor and rec.runtime.contact_momentary and rec.runtime.contact_active:
+                self.coordinator.hass.loop.call_soon_threadsafe(
+                    self._schedule_contact_reset,
+                    device_id,
+                )
             if rec.capabilities.supports_timer and rec.runtime.timer_needs_poll:
                 rec.runtime.timer_needs_poll = False
                 self.coordinator.hass.loop.call_soon_threadsafe(
@@ -487,6 +493,30 @@ class PixiePlusConfigEntryRuntimeData:
                     ),
                 )
                 LOGGER.debug("Immediate timer poll for device %s (external change)", device_id)
+
+    def _schedule_contact_reset(self, device_id: int) -> None:
+        """Schedule a short HA-side reset for momentary contact sensor events."""
+        existing = self.pending_contact_resets.pop(int(device_id), None)
+        if existing is not None:
+            existing.cancel()
+
+        def _reset() -> None:
+            self.pending_contact_resets.pop(int(device_id), None)
+            inventory = self.pixie_runtime.inventory
+            if inventory is None:
+                return
+            runtime = inventory.state_store.apply_device_update(
+                inventory.devices_by_id,
+                int(device_id),
+                source="contact_pulse_reset",
+                contact_active=False,
+                contact_momentary=False,
+            )
+            if runtime is None:
+                return
+            self.coordinator.async_set_updated_data(inventory)
+
+        self.pending_contact_resets[int(device_id)] = self.coordinator.hass.loop.call_later(1.0, _reset)
 
     async def async_ensure_runtime(self, hass: HomeAssistant, *, reason: str):
         """Ensure there is one healthy live runtime session for this config entry."""
@@ -566,6 +596,9 @@ class PixiePlusConfigEntryRuntimeData:
     async def async_shutdown(self, hass: HomeAssistant) -> None:
         """Stop the long-lived gateway runtime session."""
         async with self.restart_lock:
+            for handle in self.pending_contact_resets.values():
+                handle.cancel()
+            self.pending_contact_resets.clear()
             runtime_session = self.pixie_runtime.runtime_session
             if runtime_session is None:
                 return
@@ -837,7 +870,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "main", "mode", "timer_mode", "restart", "timer_remaining",
             "timer_duration", "hold_time", "brightness_threshold",
             "motion_sensitivity", "refresh_params", "left", "right",
-            "usb", "sensor_light_state", "door1", "door2",
+            "usb", "sensor_light_state", "contact_state", "arm",
+            "door1", "door2",
         )
         valid_entity_ids: set[str] = set()
         valid_device_ids: set[str] = {gateway_device_identifier(inv)}

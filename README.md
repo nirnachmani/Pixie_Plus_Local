@@ -44,8 +44,8 @@ The current code includes support for these model families:
 - Gate & Door Control - PC206GD/R/BTAM
 - Smart Dimmer rippleSHIELD - SDD400RS/BTAM
 - SFI Dimmer - SDD400SFI
-
-For compatible models, the integration supports on/off, dimming, RGB color, and built-in effects where those capabilities exist.
+- Contact Sensor Transceiver - PC100CS/R/BTAM
+- Strip Kit RGB - FLBP24V2RGB/BTAM 
 
 ## Installation
 
