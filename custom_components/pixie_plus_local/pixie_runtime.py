@@ -42,6 +42,8 @@ from Crypto.Util.Padding import pad, unpad
 from .pixie_protocol import PixieEnvelope, PixieMessage, PixieCrypto
 from .pixie_inventory import GatewayIdentity, PixieInventory
 from .pixie_value_profiles import (
+    decode_color_runtime_state,
+    decode_contact_runtime_state,
     build_gate_motion_plan,
     build_gate_motion_plan_from_learned_duration,
     decode_gate_command_reply,
@@ -2751,6 +2753,21 @@ class PixieAuthHandler:
                         update_kwargs["br"] = 100 if relay_on else 0
                     if isinstance(motion, bool):
                         update_kwargs["motion"] = motion
+                elif mode == "contact_sensor":
+                    if isinstance(tail, int):
+                        decoded_contact = decode_contact_runtime_state(
+                            rec.model_no,
+                            value_byte,
+                            tail,
+                            prev_armed=rec.runtime.armed,
+                            prev_source=rec.runtime.last_source,
+                            allow_pulse=True,
+                        )
+                        if "armed" in decoded_contact:
+                            update_kwargs["armed"] = decoded_contact.get("armed")
+                        if "contact_active" in decoded_contact:
+                            update_kwargs["contact_active"] = decoded_contact.get("contact_active")
+                        update_kwargs["contact_momentary"] = bool(decoded_contact.get("pulse_event"))
                 elif mode == "timer_switch":
                     timer_mode = interpreted.get("timer_mode")
                     restarting = interpreted.get("restarting")
@@ -2796,6 +2813,16 @@ class PixieAuthHandler:
                         update_kwargs["br"] = brightness
                     if isinstance(tail, int):
                         update_kwargs["cct"] = tail
+                elif mode == "color_effect":
+                    if isinstance(tail, int):
+                        decoded_color = decode_color_runtime_state(rec.model_no, value_byte, tail)
+                        brightness = decoded_color.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_kwargs["br"] = brightness
+                        if "effect" in decoded_color:
+                            update_kwargs["effect"] = decoded_color.get("effect")
+                        if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
+                            update_kwargs["rgb"] = [int(channel) for channel in decoded_color["rgb"]]
                 elif mode == "gate":
                     # Gate device: value_byte = door1 position, tail = door2 position
                     if isinstance(value_byte, int):
@@ -3034,6 +3061,13 @@ class PixieAuthHandler:
                 update_kwargs["relay"] = 0
                 update_kwargs["motion"] = False
                 update_kwargs["br"] = 0
+            elif target == "arm":
+                update_kwargs["armed"] = bool(value)
+                update_kwargs["contact_momentary"] = False
+                if value:
+                    update_kwargs["contact_active"] = False
+                else:
+                    update_kwargs["contact_active"] = None
             elif target == "relay" and rec.capabilities.supports_sensor:
                 # Sensor-family manual light control uses relay in switch mode.
                 update_kwargs["mode"] = 0
@@ -3112,6 +3146,8 @@ class PixieAuthHandler:
             prev_mode = rec.runtime.mode
             prev_relay = rec.runtime.relay
             prev_motion = rec.runtime.motion
+            prev_armed = rec.runtime.armed
+            prev_contact = rec.runtime.contact_active
             
             summary_parts = [
                 f"br {prev_br}->{updated_runtime.br}",
@@ -3127,6 +3163,10 @@ class PixieAuthHandler:
                 summary_parts.append(f"relay {prev_relay}->{updated_runtime.relay}")
             if prev_motion != updated_runtime.motion:
                 summary_parts.append(f"motion {prev_motion}->{updated_runtime.motion}")
+            if prev_armed != updated_runtime.armed:
+                summary_parts.append(f"armed {prev_armed}->{updated_runtime.armed}")
+            if prev_contact != updated_runtime.contact_active:
+                summary_parts.append(f"contact {prev_contact}->{updated_runtime.contact_active}")
             
             self._log_debug(
                 "Inventory optimistic update: id=%s name=%s %s src %s->%s",
@@ -3393,6 +3433,49 @@ class PixieAuthHandler:
                     opcode_name="d26c69",
                 )
                 return {"target": command_sensor_param, "device_id": command_device_id}
+
+            # ── Contact sensor (3012) arm/disarm dispatch ──
+            if command_state is not None and rec and rec.capabilities.supports_contact_sensor:
+                effective_target = self._resolve_command_target_for_device(
+                    command_device_id,
+                    command_target,
+                )
+                if effective_target != "arm":
+                    raise PixieAuthError(f"Unsupported command target for contact sensor: {effective_target}")
+
+                command_hex = self._build_contact_arm_command_hex(command_device_id, armed=bool(command_state))
+                command_debug = self._build_local_bledata_command_debug(
+                    key=extracted_key,
+                    command_hex=command_hex,
+                    from_email=sender_identity,
+                )
+                command_b64 = command_debug["base64"]
+                self._log_debug(
+                    "Sending contact sensor arm command: device_id=%s state=%s opcode=ca6b69",
+                    command_device_id,
+                    "armed" if command_state else "disarmed",
+                )
+                if self.verbose:
+                    self._log_debug("Contact sensor arm command hex: %s", command_hex)
+                    self._print_local_command_debug(command_debug)
+
+                command_parsed = _parse_message(command_b64, extracted_key)
+                command_route, command_match = _classify_message("out", command_parsed)
+                _log_message("out", command_parsed, command_route, command_match)
+                sock.sendall(command_b64.encode("utf-8"))
+                if runtime_session is not None:
+                    runtime_session.mark_command_sent()
+
+                _drain_incoming()
+
+                _apply_local_command_optimistic_update(
+                    command_device_id,
+                    command_state,
+                    command_hex,
+                    target="arm",
+                    opcode_name="ca6b69",
+                )
+                return {"target": "arm", "device_id": command_device_id}
 
             # ── Timer switch (2113) command dispatch ──
             is_timer_cmd = rec and rec.capabilities.supports_timer and (
@@ -4617,6 +4700,17 @@ class PixieAuthHandler:
         return self._build_shifted_prefix_command_hex(
             device_id,
             opcode=b"\xd2\x6c\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_contact_arm_command_hex(self, device_id: int, *, armed: bool) -> str:
+        """Build the captured ca6b69 arm/disarm command for the contact sensor."""
+        payload = bytes([0x01 if armed else 0x00]) + b"\xf6\xff\xff"
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xca\x6b\x69",
             payload=payload,
             counter_attr="_timer_command_counter",
             minimum_counter=0x01,

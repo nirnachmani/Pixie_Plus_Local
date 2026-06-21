@@ -7,6 +7,7 @@ be added without touching parser logic.
 
 from __future__ import annotations
 
+import colorsys
 from typing import Any, Dict, Optional
 
 
@@ -27,11 +28,15 @@ hardware_list = {
     "2212": "Smart Switch G2 - SWL350BT",
     "2312": "Smart Dimmer G2 - SDD350BT",
     "2311": "Smart Dimmer G2 - SDD350BT",
+    "3011": "Contact Sensor Transceiver - PC100CS/R/BTAM",
+    "3010": "Contact Sensor Transceiver - PC100CS/R/BTAM",
+    "3012": "Contact Sensor Transceiver - PC100CS/R/BTAM",
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
-    "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",
+    "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",    
     "2113": "Smart Timer Switch - STS600BTAM",
     "2552": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
     "1217": "Gate & Door Control - PC206GD/R/BTAM",
+    "2704": "Strip Kit RGB - FLBP24V2RGB/BTAM",
 }
 
 # Unified model capability truth.
@@ -198,9 +203,34 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_color": True,
         "supports_effects": True,
         "effect_names": ["flash", "strobe", "fade", "smooth"],
+        "color_runtime_encoding": "legacy_brightness_only",
         "supports_multi_channel": False,
         "supports_usb_subentity": False,
         "supports_cover": False,
+    },
+    "3010": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+        "supports_contact_sensor": True,
+    },
+    "3011": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+        "supports_contact_sensor": True,
     },
     "3001": {
         "is_light": True,
@@ -239,6 +269,18 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "brightness_threshold_options": ["Dark", "Night", "Evening", "Dusk", "Day"],
         "supports_motion_sensitivity": True,
         "motion_sensitivity_options": ["Low", "Medium", "High"],
+    },
+    "3012": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+        "supports_contact_sensor": True,
     },
     "2113": {
         "is_light": True,
@@ -282,6 +324,19 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_gate": True,
         "gate_doors": 2,
     },
+    "2704": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": True,
+        "supports_effects": True,
+        "effect_names": ["flash", "strobe", "fade", "smooth"],
+        "color_runtime_encoding": "tail_hue_extended",
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
 }
 
 
@@ -294,6 +349,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_onoff": bool(caps.get("supports_onoff", False)),
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),
+        "color_runtime_encoding": str(caps.get("color_runtime_encoding", "")),
         "supports_color_temp": bool(caps.get("supports_color_temp", False)),
         "color_temp_min_kelvin": int(caps.get("color_temp_min_kelvin", 0)),
         "color_temp_max_kelvin": int(caps.get("color_temp_max_kelvin", 0)),
@@ -305,6 +361,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_usb_subentity": bool(caps.get("supports_usb_subentity", False)),
         "supports_cover": bool(caps.get("supports_cover", False)),
         "supports_sensor": bool(caps.get("supports_sensor", caps.get("supports_mode", False))),
+        "supports_contact_sensor": bool(caps.get("supports_contact_sensor", False)),
         "supports_motion_sensor": bool(caps.get("supports_motion_sensor", False)),
         "supports_photocell_sensor": bool(caps.get("supports_photocell_sensor", False)),
         "supports_timer": bool(caps.get("supports_timer", False)),
@@ -481,10 +538,12 @@ def resolve_cover_command_position(
 # Decoder modes are intentionally small/explicit.
 MODE_RAW = "raw"
 MODE_BRIGHTNESS = "brightness"
+MODE_COLOR_EFFECT = "color_effect"
 MODE_TUNABLE_WHITE = "tunable_white"
 MODE_DUAL_CHANNEL = "dual_channel"
 MODE_PLUG_WITH_USB = "plug_with_usb"
 MODE_SENSOR_CONTROLLER = "sensor_controller"
+MODE_CONTACT_SENSOR = "contact_sensor"
 MODE_TIMER_SWITCH = "timer_switch"
 MODE_GATE = "gate"
 
@@ -873,10 +932,14 @@ def _decode_mode_from_capabilities(model_no: str) -> str:
         return MODE_TIMER_SWITCH
     if capabilities["supports_sensor"]:
         return MODE_SENSOR_CONTROLLER
+    if capabilities["supports_contact_sensor"]:
+        return MODE_CONTACT_SENSOR
     if capabilities["supports_usb_subentity"]:
         return MODE_PLUG_WITH_USB
     if capabilities["supports_multi_channel"]:
         return MODE_DUAL_CHANNEL
+    if capabilities["color_runtime_encoding"]:
+        return MODE_COLOR_EFFECT
     if capabilities["supports_color_temp"]:
         return MODE_TUNABLE_WHITE
     if capabilities["supports_dimming"]:
@@ -901,6 +964,19 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
     if mode == MODE_BRIGHTNESS:
         result["brightness_0_100"] = value_byte
         result["is_on"] = value_byte > 0
+        return result
+
+    if mode == MODE_COLOR_EFFECT:
+        capabilities = get_model_capabilities(model_no)
+        encoding = capabilities["color_runtime_encoding"]
+        if encoding == "tail_hue_extended":
+            result["brightness_0_100"] = max(0, min(100, value_byte & 0x7F))
+            result["is_on"] = (value_byte & 0x7F) > 0
+            result["high_bit_set"] = bool(value_byte & 0x80)
+        else:
+            result["brightness_0_100"] = max(0, min(100, value_byte))
+            result["is_on"] = value_byte > 0
+            result["high_bit_set"] = False
         return result
 
     if mode == MODE_TUNABLE_WHITE:
@@ -972,4 +1048,182 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
         result["is_on"] = relay_on
         return result
 
+    if mode == MODE_CONTACT_SENSOR:
+        result["armed"] = value_byte in (0x04, 0x05)
+        result["contact_active"] = value_byte == 0x04 if result["armed"] else None
+        result["pulse_event"] = False
+        result["is_on"] = bool(result["contact_active"]) if result["armed"] else False
+        return result
+
     return result
+
+
+def _hue_degrees_to_rgb(hue_degrees: int) -> list[int]:
+    """Convert hue degrees to a saturated RGB color."""
+    hue_fraction = (int(hue_degrees) % 360) / 360.0
+    red, green, blue = colorsys.hsv_to_rgb(hue_fraction, 1.0, 1.0)
+    return [
+        max(0, min(255, round(red * 255))),
+        max(0, min(255, round(green * 255))),
+        max(0, min(255, round(blue * 255))),
+    ]
+
+
+def decode_color_runtime_state(model_no: str, value_byte: int, tail_byte: int) -> Dict[str, Any]:
+    """Decode compact runtime bytes for RGB strip families that report color/effects."""
+    capabilities = get_model_capabilities(model_no)
+    encoding = capabilities["color_runtime_encoding"]
+    if not encoding:
+        return {}
+
+    tail = max(0, min(255, int(tail_byte)))
+    value = max(0, min(255, int(value_byte)))
+
+    if encoding == "legacy_brightness_only":
+        brightness = max(0, min(100, value))
+        return {
+            "mode": MODE_COLOR_EFFECT,
+            "brightness_0_100": brightness,
+            "is_on": brightness > 0,
+            "high_bit_set": False,
+            "tail_byte": tail,
+            "effect": None,
+        }
+
+    brightness = max(0, min(100, value & 0x7F))
+    high_bit_set = bool(value & 0x80)
+
+    if tail == 0xFF:
+        return {
+            "mode": MODE_COLOR_EFFECT,
+            "brightness_0_100": brightness,
+            "is_on": brightness > 0,
+            "high_bit_set": high_bit_set,
+            "tail_byte": tail,
+            "effect": None,
+            "rgb": [255, 255, 255],
+        }
+
+    effect: str | None = None
+    if tail >= 0xEC:
+        effect = "fade"
+    elif tail > 0xD9 or (tail == 0xD9 and high_bit_set):
+        effect = "smooth"
+    elif tail >= 0xC7:
+        effect = "strobe"
+    elif tail > 0xB4 or (tail == 0xB4 and high_bit_set):
+        effect = "flash"
+
+    decoded: Dict[str, Any] = {
+        "mode": MODE_COLOR_EFFECT,
+        "brightness_0_100": brightness,
+        "is_on": brightness > 0,
+        "high_bit_set": high_bit_set,
+        "tail_byte": tail,
+        "effect": effect,
+    }
+
+    if effect is None:
+        hue_degrees = (tail * 2) % 360
+        decoded["hue_degrees"] = hue_degrees
+        decoded["rgb"] = _hue_degrees_to_rgb(hue_degrees)
+
+    return decoded
+
+
+def decode_color_runtime_hue(model_no: str, hue_value: Any) -> Dict[str, Any]:
+    """Decode fallback onlineList hue values for RGB strips."""
+    capabilities = get_model_capabilities(model_no)
+    if capabilities["color_runtime_encoding"] != "tail_hue_extended":
+        return {}
+
+    try:
+        hue = int(hue_value)
+    except (TypeError, ValueError):
+        return {}
+
+    decoded: Dict[str, Any] = {
+        "mode": MODE_COLOR_EFFECT,
+        "effect": None,
+    }
+
+    if hue <= 360:
+        hue_degrees = hue % 360
+        decoded["hue_degrees"] = hue_degrees
+        decoded["rgb"] = _hue_degrees_to_rgb(hue_degrees)
+        return decoded
+
+    if hue <= 397:
+        decoded["effect"] = "flash"
+    elif hue <= 434:
+        decoded["effect"] = "strobe"
+    elif hue <= 471:
+        decoded["effect"] = "smooth"
+    elif hue <= 508:
+        decoded["effect"] = "fade"
+
+    return decoded
+
+
+def decode_contact_runtime_state(
+    model_no: str,
+    value_byte: int,
+    tail_byte: int,
+    *,
+    prev_armed: Optional[bool] = None,
+    prev_source: Optional[str] = None,
+    allow_pulse: bool = True,
+) -> Dict[str, Any]:
+    """Decode contact-sensor runtime bytes from single bleData or bulk GwData."""
+    capabilities = get_model_capabilities(model_no)
+    if not capabilities["supports_contact_sensor"]:
+        return {}
+
+    value = int(value_byte) & 0xFF
+    tail = int(tail_byte) & 0xFF
+
+    if value == 0x01:
+        return {
+            "mode": MODE_CONTACT_SENSOR,
+            "armed": False,
+            "contact_active": None,
+            "pulse_event": False,
+            "is_on": False,
+            "tail_byte": tail,
+        }
+
+    if model_no == "3012" and value == 0x04:
+        return {
+            "mode": MODE_CONTACT_SENSOR,
+            "armed": True,
+            "contact_active": True,
+            "pulse_event": True,
+            "is_on": True,
+            "tail_byte": tail,
+        }
+
+    armed = value in (0x04, 0x05)
+    if value == 0x05:
+        # Pulse-mode packets do not self-identify "re-arm" vs "pulse" reliably.
+        # Use the previous state, but do not treat:
+        # - startup/bulk GwData snapshots
+        # - the first hub ack after a local re-arm command
+        # as pulse events.
+        pulse_event = (
+            allow_pulse
+            and prev_armed is True
+            and prev_source != "local_command_optimistic"
+        )
+        contact_active = True if pulse_event else False
+    else:
+        pulse_event = False
+        contact_active = (value == 0x04) if armed else None
+
+    return {
+        "mode": MODE_CONTACT_SENSOR,
+        "armed": armed,
+        "contact_active": contact_active,
+        "pulse_event": pulse_event,
+        "is_on": bool(contact_active) if armed else False,
+        "tail_byte": tail,
+    }

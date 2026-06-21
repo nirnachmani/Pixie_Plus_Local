@@ -14,7 +14,15 @@ from typing import Any, Dict, List, Optional
 import json
 import logging
 
-from .pixie_value_profiles import decode_gate_state_byte, decode_value_byte, get_model_capabilities, hardware_list
+from .pixie_value_profiles import (
+    decode_color_runtime_hue,
+    decode_color_runtime_state,
+    decode_contact_runtime_state,
+    decode_gate_state_byte,
+    decode_value_byte,
+    get_model_capabilities,
+    hardware_list,
+)
 
 
 STATE_UNSET = object()
@@ -54,6 +62,8 @@ def derive_is_on_from_state(
     r: Optional[int],
     mode: Optional[int] = None,
     relay: Optional[int] = None,
+    armed: Optional[bool] = None,
+    contact_active: Optional[bool] = None,
 ) -> Optional[bool]:
     """Derive an on/off state from the current runtime fields.
 
@@ -72,6 +82,13 @@ def derive_is_on_from_state(
     # Sensor controller devices (e.g., 3001) use relay field for on/off.
     if capabilities.supports_sensor and isinstance(relay, int):
         return relay != 0
+
+    if capabilities.supports_contact_sensor:
+        if armed is False:
+            return None
+        if isinstance(contact_active, bool):
+            return contact_active
+        return None
 
     if capabilities.supports_multi_channel or capabilities.supports_usb_subentity:
         if isinstance(r, int):
@@ -151,6 +168,9 @@ class RuntimeState:
     mode: Optional[int] = None
     relay: Optional[int] = None
     motion: Optional[bool] = None
+    armed: Optional[bool] = None
+    contact_active: Optional[bool] = None
+    contact_momentary: bool = False
     timer_total_seconds: Optional[int] = None
     timer_remaining_seconds: Optional[int] = None
     last_timer_poll_at: Optional[float] = None
@@ -186,6 +206,9 @@ class RuntimeState:
             "mode": self.mode,
             "relay": self.relay,
             "motion": self.motion,
+            "armed": self.armed,
+            "contact_active": self.contact_active,
+            "contact_momentary": self.contact_momentary,
             "timer_total_seconds": self.timer_total_seconds,
             "timer_remaining_seconds": self.timer_remaining_seconds,
             "last_timer_poll_at": self.last_timer_poll_at,
@@ -223,6 +246,9 @@ class RuntimeState:
             mode=_normalize_optional_int(data.get("mode")),
             relay=_normalize_optional_int(data.get("relay")),
             motion=data.get("motion"),
+            armed=data.get("armed"),
+            contact_active=data.get("contact_active"),
+            contact_momentary=bool(data.get("contact_momentary", False)),
             timer_total_seconds=_normalize_optional_int(data.get("timer_total_seconds")),
             timer_remaining_seconds=_normalize_optional_int(data.get("timer_remaining_seconds")),
             last_timer_poll_at=data.get("last_timer_poll_at"),
@@ -276,6 +302,9 @@ class DeviceStateStore:
         mode: Any = STATE_UNSET,
         relay: Any = STATE_UNSET,
         motion: Any = STATE_UNSET,
+        armed: Any = STATE_UNSET,
+        contact_active: Any = STATE_UNSET,
+        contact_momentary: Any = STATE_UNSET,
         timer_total_seconds: Any = STATE_UNSET,
         timer_remaining_seconds: Any = STATE_UNSET,
         last_timer_poll_at: Any = STATE_UNSET,
@@ -328,6 +357,12 @@ class DeviceStateStore:
             runtime.relay = _normalize_optional_int(relay)
         if motion is not STATE_UNSET:
             runtime.motion = motion
+        if armed is not STATE_UNSET:
+            runtime.armed = None if armed is None else bool(armed)
+        if contact_active is not STATE_UNSET:
+            runtime.contact_active = None if contact_active is None else bool(contact_active)
+        if contact_momentary is not STATE_UNSET:
+            runtime.contact_momentary = bool(contact_momentary)
         if timer_total_seconds is not STATE_UNSET:
             runtime.timer_total_seconds = _normalize_optional_int(timer_total_seconds)
         if timer_remaining_seconds is not STATE_UNSET:
@@ -371,6 +406,8 @@ class DeviceStateStore:
             runtime.r,
             runtime.mode,
             runtime.relay,
+            runtime.armed,
+            runtime.contact_active,
         )
         runtime.last_source = source
         runtime.last_updated_ms = updated_ms if updated_ms is not None else int(datetime.now().timestamp() * 1000)
@@ -406,10 +443,15 @@ class DeviceStateStore:
             online_value = rec_data.get("online")
             update_br = STATE_UNSET
             update_cct = STATE_UNSET
+            update_rgb = STATE_UNSET
+            update_effect = STATE_UNSET
             update_r = STATE_UNSET
             update_mode = STATE_UNSET
             update_relay = STATE_UNSET
             update_motion = STATE_UNSET
+            update_armed = STATE_UNSET
+            update_contact_active = STATE_UNSET
+            update_contact_momentary = STATE_UNSET
             update_door1 = STATE_UNSET
             update_door2 = STATE_UNSET
             update_door1_decoded = STATE_UNSET
@@ -443,6 +485,29 @@ class DeviceStateStore:
                                 update_br = 100 if relay_on else 0
                             if isinstance(motion, bool):
                                 update_motion = motion
+                elif inv_rec.capabilities.supports_contact_sensor:
+                    raw_value = _normalize_optional_int(br_obj.get("raw"))
+                    rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
+                    if isinstance(raw_value, int) and isinstance(rssi_raw, int):
+                        prev_armed = None
+                        prev_source = None
+                        current_runtime = self.get(dev_id)
+                        if current_runtime is not None:
+                            prev_armed = current_runtime.armed
+                            prev_source = current_runtime.last_source
+                        decoded_contact = decode_contact_runtime_state(
+                            inv_rec.model_no,
+                            raw_value,
+                            rssi_raw,
+                            prev_armed=prev_armed,
+                            prev_source=prev_source,
+                            allow_pulse=False,
+                        )
+                        if "armed" in decoded_contact:
+                            update_armed = decoded_contact.get("armed")
+                        if "contact_active" in decoded_contact:
+                            update_contact_active = decoded_contact.get("contact_active")
+                        update_contact_momentary = bool(decoded_contact.get("pulse_event"))
                 elif inv_rec.capabilities.supports_gate:
                     # Gate repurposes br=door1_state, rssi=door2_state
                     update_door1 = _normalize_optional_int(br_obj.get("raw"))
@@ -486,6 +551,18 @@ class DeviceStateStore:
                     rssi_raw = rec_data.get("rssi_raw")
                     if rssi_raw is not None:
                         update_cct = _normalize_optional_int(rssi_raw)
+                elif inv_rec.capabilities.color_runtime_encoding:
+                    raw_value = _normalize_optional_int(br_obj.get("raw"))
+                    rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
+                    if isinstance(raw_value, int) and isinstance(rssi_raw, int):
+                        decoded_color = decode_color_runtime_state(inv_rec.model_no, raw_value, rssi_raw)
+                        brightness = decoded_color.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_br = brightness
+                        if "effect" in decoded_color:
+                            update_effect = decoded_color.get("effect")
+                        if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
+                            update_rgb = [int(channel) for channel in decoded_color["rgb"]]
                 elif br_obj.get("type") == "single":
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
@@ -512,10 +589,15 @@ class DeviceStateStore:
                 online=online_value,
                 br=update_br,
                 cct=update_cct,
+                rgb=update_rgb,
+                effect=update_effect,
                 r=update_r,
                 mode=update_mode,
                 relay=update_relay,
                 motion=update_motion,
+                armed=update_armed,
+                contact_active=update_contact_active,
+                contact_momentary=update_contact_momentary,
                 door1_state=update_door1,
                 door2_state=update_door2,
                 door1_decoded=update_door1_decoded,
@@ -564,6 +646,7 @@ class DeviceCapabilities:
     supports_onoff: bool = True
     supports_dimming: bool = False
     supports_color: bool = False
+    color_runtime_encoding: str = ""
     supports_color_temp: bool = False
     color_temp_min_kelvin: int = 0
     color_temp_max_kelvin: int = 0
@@ -575,6 +658,7 @@ class DeviceCapabilities:
     supports_usb_subentity: bool = False
     supports_cover: bool = False
     supports_sensor: bool = False
+    supports_contact_sensor: bool = False
     supports_motion_sensor: bool = False
     supports_photocell_sensor: bool = False
     supports_timer: bool = False
@@ -595,6 +679,7 @@ class DeviceCapabilities:
             "supports_onoff": self.supports_onoff,
             "supports_dimming": self.supports_dimming,
             "supports_color": self.supports_color,
+            "color_runtime_encoding": self.color_runtime_encoding,
             "supports_color_temp": self.supports_color_temp,
             "color_temp_min_kelvin": self.color_temp_min_kelvin,
             "color_temp_max_kelvin": self.color_temp_max_kelvin,
@@ -606,6 +691,7 @@ class DeviceCapabilities:
             "supports_usb_subentity": self.supports_usb_subentity,
             "supports_cover": self.supports_cover,
             "supports_sensor": self.supports_sensor,
+            "supports_contact_sensor": self.supports_contact_sensor,
             "supports_motion_sensor": self.supports_motion_sensor,
             "supports_photocell_sensor": self.supports_photocell_sensor,
             "supports_timer": self.supports_timer,
@@ -628,6 +714,7 @@ class DeviceCapabilities:
             supports_onoff=bool(data.get("supports_onoff", True)),
             supports_dimming=bool(data.get("supports_dimming", False)),
             supports_color=bool(data.get("supports_color", False)),
+            color_runtime_encoding=str(data.get("color_runtime_encoding", "")),
             supports_color_temp=bool(data.get("supports_color_temp", False)),
             color_temp_min_kelvin=int(data.get("color_temp_min_kelvin", 0)),
             color_temp_max_kelvin=int(data.get("color_temp_max_kelvin", 0)),
@@ -639,6 +726,7 @@ class DeviceCapabilities:
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
             supports_cover=bool(data.get("supports_cover", False)),
             supports_sensor=bool(data.get("supports_sensor", data.get("supports_mode", False))),
+            supports_contact_sensor=bool(data.get("supports_contact_sensor", False)),
             supports_motion_sensor=bool(data.get("supports_motion_sensor", False)),
             supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
             supports_timer=bool(data.get("supports_timer", False)),
@@ -743,6 +831,7 @@ class PixieInventory:
         cap.supports_onoff = model_caps["supports_onoff"]
         cap.supports_dimming = model_caps["supports_dimming"]
         cap.supports_color = model_caps["supports_color"]
+        cap.color_runtime_encoding = model_caps["color_runtime_encoding"]
         cap.supports_color_temp = model_caps["supports_color_temp"]
         cap.color_temp_min_kelvin = int(model_caps["color_temp_min_kelvin"])
         cap.color_temp_max_kelvin = int(model_caps["color_temp_max_kelvin"])
@@ -754,6 +843,7 @@ class PixieInventory:
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
         cap.supports_cover = model_caps["supports_cover"]
         cap.supports_sensor = model_caps["supports_sensor"]
+        cap.supports_contact_sensor = model_caps["supports_contact_sensor"]
         cap.supports_motion_sensor = model_caps["supports_motion_sensor"]
         cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
         cap.supports_timer = model_caps["supports_timer"]
@@ -841,6 +931,19 @@ class PixieInventory:
                 last_source=source,
                 last_updated_ms=now_ms,
             )
+            if rec.capabilities.supports_contact_sensor:
+                arm_value = online.get("arm")
+                sensor_value = online.get("sensor")
+                runtime_state.armed = bool(int(arm_value)) if _normalize_optional_int(arm_value) is not None else None
+                normalized_sensor = _normalize_optional_int(sensor_value)
+                if normalized_sensor is not None:
+                    runtime_state.contact_active = normalized_sensor == 0
+            if rec.capabilities.color_runtime_encoding:
+                online_hue_state = decode_color_runtime_hue(rec.model_no, online.get("hue"))
+                if isinstance(online_hue_state.get("rgb"), list):
+                    runtime_state.rgb = [int(channel) for channel in online_hue_state["rgb"]]
+                if "effect" in online_hue_state:
+                    runtime_state.effect = online_hue_state.get("effect")
             # Seed timer duration from device state (already in seconds).
             if rec.capabilities.supports_timer:
                 dev_state = d.get("state") if isinstance(d.get("state"), dict) else {}

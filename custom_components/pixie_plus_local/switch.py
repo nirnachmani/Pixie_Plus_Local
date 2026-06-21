@@ -34,6 +34,21 @@ def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
         record = inventory.devices_by_id[device_id]
         parent_identifier = physical_device_identifier(record)
 
+        if record.capabilities.supports_contact_sensor:
+            endpoints.append(
+                PixieEndpoint(
+                    device_id=record.id,
+                    endpoint_key="arm",
+                    command_target="arm",
+                    entity_unique_id=endpoint_unique_identifier(record, "arm"),
+                    device_identifier=parent_identifier,
+                    device_name=record.name,
+                    via_device_identifier=gateway_identifier,
+                    entity_name="Armed",
+                )
+            )
+            continue
+
         if not record.capabilities.is_switch:
             continue
 
@@ -127,6 +142,8 @@ class PixiePlusSwitchEntity(PixiePlusCoordinatorEntity, SwitchEntity):
         target = self.endpoint.command_target
         endpoint_key = self.endpoint.endpoint_key
 
+        if target == "arm":
+            return runtime.armed
         if target == "usb":
             return bool(runtime.r & 0x02) if isinstance(runtime.r, int) else None
         if endpoint_key == "main" and self.record.capabilities.supports_usb_subentity:
