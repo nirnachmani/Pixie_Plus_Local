@@ -24,7 +24,7 @@ This integration is for gateway-based Pixie Plus systems. It does not expose dir
 
 ## Supported Devices
 
-The current code includes support for these model families:
+The current code includes support for these models:
 
 - Gateway G3 - SGW3BTAM
 - Smart Switch G3 - SWL600BTAM
