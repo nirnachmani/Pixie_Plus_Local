@@ -35,6 +35,7 @@ hardware_list = {
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",    
     "2113": "Smart Timer Switch - STS600BTAM",
     "2552": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
+    "2452": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
     "1217": "Gate & Door Control - PC206GD/R/BTAM",
     "2704": "Strip Kit RGB - FLBP24V2RGB/BTAM",
 }
@@ -306,6 +307,24 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "color_temp_max_kelvin": 6500,
         "color_temp_cct_min": 0,
         "color_temp_cct_max": 255,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    # SDD400RS/BTAM reported as type/stype 2452 (same printed model as the 2552
+    # entry above). Profiled here as brightness-only. This hardware may itself be
+    # colour-temp capable like 2552 when paired with signal-controllable CCT
+    # downlights; it was characterised against an installation where colour
+    # temperature is fixed on the fixture (SAL S9041TC tri-colour switch) and the
+    # dimmer only controls brightness. If a 2452 is later confirmed to drive CCT
+    # over the rippleSHIELD signal, copy the colour-temp fields from 2552.
+    "2452": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": False,
         "supports_effects": False,
         "supports_multi_channel": False,
         "supports_usb_subentity": False,
