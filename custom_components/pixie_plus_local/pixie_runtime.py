@@ -42,6 +42,7 @@ from Crypto.Util.Padding import pad, unpad
 from .pixie_protocol import PixieEnvelope, PixieMessage, PixieCrypto
 from .pixie_inventory import GatewayIdentity, PixieInventory
 from .pixie_value_profiles import (
+    EFFECT_COMMAND_ENCODINGS,
     decode_color_runtime_state,
     decode_contact_runtime_state,
     build_gate_motion_plan,
@@ -2997,6 +2998,12 @@ class PixieAuthHandler:
             prev_source = rec.runtime.last_source
             update_kwargs: Dict[str, Any] = {}
 
+            def _remembered_turn_on_brightness() -> int:
+                for candidate in (rec.runtime.last_nonzero_br, rec.runtime.br):
+                    if isinstance(candidate, int) and candidate > 0:
+                        return max(1, min(100, candidate))
+                return 100
+
             # Handle brightness/color/effect commands
             if target == "brightness":
                 if isinstance(value, int):
@@ -3006,10 +3013,12 @@ class PixieAuthHandler:
                     update_kwargs["br"] = brightness_level
                 if rgb_color is not None:
                     update_kwargs["rgb"] = [int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2])]
+                update_kwargs["effect"] = None
             elif target == "color_temp":
                 if isinstance(brightness_level, int):
                     update_kwargs["br"] = brightness_level
                 update_kwargs["cct"] = int(value) if value is not None else None
+                update_kwargs["effect"] = None
             elif target == "effect":
                 if isinstance(brightness_level, int):
                     update_kwargs["br"] = brightness_level
@@ -3074,8 +3083,8 @@ class PixieAuthHandler:
                 update_kwargs["relay"] = 1 if value else 0
                 update_kwargs["motion"] = False
                 update_kwargs["br"] = 100 if value else 0
-            elif rec.model_no == "2213":
-                update_kwargs["br"] = 100 if value else 0
+            elif rec.capabilities.supports_dimming:
+                update_kwargs["br"] = _remembered_turn_on_brightness() if value else 0
             elif rec.model_no == "0107":
                 # 0107 fallback can start cloud-only with br and no USB detail.
                 if isinstance(rec.runtime.r, int):
@@ -3303,6 +3312,8 @@ class PixieAuthHandler:
                 allowed_effects = rec.capabilities.effect_names or get_model_effect_names(rec.model_no)
                 if not allowed_effects:
                     raise PixieAuthError(f"Model {rec.model_no} does not support effects")
+                if not rec.capabilities.effect_command_encoding:
+                    raise PixieAuthError(f"Model {rec.model_no} supports effects but has no effect command encoding")
                 if command_effect.strip().lower() not in allowed_effects:
                     raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
 
@@ -3721,6 +3732,7 @@ class PixieAuthHandler:
                     effect_name=effect_name,
                     effect_speed=effect_speed,
                     brightness_level=effect_brightness,
+                    capabilities=rec.capabilities if rec else None,
                 )
                 command_debug = self._build_local_bledata_command_debug(
                     key=extracted_key,
@@ -4546,22 +4558,18 @@ class PixieAuthHandler:
         effect_name: Optional[str],
         effect_speed: int,
         brightness_level: int,
+        capabilities: Optional[Any] = None,
     ) -> str:
-        """Build app-style effect command using captured f86969 payload bytes.
-
-        Captured payload after opcode is:
-        [effect_code][speed][ff][00][brightness].
-        """
-        effect_map = {
-            "none": "00",
-            "flash": "01",
-            "strobe": "02",
-            "smooth": "03",
-            "fade": "04",
-        }
+        """Build app-style effect command using the model capability encoding."""
         normalized = (effect_name or "none").strip().lower()
+        encoding = str(getattr(capabilities, "effect_command_encoding", "") or "")
+        if not encoding:
+            raise PixieAuthError("Effect command encoding is required for effect-capable devices")
+        effect_map = EFFECT_COMMAND_ENCODINGS.get(encoding)
+        if effect_map is None:
+            raise PixieAuthError(f"Unsupported effect command encoding: {encoding}")
         if normalized not in effect_map:
-            raise PixieAuthError(f"Unsupported effect: {effect_name}")
+            raise PixieAuthError(f"Unsupported effect for {encoding} encoding: {effect_name}")
         if not (0 <= effect_speed <= 255):
             raise PixieAuthError(f"Effect speed must be 0-255, got {effect_speed}")
         if not (0 <= brightness_level <= 100):
@@ -4574,15 +4582,27 @@ class PixieAuthHandler:
 
         dev_id_byte = int(destination_id) & 0xFF
         brightness_byte = min(0xFF, max(0x00, round((brightness_level * 256) / 100)))
+        if encoding == "legacy":
+            effect_payload = (
+                f"{effect_map[normalized]}"
+                f"{effect_speed:02x}"
+                "ff00"
+                f"{brightness_byte:02x}"
+            )
+        elif encoding == "template":
+            effect_payload = (
+                f"{effect_speed:02x}"
+                f"{brightness_byte:02x}"
+                f"{effect_map[normalized]}"
+            )
+        else:
+            raise PixieAuthError(f"Unsupported effect command encoding: {encoding}")
         command_hex = (
             f"{cmd_num:02x}"
             "00000304"
             f"{dev_id_byte:02x}"
             "00f86969"
-            f"{effect_map[normalized]}"
-            f"{effect_speed:02x}"
-            "ff00"
-            f"{brightness_byte:02x}"
+            f"{effect_payload}"
         )
         return command_hex
 
