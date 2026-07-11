@@ -11,6 +11,26 @@ import colorsys
 from typing import Any, Dict, Optional
 
 
+EFFECT_COMMAND_CODES: Dict[str, str] = {
+    "flash": "01",
+    "strobe": "02",
+    "smooth": "03",
+    "fade": "04",
+}
+
+EFFECT_COMMAND_TEMPLATES: Dict[str, str] = {
+    "flash": "1c9df8f200",
+    "strobe": "9db400f000",
+    "smooth": "1e9df8f200",
+    "fade": "9fb400f000",
+}
+
+EFFECT_COMMAND_ENCODINGS = {
+    "legacy": EFFECT_COMMAND_CODES,
+    "template": EFFECT_COMMAND_TEMPLATES,
+}
+
+
 # Human-readable model names (optional but useful for logs/debug).
 hardware_list = {
     "0102": "Gateway G3 - SGW3BTAM",
@@ -203,6 +223,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_dimming": True,
         "supports_color": True,
         "supports_effects": True,
+        "effect_command_encoding": "legacy",
         "effect_names": ["flash", "strobe", "fade", "smooth"],
         "color_runtime_encoding": "legacy_brightness_only",
         "supports_multi_channel": False,
@@ -350,6 +371,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_dimming": True,
         "supports_color": True,
         "supports_effects": True,
+        "effect_command_encoding": "template",
         "effect_names": ["flash", "strobe", "fade", "smooth"],
         "color_runtime_encoding": "tail_hue_extended",
         "supports_multi_channel": False,
@@ -362,6 +384,10 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
 def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     """Return normalized capability flags for a model number."""
     caps = MODEL_CAPABILITIES.get(str(model_no), {})
+    effect_command_encoding = str(caps.get("effect_command_encoding", ""))
+    effect_names = [str(effect_name) for effect_name in caps.get("effect_names", [])]
+    if not effect_names and effect_command_encoding in EFFECT_COMMAND_ENCODINGS:
+        effect_names = list(EFFECT_COMMAND_ENCODINGS[effect_command_encoding].keys())
     return {
         "is_light": bool(caps.get("is_light", False)),
         "is_switch": bool(caps.get("is_switch", False)),
@@ -375,7 +401,8 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "color_temp_cct_min": int(caps.get("color_temp_cct_min", 0)),
         "color_temp_cct_max": int(caps.get("color_temp_cct_max", 255)),
         "supports_effects": bool(caps.get("supports_effects", False)),
-        "effect_names": [str(effect_name) for effect_name in caps.get("effect_names", [])],
+        "effect_command_encoding": effect_command_encoding,
+        "effect_names": effect_names,
         "supports_multi_channel": bool(caps.get("supports_multi_channel", False)),
         "supports_usb_subentity": bool(caps.get("supports_usb_subentity", False)),
         "supports_cover": bool(caps.get("supports_cover", False)),
@@ -1106,7 +1133,6 @@ def decode_color_runtime_state(model_no: str, value_byte: int, tail_byte: int) -
             "is_on": brightness > 0,
             "high_bit_set": False,
             "tail_byte": tail,
-            "effect": None,
         }
 
     brightness = max(0, min(100, value & 0x7F))

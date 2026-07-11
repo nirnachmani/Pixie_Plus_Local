@@ -160,6 +160,7 @@ class RuntimeState:
     presence: str = "offline"
     is_on: Optional[bool] = None
     br: Optional[int] = None
+    last_nonzero_br: Optional[int] = None
     cct: Optional[int] = None
     rgb: Optional[List[int]] = None
     effect: Optional[str] = None
@@ -198,6 +199,7 @@ class RuntimeState:
             "presence": self.presence,
             "is_on": self.is_on,
             "br": self.br,
+            "last_nonzero_br": self.last_nonzero_br,
             "cct": self.cct,
             "rgb": self.rgb,
             "effect": self.effect,
@@ -233,11 +235,16 @@ class RuntimeState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RuntimeState":
+        br_value = _normalize_optional_int(data.get("br"))
+        remembered_br = _normalize_optional_int(data.get("last_nonzero_br"))
+        if remembered_br is None and isinstance(br_value, int) and br_value > 0:
+            remembered_br = br_value
         return cls(
             online=data.get("online"),
             presence=str(data.get("presence") or "offline"),
             is_on=data.get("is_on"),
-            br=_normalize_optional_int(data.get("br")),
+            br=br_value,
+            last_nonzero_br=remembered_br,
             cct=_normalize_optional_int(data.get("cct")),
             rgb=list(data.get("rgb")) if isinstance(data.get("rgb"), list) else None,
             effect=data.get("effect"),
@@ -341,6 +348,8 @@ class DeviceStateStore:
 
         if br is not STATE_UNSET:
             runtime.br = _normalize_optional_int(br)
+            if isinstance(runtime.br, int) and runtime.br > 0:
+                runtime.last_nonzero_br = runtime.br
         if cct is not STATE_UNSET:
             runtime.cct = _normalize_optional_int(cct)
         if rgb is not STATE_UNSET:
@@ -653,6 +662,7 @@ class DeviceCapabilities:
     color_temp_cct_min: int = 0
     color_temp_cct_max: int = 255
     supports_effects: bool = False
+    effect_command_encoding: str = ""
     effect_names: List[str] = field(default_factory=list)
     supports_multi_channel: bool = False
     supports_usb_subentity: bool = False
@@ -686,6 +696,7 @@ class DeviceCapabilities:
             "color_temp_cct_min": self.color_temp_cct_min,
             "color_temp_cct_max": self.color_temp_cct_max,
             "supports_effects": self.supports_effects,
+            "effect_command_encoding": self.effect_command_encoding,
             "effect_names": list(self.effect_names),
             "supports_multi_channel": self.supports_multi_channel,
             "supports_usb_subentity": self.supports_usb_subentity,
@@ -721,6 +732,7 @@ class DeviceCapabilities:
             color_temp_cct_min=int(data.get("color_temp_cct_min", 0)),
             color_temp_cct_max=int(data.get("color_temp_cct_max", 255)),
             supports_effects=bool(data.get("supports_effects", False)),
+            effect_command_encoding=str(data.get("effect_command_encoding", "")),
             effect_names=list(data.get("effect_names") or []),
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
@@ -782,11 +794,18 @@ class DeviceRecord:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DeviceRecord":
+        model_no = str(data.get("model_no") or "")
+        capabilities = DeviceCapabilities.from_dict(dict(data.get("capabilities") or {}))
+        if capabilities.supports_effects and not capabilities.effect_command_encoding:
+            model_caps = get_model_capabilities(model_no)
+            capabilities.effect_command_encoding = str(model_caps.get("effect_command_encoding", ""))
+            if not capabilities.effect_names:
+                capabilities.effect_names = list(model_caps.get("effect_names") or [])
         return cls(
             id=int(data.get("id", 0)),
             type=int(data.get("type", 0)),
             stype=int(data.get("stype", 0)),
-            model_no=str(data.get("model_no") or ""),
+            model_no=model_no,
             name=str(data.get("name") or ""),
             mac=str(data.get("mac") or ""),
             version=data.get("version"),
@@ -794,7 +813,7 @@ class DeviceRecord:
             right_name=data.get("right_name"),
             rooms=list(data.get("rooms") or []),
             import_mode=data.get("import_mode"),
-            capabilities=DeviceCapabilities.from_dict(dict(data.get("capabilities") or {})),
+            capabilities=capabilities,
             runtime=RuntimeState.from_dict(dict(data.get("runtime") or {})),
         )
 
@@ -838,6 +857,7 @@ class PixieInventory:
         cap.color_temp_cct_min = int(model_caps["color_temp_cct_min"])
         cap.color_temp_cct_max = int(model_caps["color_temp_cct_max"])
         cap.supports_effects = model_caps["supports_effects"]
+        cap.effect_command_encoding = model_caps["effect_command_encoding"]
         cap.effect_names = model_caps["effect_names"]
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
