@@ -4111,6 +4111,28 @@ class PixieAuthHandler:
                 runtime_session.mark_heartbeat_failure()
             return got_traffic
 
+        def _decrypt_initial_dual_parts(envelope_struct: Dict[str, Any]) -> tuple[Optional[tuple[str, str]], Optional[str]]:
+            """Try stored netID first, then its integer-like form for zero-padded accounts."""
+            netid_candidates: list[str] = []
+            if self.netid_seed not in (None, "", "unknown"):
+                stored_netid = str(self.netid_seed)
+                netid_candidates.append(stored_netid)
+                stripped_netid = stored_netid.lstrip("0") or "0"
+                if stripped_netid != stored_netid:
+                    netid_candidates.append(stripped_netid)
+
+            for candidate in netid_candidates:
+                parts = PixieEnvelope.decrypt_dual_parts(envelope_struct, candidate)
+                if parts:
+                    if candidate != str(self.netid_seed):
+                        self._log_debug(
+                            "Initial hub handshake decrypted with normalized netID %s from stored %s",
+                            candidate,
+                            self.netid_seed,
+                        )
+                    return parts, candidate
+            return None, None
+
         try:
             # Java flow: hub sends first, then app sends eack, then heartbeat loop starts.
             self._log_debug("Waiting for hub's initial message")
@@ -4130,7 +4152,7 @@ class PixieAuthHandler:
                     # - data1 decrypted with netID => session key (f14376j)
                     # - data2 decrypted with session key => mesh validation value
                     if envelope_struct and envelope_struct.get("flag1") == 0:
-                        parts = PixieEnvelope.decrypt_dual_parts(envelope_struct, self.netid_seed)
+                        parts, handshake_netid = _decrypt_initial_dual_parts(envelope_struct)
                         if parts:
                             part1, part2 = parts
                             extracted_key = part1
@@ -4147,7 +4169,7 @@ class PixieAuthHandler:
                                 )
                             elif expected_values:
                                 self._log_debug("Mesh validation matched cloud/UDP values")
-                            initial_parsed = _parse_message(raw_b64, self.netid_seed)
+                            initial_parsed = _parse_message(raw_b64, handshake_netid or self.netid_seed)
                             initial_route, initial_match = _classify_message("in", initial_parsed)
                             _log_message("in", initial_parsed, initial_route, initial_match, byte_len=len(response_data))
                         else:
