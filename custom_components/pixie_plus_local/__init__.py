@@ -18,6 +18,10 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .pixie_inventory import DeviceRecord, PixieInventory
+from .pixie_ble import (
+    BT_STATE_NO_WORKING_PROXY,
+    PixieBluetoothRuntime,
+)
 from .pixie_runtime import (
     CloudParams,
     PixieAuthError,
@@ -46,15 +50,27 @@ CONF_GATEWAY_IP = "gateway_ip"
 CONF_GATEWAY_IP_REQUIRED = "gateway_ip_required"
 CONF_PIXIE_USERNAME = "pixie_username"
 CONF_PIXIE_PASSWORD = "pixie_password"
+CONF_BT_ENABLED = "bt_enabled"
+CONF_BT_STATE = "bt_state"
+CONF_BT_SOURCE = "bt_source"
+CONF_BT_ACCESS_NODE = "bt_access_node"
+CONF_BT_RESPONSE_ACCESS_NODE = "bt_response_access_node"
+CONF_COMMAND_TRANSPORT = "command_transport"
 
 INVENTORY_MODE_LOCAL_53216 = "local_53216"
 INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
+COMMAND_TRANSPORT_TCP_PRIMARY = "tcp_primary"
+COMMAND_TRANSPORT_BT_PRIMARY = "bt_primary"
+COMMAND_TRANSPORT_TCP_ONLY = "tcp_only"
+COMMAND_TRANSPORT_BT_ONLY = "bt_only"
 ISSUE_ID_MISSING_FALLBACK_CREDENTIALS = "missing_fallback_credentials"
 ISSUE_ID_GATEWAY_IP_REQUIRED = "gateway_ip_required"
+ISSUE_ID_BT_PROXY_UNAVAILABLE = "bt_proxy_unavailable"
 
 COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
 TIMER_POLL_INTERVAL_SECONDS = 10.0
 INVENTORY_STORE_VERSION = 1
+BLE_COMMAND_READY_TIMEOUT = 45.0
 
 
 def _inventory_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
@@ -122,6 +138,66 @@ def _entry_gateway_ip_required(entry: ConfigEntry) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _entry_bt_enabled(entry: ConfigEntry) -> bool:
+    value = entry.data.get(CONF_BT_ENABLED)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _entry_command_transport(entry: ConfigEntry) -> str:
+    if not _entry_bt_enabled(entry):
+        return COMMAND_TRANSPORT_TCP_PRIMARY
+
+    value = str(entry.options.get(CONF_COMMAND_TRANSPORT) or COMMAND_TRANSPORT_TCP_PRIMARY)
+    allowed = {
+        COMMAND_TRANSPORT_TCP_PRIMARY,
+        COMMAND_TRANSPORT_BT_PRIMARY,
+        COMMAND_TRANSPORT_TCP_ONLY,
+        COMMAND_TRANSPORT_BT_ONLY,
+    }
+    if value not in allowed:
+        return COMMAND_TRANSPORT_TCP_PRIMARY
+    return value
+
+
+def _async_remember_ble_access_node(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    *,
+    source: str | None,
+    access_node: str | None,
+    response_capable: bool,
+) -> None:
+    """Persist learned BLE access-node hints for future sessions."""
+    if not access_node:
+        return
+    normalized_node = str(access_node).upper()
+    normalized_source = str(source).upper() if source else None
+    data = dict(entry.data)
+    changed = False
+
+    if normalized_source and data.get(CONF_BT_SOURCE) != normalized_source:
+        data[CONF_BT_SOURCE] = normalized_source
+        changed = True
+    if data.get(CONF_BT_ACCESS_NODE) != normalized_node:
+        data[CONF_BT_ACCESS_NODE] = normalized_node
+        changed = True
+    if response_capable and data.get(CONF_BT_RESPONSE_ACCESS_NODE) != normalized_node:
+        data[CONF_BT_RESPONSE_ACCESS_NODE] = normalized_node
+        changed = True
+
+    if not changed:
+        return
+    hass.config_entries.async_update_entry(entry, data=data)
+    LOGGER.info(
+        "Persisted Pixie BLE access-node hint access_node=%s source=%s response_capable=%s",
+        normalized_node,
+        normalized_source,
+        response_capable,
+    )
 
 
 async def _async_update_entry_runtime_data(
@@ -213,6 +289,30 @@ def _async_delete_gateway_ip_issue(hass: HomeAssistant, entry: ConfigEntry) -> N
     ir.async_delete_issue(hass, DOMAIN, _gateway_ip_issue_id(entry))
 
 
+def _bt_proxy_issue_id(entry: ConfigEntry) -> str:
+    return f"{ISSUE_ID_BT_PROXY_UNAVAILABLE}_{entry.entry_id}"
+
+
+def _async_create_bt_proxy_issue(hass: HomeAssistant, entry: ConfigEntry, *, error: str | None = None) -> None:
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _bt_proxy_issue_id(entry),
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_ID_BT_PROXY_UNAVAILABLE,
+        translation_placeholders={
+            "entry_title": entry.title or INTEGRATION_TITLE,
+            "error": error or "No working ESPHome Bluetooth proxy was found.",
+        },
+    )
+
+
+def _async_delete_bt_proxy_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, _bt_proxy_issue_id(entry))
+
+
 def _handler_cloud_params(handler: PixieAuthHandler, fallback: CloudParams) -> CloudParams:
     return CloudParams(
         home_id=str(handler.home_id or fallback.home_id),
@@ -295,7 +395,7 @@ async def async_register_device_topology(
     device_registry.async_get_or_create(**gateway_kwargs)
 
     for record in inventory.devices_by_id.values():
-        if record.model_no == "0102":
+        if record.capabilities.is_gateway:
             continue
 
         kwargs = {
@@ -336,8 +436,7 @@ class PixiePlusCoordinatorEntity(CoordinatorEntity[PixieInventory]):
     @property
     def available(self) -> bool:
         """Return whether the entity is currently available."""
-        runtime_session = self.runtime_data.pixie_runtime.runtime_session
-        if runtime_session is None or not runtime_session.is_alive():
+        if not self.runtime_data.is_any_runtime_healthy():
             return False
         return self.record.runtime.presence == "online"
 
@@ -392,7 +491,12 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
             try:
                 await self.runtime_manager.async_ensure_runtime(self.hass, reason="coordinator_refresh")
             except Exception as err:
-                raise UpdateFailed(f"Pixie runtime unavailable: {err}") from err
+                await self.runtime_manager.async_ensure_ble_runtime()
+                if not self.runtime_manager.is_any_runtime_healthy():
+                    raise UpdateFailed(f"Pixie runtime unavailable: {err}") from err
+                LOGGER.debug("Pixie TCP runtime unavailable during refresh, continuing with BLE health: %s", err)
+            else:
+                await self.runtime_manager.async_ensure_ble_runtime()
 
         inventory = self.pixie_runtime.inventory
         if inventory is None:
@@ -416,7 +520,15 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
                     continue
                 if rec.runtime.mode != 1 or not rec.runtime.is_on:
                     continue
-                last_poll = rec.runtime.last_timer_poll_at
+                last_poll_markers = [
+                    value
+                    for value in (
+                        rec.runtime.last_timer_poll_at,
+                        rec.runtime.last_timer_poll_requested_at,
+                    )
+                    if isinstance(value, (int, float))
+                ]
+                last_poll = max(last_poll_markers) if last_poll_markers else None
                 if last_poll is not None and (now - last_poll) < TIMER_POLL_INTERVAL_SECONDS:
                     continue
                 # Fire-and-forget — don't block the coordinator update
@@ -441,6 +553,7 @@ class PixiePlusConfigEntryRuntimeData:
     pixie_runtime: PixieRuntimeData
     coordinator: PixiePlusRuntimeCoordinator
     entry: ConfigEntry
+    ble_runtime: PixieBluetoothRuntime | None = None
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_contact_resets: dict[int, asyncio.Handle] = field(default_factory=dict)
 
@@ -482,17 +595,110 @@ class PixiePlusConfigEntryRuntimeData:
                     self._schedule_contact_reset,
                     device_id,
                 )
+        self._schedule_pending_timer_polls(inventory, from_thread=True, reason="external change")
+
+    def push_inventory_update_from_loop(self, inventory: PixieInventory) -> None:
+        """Push a runtime inventory update already running in HA's event loop."""
+        self.pixie_runtime.inventory = inventory
+        self.coordinator.async_set_updated_data(inventory)
+        self.coordinator.hass.async_create_task(
+            _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory)
+        )
+        self._schedule_pending_timer_polls(inventory, from_thread=False, reason="BLE update")
+
+    def _schedule_pending_timer_polls(self, inventory: PixieInventory, *, from_thread: bool, reason: str) -> None:
+        """Schedule immediate timer polls requested by newly applied runtime state."""
+        for device_id in sorted(inventory.devices_by_id):
+            rec = inventory.devices_by_id[device_id]
             if rec.capabilities.supports_timer and rec.runtime.timer_needs_poll:
                 rec.runtime.timer_needs_poll = False
-                self.coordinator.hass.loop.call_soon_threadsafe(
-                    self.coordinator.hass.async_create_task,
-                    self.async_send_local_command(
-                        self.coordinator.hass,
-                        command_device_id=device_id,
-                        command_timer_action="poll",
-                    ),
+                command_coro = self.async_send_local_command(
+                    self.coordinator.hass,
+                    command_device_id=device_id,
+                    command_timer_action="poll",
                 )
-                LOGGER.debug("Immediate timer poll for device %s (external change)", device_id)
+                if from_thread:
+                    self.coordinator.hass.loop.call_soon_threadsafe(
+                        self.coordinator.hass.async_create_task,
+                        command_coro,
+                    )
+                else:
+                    self.coordinator.hass.async_create_task(command_coro)
+                LOGGER.debug("Immediate timer poll for device %s (%s)", device_id, reason)
+
+    def is_tcp_runtime_healthy(self) -> bool:
+        """Return True when the TCP runtime session is currently usable."""
+        runtime_session = self.pixie_runtime.runtime_session
+        return (
+            runtime_session is not None
+            and runtime_session.is_alive()
+            and not runtime_session.needs_restart()
+            and runtime_session.connection_closed_at is None
+        )
+
+    def is_ble_runtime_healthy(self) -> bool:
+        """Return True when the optional BLE runtime is currently usable."""
+        return self.ble_runtime is not None and self.ble_runtime.health.healthy
+
+    def is_any_runtime_healthy(self) -> bool:
+        """Return True if at least one enabled runtime path is healthy."""
+        if self.is_tcp_runtime_healthy():
+            return True
+        return self.is_ble_runtime_healthy()
+
+    async def async_ensure_ble_runtime(self) -> PixieBluetoothRuntime | None:
+        """Ensure the optional BLE runtime task is started when configured."""
+        if self.ble_runtime is None or not _entry_bt_enabled(self.entry):
+            return None
+        await self.ble_runtime.async_start()
+        return self.ble_runtime
+
+    async def async_wait_for_ble_runtime_ready(self, timeout: float = BLE_COMMAND_READY_TIMEOUT) -> PixieBluetoothRuntime | None:
+        """Start BLE if configured and wait briefly for a usable command session."""
+        runtime = await self.async_ensure_ble_runtime()
+        if runtime is None:
+            return None
+        if not runtime.health.healthy:
+            LOGGER.debug("Waiting up to %.1fs for Pixie BLE runtime to become command-ready", timeout)
+        deadline = self.coordinator.hass.loop.time() + timeout
+        while self.coordinator.hass.loop.time() < deadline:
+            if runtime.health.healthy:
+                LOGGER.debug(
+                    "Pixie BLE runtime became command-ready source=%s access_node=%s",
+                    runtime.health.source,
+                    runtime.health.access_node,
+                )
+                return runtime
+            await asyncio.sleep(0.25)
+        if runtime.health.healthy:
+            return runtime
+        return None
+
+    def _apply_ble_command_optimistic_update(self, command_kwargs: dict) -> bool:
+        """Apply the same transport-neutral optimistic update used by TCP."""
+        intent = self.handler.resolve_optimistic_update_intent(command_kwargs)
+        if intent is None:
+            LOGGER.debug("Optimistic update skipped: unsupported command kwargs=%s", command_kwargs)
+            return False
+        applied = self.handler.apply_optimistic_update_intent(intent)
+        if applied:
+            self.pixie_runtime.inventory = self.handler.inventory
+        return applied
+
+    async def _async_send_ble_command(self, command_kwargs: dict, *, wait_for_ready: bool) -> None:
+        """Send one command over BLE and apply the shared optimistic update."""
+        ble_runtime = self.ble_runtime if self.ble_runtime is not None and self.ble_runtime.health.healthy else None
+        if ble_runtime is None and wait_for_ready:
+            ble_runtime = await self.async_wait_for_ble_runtime_ready()
+        if ble_runtime is None or not ble_runtime.health.healthy:
+            ble_error = self.ble_runtime.health.last_error if self.ble_runtime is not None else None
+            raise ConfigEntryError(
+                f"Pixie BLE command transport is not available"
+                f"{f': {ble_error}' if ble_error else ''}"
+            )
+        await ble_runtime.async_send_command(command_kwargs)
+        self._apply_ble_command_optimistic_update(command_kwargs)
+        self.coordinator.async_set_updated_data(self.pixie_runtime.inventory)
 
     def _schedule_contact_reset(self, device_id: int) -> None:
         """Schedule a short HA-side reset for momentary contact sensor events."""
@@ -582,8 +788,12 @@ class PixiePlusConfigEntryRuntimeData:
             self.pixie_runtime.handler = restart_handler
             self.pixie_runtime.runtime_session = restarted_runtime.runtime_session
             self.pixie_runtime.inventory_mode = inventory_mode
+            if self.ble_runtime is not None:
+                self.ble_runtime.command_builder = restart_handler
             if restarted_runtime.inventory is not None:
                 self.pixie_runtime.inventory = restarted_runtime.inventory
+                if self.ble_runtime is not None:
+                    self.ble_runtime.inventory = restarted_runtime.inventory
             _async_delete_gateway_ip_issue(hass, self.entry)
 
             LOGGER.info(
@@ -601,17 +811,52 @@ class PixiePlusConfigEntryRuntimeData:
             self.pending_contact_resets.clear()
             runtime_session = self.pixie_runtime.runtime_session
             if runtime_session is None:
+                if self.ble_runtime is not None:
+                    await self.ble_runtime.async_shutdown()
                 return
 
             await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
+            if self.ble_runtime is not None:
+                await self.ble_runtime.async_shutdown()
 
-    async def async_send_local_command(self, hass: HomeAssistant, **kwargs) -> None:
-        """Send a local command using the single shared 41578 runtime session.
+    async def async_send_command(self, hass: HomeAssistant, **kwargs) -> None:
+        """Send a command using the configured transport preference.
 
         Passes through all kwargs including timer-specific ones:
         - command_timer_action: "restart", "override", "set_duration", "poll"
         - command_timer_duration: int (seconds, 1-86400)
         """
+        transport = _entry_command_transport(self.entry)
+        if transport in (COMMAND_TRANSPORT_BT_PRIMARY, COMMAND_TRANSPORT_BT_ONLY):
+            try:
+                await self._async_send_ble_command(dict(kwargs), wait_for_ready=True)
+                return
+            except Exception as err:
+                if transport == COMMAND_TRANSPORT_BT_ONLY:
+                    raise
+                LOGGER.warning("Pixie BLE command failed; falling back to TCP: %s", err)
+
+        if transport in (COMMAND_TRANSPORT_TCP_PRIMARY, COMMAND_TRANSPORT_TCP_ONLY, COMMAND_TRANSPORT_BT_PRIMARY):
+            try:
+                await self._async_send_tcp_command(hass, **kwargs)
+                return
+            except Exception as err:
+                if transport == COMMAND_TRANSPORT_TCP_ONLY:
+                    raise
+                if transport == COMMAND_TRANSPORT_TCP_PRIMARY and self.ble_runtime is not None and self.ble_runtime.health.healthy:
+                    LOGGER.warning("Pixie TCP command failed; falling back to BLE: %s", err)
+                    await self._async_send_ble_command(dict(kwargs), wait_for_ready=False)
+                    return
+                raise
+
+        raise ConfigEntryError("No Pixie command transport is available")
+
+    async def async_send_local_command(self, hass: HomeAssistant, **kwargs) -> None:
+        """Compatibility wrapper for entity code; uses configured transport."""
+        await self.async_send_command(hass, **kwargs)
+
+    async def _async_send_tcp_command(self, hass: HomeAssistant, **kwargs) -> None:
+        """Send a local command using the single shared 41578 runtime session."""
         runtime_session = await self.async_ensure_runtime(hass, reason="command_send")
         try:
             await hass.async_add_executor_job(runtime_session.send_command, dict(kwargs))
@@ -840,9 +1085,44 @@ async def _async_build_runtime_data(
         pixie_runtime=pixie_runtime,
         coordinator=coordinator,
         entry=entry,
+        ble_runtime=PixieBluetoothRuntime(
+            hass=hass,
+            cloud_params=cloud_params,
+            inventory=pixie_runtime.inventory,
+            enabled=_entry_bt_enabled(entry),
+            command_builder=handler,
+            inventory_update_callback=None,
+            preferred_source=str(entry.data.get(CONF_BT_SOURCE) or "") or None,
+            preferred_access_node=str(entry.data.get(CONF_BT_ACCESS_NODE) or "") or None,
+            preferred_response_access_node=str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "") or None,
+        ),
     )
     coordinator.runtime_manager = runtime_data
+    if runtime_data.ble_runtime is not None:
+        runtime_data.ble_runtime.inventory_update_callback = runtime_data.push_inventory_update_from_loop
+        runtime_data.ble_runtime.access_node_update_callback = (
+            lambda source, access_node, response_capable: _async_remember_ble_access_node(
+                hass,
+                entry,
+                source=source,
+                access_node=access_node,
+                response_capable=response_capable,
+            )
+        )
     handler.set_inventory_update_callback(runtime_data.push_inventory_update_from_thread)
+    await runtime_data.async_ensure_ble_runtime()
+    if _entry_bt_enabled(entry):
+        ble_error = runtime_data.ble_runtime.health.last_error if runtime_data.ble_runtime else None
+        if runtime_data.is_ble_runtime_healthy():
+            _async_delete_bt_proxy_issue(hass, entry)
+        elif ble_error:
+            _async_create_bt_proxy_issue(hass, entry, error=ble_error)
+        else:
+            _async_delete_bt_proxy_issue(hass, entry)
+    elif str(entry.data.get(CONF_BT_STATE) or "") == BT_STATE_NO_WORKING_PROXY:
+        _async_create_bt_proxy_issue(hass, entry, error="No working ESPHome Bluetooth proxy was found.")
+    else:
+        _async_delete_bt_proxy_issue(hass, entry)
     return runtime_data
 
 

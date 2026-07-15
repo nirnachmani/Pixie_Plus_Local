@@ -15,11 +15,11 @@ import json
 import logging
 
 from .pixie_value_profiles import (
-    decode_color_runtime_hue,
-    decode_color_runtime_state,
+    decode_color_runtime_hue_for_capabilities,
+    decode_color_runtime_state_for_capabilities,
     decode_contact_runtime_state,
     decode_gate_state_byte,
-    decode_value_byte,
+    decode_value_byte_for_capabilities,
     get_model_capabilities,
     hardware_list,
 )
@@ -175,7 +175,9 @@ class RuntimeState:
     timer_total_seconds: Optional[int] = None
     timer_remaining_seconds: Optional[int] = None
     last_timer_poll_at: Optional[float] = None
+    last_timer_poll_requested_at: Optional[float] = None
     timer_needs_poll: bool = False
+    local_timer_restart_at: Optional[float] = None
     hold_time_seconds: Optional[int] = None
     brightness_threshold: Optional[int] = None
     motion_sensitivity: Optional[int] = None
@@ -214,6 +216,7 @@ class RuntimeState:
             "timer_total_seconds": self.timer_total_seconds,
             "timer_remaining_seconds": self.timer_remaining_seconds,
             "last_timer_poll_at": self.last_timer_poll_at,
+            "last_timer_poll_requested_at": self.last_timer_poll_requested_at,
             "timer_needs_poll": self.timer_needs_poll,
             "hold_time_seconds": self.hold_time_seconds,
             "brightness_threshold": self.brightness_threshold,
@@ -259,6 +262,7 @@ class RuntimeState:
             timer_total_seconds=_normalize_optional_int(data.get("timer_total_seconds")),
             timer_remaining_seconds=_normalize_optional_int(data.get("timer_remaining_seconds")),
             last_timer_poll_at=data.get("last_timer_poll_at"),
+            last_timer_poll_requested_at=data.get("last_timer_poll_requested_at"),
             timer_needs_poll=bool(data.get("timer_needs_poll", False)),
             hold_time_seconds=_normalize_optional_int(data.get("hold_time_seconds")),
             brightness_threshold=_normalize_optional_int(data.get("brightness_threshold")),
@@ -315,6 +319,7 @@ class DeviceStateStore:
         timer_total_seconds: Any = STATE_UNSET,
         timer_remaining_seconds: Any = STATE_UNSET,
         last_timer_poll_at: Any = STATE_UNSET,
+        last_timer_poll_requested_at: Any = STATE_UNSET,
         timer_needs_poll: Any = STATE_UNSET,
         hold_time_seconds: Any = STATE_UNSET,
         brightness_threshold: Any = STATE_UNSET,
@@ -378,6 +383,8 @@ class DeviceStateStore:
             runtime.timer_remaining_seconds = _normalize_optional_int(timer_remaining_seconds)
         if last_timer_poll_at is not STATE_UNSET:
             runtime.last_timer_poll_at = last_timer_poll_at
+        if last_timer_poll_requested_at is not STATE_UNSET:
+            runtime.last_timer_poll_requested_at = last_timer_poll_requested_at
         if timer_needs_poll is not STATE_UNSET:
             runtime.timer_needs_poll = bool(timer_needs_poll)
         if hold_time_seconds is not STATE_UNSET:
@@ -480,7 +487,7 @@ class DeviceStateStore:
                 if inv_rec.capabilities.supports_sensor:
                     raw_value = br_obj.get("raw")
                     if isinstance(raw_value, int):
-                        interpreted = decode_value_byte(inv_rec.model_no, raw_value)
+                        interpreted = decode_value_byte_for_capabilities(inv_rec.capabilities, raw_value)
                         if interpreted.get("mode") == "sensor_controller":
                             mode_value = interpreted.get("mode_value")
                             relay_on = interpreted.get("relay_on")
@@ -505,7 +512,7 @@ class DeviceStateStore:
                             prev_armed = current_runtime.armed
                             prev_source = current_runtime.last_source
                         decoded_contact = decode_contact_runtime_state(
-                            inv_rec.model_no,
+                            inv_rec.capabilities,
                             raw_value,
                             rssi_raw,
                             prev_armed=prev_armed,
@@ -553,7 +560,7 @@ class DeviceStateStore:
                 elif inv_rec.capabilities.supports_color_temp:
                     raw_value = _normalize_optional_int(br_obj.get("raw"))
                     if isinstance(raw_value, int):
-                        interpreted = decode_value_byte(inv_rec.model_no, raw_value)
+                        interpreted = decode_value_byte_for_capabilities(inv_rec.capabilities, raw_value)
                         brightness = interpreted.get("brightness_0_100")
                         if isinstance(brightness, int):
                             update_br = brightness
@@ -564,7 +571,11 @@ class DeviceStateStore:
                     raw_value = _normalize_optional_int(br_obj.get("raw"))
                     rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
                     if isinstance(raw_value, int) and isinstance(rssi_raw, int):
-                        decoded_color = decode_color_runtime_state(inv_rec.model_no, raw_value, rssi_raw)
+                        decoded_color = decode_color_runtime_state_for_capabilities(
+                            inv_rec.capabilities,
+                            raw_value,
+                            rssi_raw,
+                        )
                         brightness = decoded_color.get("brightness_0_100")
                         if isinstance(brightness, int):
                             update_br = brightness
@@ -588,7 +599,7 @@ class DeviceStateStore:
                     else:
                         update_r = 0
 
-                    if inv_rec.model_no == "0107":
+                    if inv_rec.capabilities.supports_usb_subentity:
                         update_br = 100 if bool(update_r & 0x01) else 0
 
             runtime = self.apply_device_update(
@@ -646,12 +657,14 @@ class DeviceCapabilities:
     - supports_effects  : model supports named effect commands/state
     - supports_multi_channel : device record has both 'left_name' and
                           'right_name' fields (only dual-output devices do)
-    - supports_cover    : device type == 11
-    - supports_usb_subentity : model 0107 (type=1, stype=7) only
+    - supports_cover    : expose as a cover/gate-style controller
+    - supports_usb_subentity : expose a separate USB endpoint
     """
 
+    is_gateway: bool = False
     is_light: bool = False
     is_switch: bool = False
+    switch_type: str = ""
     supports_onoff: bool = True
     supports_dimming: bool = False
     supports_color: bool = False
@@ -667,8 +680,10 @@ class DeviceCapabilities:
     supports_multi_channel: bool = False
     supports_usb_subentity: bool = False
     supports_cover: bool = False
+    cover_type: str = ""
     supports_sensor: bool = False
     supports_contact_sensor: bool = False
+    contact_sensor_type: str = ""
     supports_motion_sensor: bool = False
     supports_photocell_sensor: bool = False
     supports_timer: bool = False
@@ -684,8 +699,10 @@ class DeviceCapabilities:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "is_gateway": self.is_gateway,
             "is_light": self.is_light,
             "is_switch": self.is_switch,
+            "switch_type": self.switch_type,
             "supports_onoff": self.supports_onoff,
             "supports_dimming": self.supports_dimming,
             "supports_color": self.supports_color,
@@ -701,8 +718,10 @@ class DeviceCapabilities:
             "supports_multi_channel": self.supports_multi_channel,
             "supports_usb_subentity": self.supports_usb_subentity,
             "supports_cover": self.supports_cover,
+            "cover_type": self.cover_type,
             "supports_sensor": self.supports_sensor,
             "supports_contact_sensor": self.supports_contact_sensor,
+            "contact_sensor_type": self.contact_sensor_type,
             "supports_motion_sensor": self.supports_motion_sensor,
             "supports_photocell_sensor": self.supports_photocell_sensor,
             "supports_timer": self.supports_timer,
@@ -720,8 +739,10 @@ class DeviceCapabilities:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DeviceCapabilities":
         return cls(
+            is_gateway=bool(data.get("is_gateway", False)),
             is_light=bool(data.get("is_light", False)),
             is_switch=bool(data.get("is_switch", False)),
+            switch_type=str(data.get("switch_type", "")),
             supports_onoff=bool(data.get("supports_onoff", True)),
             supports_dimming=bool(data.get("supports_dimming", False)),
             supports_color=bool(data.get("supports_color", False)),
@@ -737,8 +758,10 @@ class DeviceCapabilities:
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
             supports_cover=bool(data.get("supports_cover", False)),
+            cover_type=str(data.get("cover_type", "")),
             supports_sensor=bool(data.get("supports_sensor", data.get("supports_mode", False))),
             supports_contact_sensor=bool(data.get("supports_contact_sensor", False)),
+            contact_sensor_type=str(data.get("contact_sensor_type", "")),
             supports_motion_sensor=bool(data.get("supports_motion_sensor", False)),
             supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
             supports_timer=bool(data.get("supports_timer", False)),
@@ -796,8 +819,16 @@ class DeviceRecord:
     def from_dict(cls, data: Dict[str, Any]) -> "DeviceRecord":
         model_no = str(data.get("model_no") or "")
         capabilities = DeviceCapabilities.from_dict(dict(data.get("capabilities") or {}))
+        model_caps = get_model_capabilities(model_no)
+        if not capabilities.is_gateway:
+            capabilities.is_gateway = bool(model_caps.get("is_gateway", False))
+        if capabilities.is_switch and not capabilities.switch_type:
+            capabilities.switch_type = str(model_caps.get("switch_type", "switch"))
+        if capabilities.supports_contact_sensor and not capabilities.contact_sensor_type:
+            capabilities.contact_sensor_type = str(model_caps.get("contact_sensor_type", "standard_contact"))
+        if capabilities.supports_cover and not capabilities.cover_type:
+            capabilities.cover_type = str(model_caps.get("cover_type", ""))
         if capabilities.supports_effects and not capabilities.effect_command_encoding:
-            model_caps = get_model_capabilities(model_no)
             capabilities.effect_command_encoding = str(model_caps.get("effect_command_encoding", ""))
             if not capabilities.effect_names:
                 capabilities.effect_names = list(model_caps.get("effect_names") or [])
@@ -845,8 +876,10 @@ class PixieInventory:
         cap = DeviceCapabilities()
         model_caps = get_model_capabilities(model_no)
 
+        cap.is_gateway = model_caps["is_gateway"]
         cap.is_light = model_caps["is_light"]
         cap.is_switch = model_caps["is_switch"]
+        cap.switch_type = model_caps["switch_type"]
         cap.supports_onoff = model_caps["supports_onoff"]
         cap.supports_dimming = model_caps["supports_dimming"]
         cap.supports_color = model_caps["supports_color"]
@@ -862,8 +895,10 @@ class PixieInventory:
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
         cap.supports_cover = model_caps["supports_cover"]
+        cap.cover_type = model_caps["cover_type"]
         cap.supports_sensor = model_caps["supports_sensor"]
         cap.supports_contact_sensor = model_caps["supports_contact_sensor"]
+        cap.contact_sensor_type = model_caps["contact_sensor_type"]
         cap.supports_motion_sensor = model_caps["supports_motion_sensor"]
         cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
         cap.supports_timer = model_caps["supports_timer"]
@@ -885,7 +920,8 @@ class PixieInventory:
     def _extract_gateway_identity(cls, devices: List[Dict[str, Any]]) -> Optional[GatewayIdentity]:
         for device_obj in devices:
             model_no = cls._model_no(device_obj)
-            if model_no != "0102":
+            model_caps = get_model_capabilities(model_no)
+            if not model_caps["is_gateway"]:
                 continue
 
             gateway_mac = str(device_obj.get("mac") or "")
@@ -959,7 +995,7 @@ class PixieInventory:
                 if normalized_sensor is not None:
                     runtime_state.contact_active = normalized_sensor == 0
             if rec.capabilities.color_runtime_encoding:
-                online_hue_state = decode_color_runtime_hue(rec.model_no, online.get("hue"))
+                online_hue_state = decode_color_runtime_hue_for_capabilities(rec.capabilities, online.get("hue"))
                 if isinstance(online_hue_state.get("rgb"), list):
                     runtime_state.rgb = [int(channel) for channel in online_hue_state["rgb"]]
                 if "effect" in online_hue_state:

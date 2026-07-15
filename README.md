@@ -2,13 +2,13 @@
 
 Pixie Plus Local is a Home Assistant custom integration for SAL Pixie Plus devices.
 
-Unlike the older Pixie Plus integration, this one controls the gateway locally over your LAN instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata required for local access, but after that the integration runs against the gateway directly. I attempted to implement Bluetooth support as well but Pixie Plus devices are not compatible with Home Assistant Bluetooth (Pixie devices ignore CCCD write which is required for a successful handshake.) As such, the integration still requires a Pixie Gateway to work. 
+Unlike the older Pixie Plus integration, this one controls the gateway locally over your LAN and/or using Bluetooth instead of using the cloud. It still uses your Pixie account once during setup to retrieve the metadata required for local access, but after that the integration runs against the gateway or other Pixie device directly.  
 
 ## Features
 
 - Automatic gateway discovery with manual IP option (e.g. if gateway is on another subnet) 
-- Local control through the Pixie Plus gateway
-- Local push-style state updates from the live gateway session
+- Local control through the Pixie Plus gateway and/or Bluetooth
+- Local push-style state updates from the live gateway session and Bluetooth
 - Lights, dimmers, switches, smart plugs, RGB strip control, blinds, timer, sensors and gate control
 - Blind button mapping is now done through the UI
 
@@ -16,11 +16,9 @@ The integration intentionally does not implement Pixie Plus groups, scenes, sche
 
 ## Requirements
 
-- A Pixie Plus gateway on the same local network as Home Assistant
+- A Pixie Plus gateway (automatic gateway discovery will only work if the gateway is on the same local network as Home Assistant. If not, the gateway's IP address needs to be provided manually during setup. The gateway's mode and IP address can be updated through reconfiguring the integration: click on the integration -> ⋮ -> Reconfigure -> Gateway connections settings)
 - All devices already paired and configured in the official Pixie Plus app
 - A working Pixie account for the initial setup step
-
-This integration is for gateway-based Pixie Plus systems. It does not expose direct Bluetooth-only control.
 
 ## Supported Devices
 
@@ -73,12 +71,19 @@ config/custom_components/pixie_plus_local/
 4. Search for `Pixie Plus Local` and complete the setup flow.
 5. Enter your Pixie Plus username and password when prompted.
 
-
 ## Notes on migration from the old integration
 
 Delete the old integration before installing the current one (theoretically they can both work at the same time but HA will create a second entity for all devices.)
 
 Entity ID should remain the same as with the old integration but check that this is the case, especially for devices with multiple entities. 
+
+## Bluetooth functionality
+
+- Bluetooth (BT) functionality requires an ESPHome bluetooth proxy. See [here](https://esphome.io/components/bluetooth_proxy/). ***It will not work without one***.
+- The integration will connect to one Pixie device via BT and will use the BLE mesh to send commands and get updates. Because some updates are only available from the gateway (e.g. timer duration left) the integration will attempt to connect to the gateway if possible.
+- Once enabled, the user can select if commands will be sent via TCP or BT through the integration's configuration (cogwheel icon) -> Command transport. There are 4 options: TCP primary, BT fallback; BT Primary, TCP fallback: TCP only; BT only. Because the ESPHome bluetooth proxy requires LAN access, BT modes still depend on the LAN. Updates from devices will arrive from both TCP and BT, and will race.
+- BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via reconfigure (under ⋮ after clicking on the integration ) -> Bluetooth support.
+- The added benefit of BT is currently minimal, but I am hoping to add the ability to add and remove devices straight from HA, which requires BT 
 
 ## Blind Configuration
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -18,10 +19,10 @@ from . import (
     physical_device_identifier,
 )
 from .pixie_value_profiles import (
-    get_sensor_select_options,
-    get_timer_select_options,
-    sensor_mode_value_to_option,
-    sensor_option_to_mode_value,
+    get_sensor_select_options_for_capabilities,
+    get_timer_select_options_for_capabilities,
+    sensor_mode_value_to_option_for_capabilities,
+    sensor_option_to_mode_value_for_capabilities,
     timer_mode_value_to_option,
     timer_option_to_mode_value,
 )
@@ -135,12 +136,14 @@ async def async_setup_entry(
 class PixiePlusModeSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
     """Representation of a Pixie Plus mode select entity (sensor or timer)."""
 
+    _attr_entity_category = EntityCategory.CONFIG
+
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
         if self.record.capabilities.supports_timer:
-            self._attr_options = get_timer_select_options(self.record.model_no)
+            self._attr_options = get_timer_select_options_for_capabilities(self.record.capabilities)
         else:
-            self._attr_options = get_sensor_select_options(self.record.model_no)
+            self._attr_options = get_sensor_select_options_for_capabilities(self.record.capabilities)
 
     @property
     def current_option(self) -> str | None:
@@ -148,7 +151,7 @@ class PixiePlusModeSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
         if isinstance(runtime.mode, int):
             if self.record.capabilities.supports_timer:
                 return timer_mode_value_to_option(runtime.mode)
-            return sensor_mode_value_to_option(self.record.model_no, runtime.mode)
+            return sensor_mode_value_to_option_for_capabilities(self.record.capabilities, runtime.mode)
         return None
 
     async def async_select_option(self, option: str) -> None:
@@ -169,7 +172,7 @@ class PixiePlusModeSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
             except Exception as err:
                 raise HomeAssistantError(str(err)) from err
         else:
-            mode_value = sensor_option_to_mode_value(self.record.model_no, option)
+            mode_value = sensor_option_to_mode_value_for_capabilities(self.record.capabilities, option)
             if mode_value is None:
                 raise HomeAssistantError(f"Unsupported mode option: {option}")
             try:
@@ -184,6 +187,8 @@ class PixiePlusModeSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
 
 class PixiePlusSensorParamSelectEntity(PixiePlusCoordinatorEntity, SelectEntity):
     """Select entity for sensor parameters (brightness threshold, sensitivity)."""
+
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)

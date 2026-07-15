@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -87,6 +88,7 @@ async def async_setup_entry(
 class PixiePlusTimerDurationNumberEntity(PixiePlusCoordinatorEntity, NumberEntity):
     """Number input for setting the timer countdown duration (seconds)."""
 
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_native_min_value = 1
     _attr_native_max_value = 86400
     _attr_native_step = 1
@@ -121,6 +123,7 @@ class PixiePlusTimerDurationNumberEntity(PixiePlusCoordinatorEntity, NumberEntit
 class PixiePlusHoldTimeNumberEntity(PixiePlusCoordinatorEntity, NumberEntity):
     """Number input for the sensor hold time (0–1799 seconds)."""
 
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_native_min_value = 0
     _attr_native_max_value = 1799
     _attr_native_step = 1
