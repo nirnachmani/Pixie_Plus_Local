@@ -19,13 +19,6 @@ from . import (
     physical_device_identifier,
 )
 
-SWITCH_DEVICE_CLASSES = {
-    "0107": "outlet",
-    "0208": "outlet",
-    "1002": "switch",
-}
-
-
 def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
     """Return switch endpoints from inventory."""
     gateway_identifier = gateway_device_identifier(inventory)
@@ -131,7 +124,7 @@ class PixiePlusSwitchEntity(PixiePlusCoordinatorEntity, SwitchEntity):
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
-        device_class = SWITCH_DEVICE_CLASSES.get(self.record.model_no, "switch")
+        device_class = self.record.capabilities.switch_type or "switch"
         self._attr_device_class = (
             SwitchDeviceClass.OUTLET if device_class == "outlet" else SwitchDeviceClass.SWITCH
         )

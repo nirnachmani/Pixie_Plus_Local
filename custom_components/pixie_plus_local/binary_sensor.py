@@ -80,7 +80,7 @@ class PixiePlusBinarySensorEntity(PixiePlusCoordinatorEntity, BinarySensorEntity
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
-        if self.record.model_no == "3010":
+        if self.record.capabilities.contact_sensor_type == "inverted_door":
             self._attr_device_class = BinarySensorDeviceClass.DOOR
 
     @property
@@ -99,7 +99,7 @@ class PixiePlusBinarySensorEntity(PixiePlusCoordinatorEntity, BinarySensorEntity
     def is_on(self) -> bool | None:
         runtime = self.record.runtime
         if self.record.capabilities.supports_contact_sensor:
-            if self.record.model_no == "3010":
+            if self.record.capabilities.contact_sensor_type == "inverted_door":
                 if runtime.contact_active is None:
                     return None
                 return not runtime.contact_active

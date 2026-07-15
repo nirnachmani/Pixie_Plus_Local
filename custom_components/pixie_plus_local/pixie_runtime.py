@@ -35,6 +35,8 @@ RUNTIME_COMMAND_BASE_TIMEOUT_SECONDS = 10.0
 RUNTIME_COMMAND_PER_AHEAD_SECONDS = 2.0
 RUNTIME_COMMAND_MAX_TIMEOUT_SECONDS = 60.0
 RUNTIME_COMMAND_MIN_GAP_SECONDS = 0.25
+LOCAL_TIMER_RESTART_GUARD_SECONDS = 4.0
+TIMER_STATUS_CORRECTION_DEADBAND_SECONDS = 1.0
 from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -43,18 +45,16 @@ from .pixie_protocol import PixieEnvelope, PixieMessage, PixieCrypto
 from .pixie_inventory import GatewayIdentity, PixieInventory
 from .pixie_value_profiles import (
     EFFECT_COMMAND_ENCODINGS,
-    decode_color_runtime_state,
+    decode_color_runtime_state_for_capabilities,
     decode_contact_runtime_state,
     build_gate_motion_plan,
     build_gate_motion_plan_from_learned_duration,
     decode_gate_command_reply,
     decode_gate_state_byte,
-    decode_value_byte,
+    decode_value_byte_for_capabilities,
     sync_gate_motion_plan,
     gate_can_run_action,
-    get_all_effect_names,
-    get_model_effect_names,
-    get_supported_sensor_mode_values,
+    get_supported_sensor_mode_values_for_capabilities,
     resolve_cover_command_position,
 )
 
@@ -85,6 +85,10 @@ class PixieAuthError(Exception):
     pass
 
 
+class PixieInvalidCredentialsError(PixieAuthError):
+    """Pixie cloud rejected the supplied username/password."""
+
+
 class PixieGatewayResolutionError(PixieAuthError):
     """Gateway discovery could not resolve a single usable host."""
 
@@ -103,6 +107,42 @@ class CloudParams:
     meshnet: str
     meshnet2: str
     netid: str
+
+
+@dataclass(frozen=True)
+class PixieOptimisticUpdateIntent:
+    """Transport-neutral HA runtime prediction for one user command."""
+
+    device_id: int
+    target: str
+    value: Any = None
+    brightness_level: Optional[int] = None
+    rgb_color: Optional[Tuple[int, int, int]] = None
+    effect_name: Optional[str] = None
+    effect_speed: Optional[int] = None
+    cover_button_position: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PixieCoreCommandPacket:
+    """One core Pixie command packet before TCP/BLE transport wrapping."""
+
+    command_hex: str
+    tcp_repeat: int = 0
+    delay_after: float = 0.0
+    log_message: Optional[str] = None
+    log_args: Tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class PixieCoreCommandPlan:
+    """Transport-neutral core command sequence for one HA command."""
+
+    device_id: int
+    target: str
+    packets: Tuple[PixieCoreCommandPacket, ...]
+    optimistic_intent: Optional[PixieOptimisticUpdateIntent] = None
+    result: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -652,6 +692,698 @@ class PixieAuthHandler:
         applied = self.inventory.apply_gwdata_bulk(records, source, full_snapshot=full_snapshot)
         if applied > 0:
             self._notify_inventory_updated()
+        return applied
+
+    def decode_bledata_hex(self, hex_payload: str) -> Optional[Dict[str, Any]]:
+        """Decode a Pixie core bleData hex payload into normalized records."""
+        if not isinstance(hex_payload, str):
+            return None
+
+        clean = hex_payload.strip().lower()
+        if not clean or len(clean) % 2 != 0:
+            return None
+
+        try:
+            raw = bytes.fromhex(clean)
+        except Exception:
+            return None
+
+        decoded: Dict[str, Any] = {
+            "hex": clean,
+            "length": len(raw),
+            "bytes": [int(b) for b in raw],
+        }
+
+        if len(raw) >= 18 and (len(raw) - 6) % 4 == 0:
+            records: List[Dict[str, Any]] = []
+            for i in range(6, len(raw) - 3, 4):
+                dev_id = int(raw[i])
+                online = int(raw[i + 1])
+                br_raw = int(raw[i + 2])
+                rssi_raw = int(raw[i + 3])
+                if dev_id in (0, 255):
+                    continue
+                records.append({
+                    "id": dev_id,
+                    "online": online,
+                    "br_raw": br_raw,
+                    "br": self._decode_bulk_br(br_raw),
+                    "rssi_raw": rssi_raw,
+                })
+
+            if len(records) >= 2:
+                decoded["kind"] = "bulk"
+                decoded["records"] = records
+                return decoded
+
+        mode_command = self._decode_sensor_mode_command(raw)
+        if mode_command is not None:
+            decoded["kind"] = "single"
+            decoded["opcode"] = "c16969"
+            decoded["device_id"] = mode_command["device_id"]
+            decoded["mode"] = mode_command["mode"]
+            decoded["relay"] = mode_command["relay"]
+            decoded["records"] = [{
+                "id": decoded["device_id"],
+                "online": None,
+                "br_raw": None,
+                "br": {"type": "single", "raw": None, "pct": 100 if decoded["relay"] else 0},
+                "mode": decoded["mode"],
+                "relay": decoded["relay"],
+                "rgb": None,
+                "value_byte": None,
+                "tail_flag": None,
+                "is_on_from_tail": None,
+                "online_value": None,
+            }]
+            return decoded
+
+        if len(raw) >= 14 and raw[7] == 0xC1 and raw[8] == 0x69 and raw[9] == 0x69:
+            decoded["kind"] = "single"
+            decoded["opcode"] = "c16969"
+            decoded["device_id"] = int(raw[5])
+            decoded["rgb"] = [int(raw[10]), int(raw[11]), int(raw[12])]
+            brightness_raw = int(raw[13])
+            decoded["brightness_raw"] = brightness_raw
+            decoded["brightness_0_100"] = max(0, min(100, round((brightness_raw * 100) / 256)))
+            decoded["records"] = [{
+                "id": decoded["device_id"],
+                "online": None,
+                "br_raw": brightness_raw,
+                "br": {"type": "single", "raw": brightness_raw, "pct": decoded["brightness_0_100"]},
+                "rgb": list(decoded["rgb"]),
+                "value_byte": None,
+                "tail_flag": None,
+                "is_on_from_tail": None,
+                "online_value": None,
+            }]
+            return decoded
+
+        d3_pos = raw.find(b"\xd3\x69\x69")
+        if d3_pos >= 0 and len(raw) >= d3_pos + 10:
+            flag_byte = raw[d3_pos + 3]
+            dev_id = int.from_bytes(raw[3:5], byteorder="little")
+            data_start = d3_pos + 4
+            if flag_byte != 0xb9:
+                return None
+
+            rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
+            if rec and rec.capabilities.supports_timer:
+                decoded["kind"] = "timer_status"
+                decoded["device_id"] = dev_id
+                try:
+                    decoded["timer_total_seconds"] = int.from_bytes(raw[data_start + 1 : data_start + 5], byteorder="little")
+                    decoded["timer_remaining_seconds"] = int.from_bytes(raw[data_start + 5 : data_start + 9], byteorder="little")
+                except Exception:
+                    decoded["timer_total_seconds"] = None
+                    decoded["timer_remaining_seconds"] = None
+                decoded["records"] = [{
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "timer_total_seconds": decoded["timer_total_seconds"],
+                    "timer_remaining_seconds": decoded["timer_remaining_seconds"],
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                }]
+                return decoded
+            if rec and rec.capabilities.supports_sensor:
+                decoded["kind"] = "sensor_params"
+                decoded["device_id"] = dev_id
+                try:
+                    decoded["brightness_threshold"] = int(raw[data_start + 2])
+                    decoded["hold_time_seconds"] = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
+                    decoded["motion_sensitivity"] = int(raw[data_start + 6])
+                except Exception:
+                    decoded["brightness_threshold"] = None
+                    decoded["hold_time_seconds"] = None
+                    decoded["motion_sensitivity"] = None
+                decoded["records"] = [{
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "hold_time_seconds": decoded.get("hold_time_seconds"),
+                    "brightness_threshold": decoded.get("brightness_threshold"),
+                    "motion_sensitivity": decoded.get("motion_sensitivity"),
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                }]
+                return decoded
+            if rec and rec.capabilities.supports_gate:
+                decoded["kind"] = "gate_status"
+                decoded["device_id"] = dev_id
+                try:
+                    door_index = int(raw[data_start + 1])
+                    state_byte = int(raw[data_start + 3])
+                    position_raw = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
+                    runtime_ms = int.from_bytes(raw[data_start + 6 : data_start + 9], byteorder="little")
+                    decoded_state = decode_gate_command_reply(door_index, state_byte, position_raw, runtime_ms)
+                except Exception:
+                    door_index = None
+                    state_byte = None
+                    position_raw = None
+                    runtime_ms = None
+                    decoded_state = None
+                decoded["records"] = [{
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "gate_door": door_index,
+                    "door_state": state_byte,
+                    "door_decoded": decoded_state,
+                    "position_raw": position_raw,
+                    "runtime_ms": runtime_ms,
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                }]
+                return decoded
+            decoded["kind"] = "d36969"
+            decoded["device_id"] = dev_id
+            decoded["flag"] = flag_byte
+            decoded["data_hex"] = raw[data_start:].hex()
+            return decoded
+
+        if len(raw) >= 14 and raw[7:10] == b"\xdc\x11\x02":
+            dc_records: List[Dict[str, Any]] = []
+            mesh_status_records: List[Dict[str, Any]] = []
+            for offset in range(10, len(raw) - 3, 4):
+                chunk = raw[offset : offset + 4]
+                dev_id = int(chunk[0])
+                if dev_id == 0:
+                    continue
+                if dev_id == 0xFF:
+                    mesh_status_records.append({
+                        "offset": offset,
+                        "pseudo_id": "0xff",
+                        "online_value": int(chunk[1]),
+                        "value_byte": int(chunk[2]),
+                        "tail_flag": int(chunk[3]),
+                    })
+                    continue
+                value_byte = int(chunk[2])
+                dc_records.append({
+                    "id": dev_id,
+                    "online": int(chunk[1]),
+                    "br_raw": value_byte,
+                    "br": self._decode_bulk_br(value_byte),
+                    "rgb": None,
+                    "value_byte": value_byte,
+                    "tail_flag": int(chunk[3]),
+                    "is_on_from_tail": bool(chunk[3] & 0x10),
+                    "online_value": int(chunk[1]),
+                })
+
+            if mesh_status_records:
+                decoded["mesh_status_records"] = mesh_status_records
+                if not dc_records:
+                    decoded["kind"] = "mesh_status"
+                    return decoded
+                decoded["kind"] = "single" if len(dc_records) == 1 else "bulk"
+                decoded["records"] = dc_records
+                return decoded
+
+        if len(raw) >= 11:
+            decoded["device_id"] = int(raw[10])
+        if len(raw) >= 12:
+            decoded["online_value"] = int(raw[11])
+        if len(raw) >= 13:
+            decoded["value_byte"] = int(raw[12])
+            decoded["level"] = decoded["value_byte"]
+        if len(raw) >= 14:
+            tail = int(raw[13])
+            decoded["tail_flag"] = tail
+            decoded["is_on_from_tail"] = bool(tail & 0x10)
+
+        if isinstance(decoded.get("device_id"), int):
+            value_byte = decoded.get("value_byte")
+            if isinstance(value_byte, int):
+                record_br = self._decode_bulk_br(value_byte)
+            else:
+                record_br = {"type": "single", "raw": None, "pct": None}
+            decoded["kind"] = "single"
+            decoded["records"] = [{
+                "id": decoded["device_id"],
+                "online": decoded.get("online_value") if isinstance(decoded.get("online_value"), int) else None,
+                "br_raw": value_byte if isinstance(value_byte, int) else None,
+                "br": record_br,
+                "rgb": decoded.get("rgb") if isinstance(decoded.get("rgb"), list) else None,
+                "value_byte": value_byte,
+                "tail_flag": decoded.get("tail_flag"),
+                "is_on_from_tail": decoded.get("is_on_from_tail"),
+                "online_value": decoded.get("online_value"),
+            }]
+
+        return decoded
+
+    def apply_bledata_hex(
+        self,
+        ble_hex: str,
+        *,
+        payload_meta: Optional[Dict[str, Any]] = None,
+        source: str = "hub_update",
+        bulk_source: str = "hub_gwdata",
+        full_snapshot: bool = False,
+        queue_bulk: bool = False,
+    ) -> int:
+        """Decode and apply one core Pixie bleData payload to inventory."""
+        decoded = self.decode_bledata_hex(ble_hex)
+        if not decoded:
+            self._log_debug("BLE decode: unable to parse data field")
+            return 0
+
+        kind = decoded.get("kind")
+        self._log_debug("BLE apply: kind=%s hex_preview=%s", kind, ble_hex[:40] if ble_hex else "none")
+        records = decoded.get("records") if isinstance(decoded.get("records"), list) else []
+
+        if kind == "bulk":
+            self._log_debug("BLE decode (bulk): records=%s", len(records))
+            if queue_bulk:
+                self._queue_bulk_ble_records(records, source=bulk_source, full_snapshot=full_snapshot)
+            if self.inventory:
+                applied = self._apply_bulk_ble_records_to_inventory(records, source=bulk_source, full_snapshot=full_snapshot)
+                self._log_debug("Inventory bulk update: applied=%s", applied)
+                return applied
+            return 0
+
+        if kind == "mesh_status":
+            self._log_debug("BLE mesh-status record(s): %s", decoded.get("mesh_status_records") or [])
+            return 0
+
+        payload_meta = payload_meta or {}
+        if kind == "timer_status":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            timer_total = first.get("timer_total_seconds")
+            timer_remaining = first.get("timer_remaining_seconds")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                rec = self.inventory.devices_by_id[dev_id]
+                now = time.time()
+                current_total = rec.runtime.timer_total_seconds
+                current_remaining = rec.runtime.timer_remaining_seconds
+                last_poll_at = rec.runtime.last_timer_poll_at
+                if (
+                    isinstance(timer_remaining, int)
+                    and isinstance(current_remaining, int)
+                    and isinstance(last_poll_at, (int, float))
+                    and timer_total == current_total
+                ):
+                    estimated_remaining = max(0.0, float(current_remaining) - (now - float(last_poll_at)))
+                    correction = abs(float(timer_remaining) - estimated_remaining)
+                    near_zero = timer_remaining <= 1 or estimated_remaining <= 1.0
+                    if not near_zero and correction < TIMER_STATUS_CORRECTION_DEADBAND_SECONDS:
+                        self._log_debug(
+                            "Timer status update ignored within deadband: dev_id=%s total=%s remaining=%s estimated=%.2f correction=%.2f",
+                            dev_id,
+                            timer_total,
+                            timer_remaining,
+                            estimated_remaining,
+                            correction,
+                        )
+                        return 0
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    timer_total_seconds=timer_total,
+                    timer_remaining_seconds=timer_remaining,
+                    last_timer_poll_at=now,
+                )
+                self._log_debug("Timer status update: dev_id=%s total=%s remaining=%s", dev_id, timer_total, timer_remaining)
+                self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "sensor_params":
+            if not self.inventory:
+                return 0
+            dev_id = decoded.get("device_id")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    hold_time_seconds=decoded.get("hold_time_seconds"),
+                    brightness_threshold=decoded.get("brightness_threshold"),
+                    motion_sensitivity=decoded.get("motion_sensitivity"),
+                )
+                self._log_debug(
+                    "Sensor params update: dev_id=%s hold=%s bright=%s sens=%s",
+                    dev_id,
+                    decoded.get("hold_time_seconds"),
+                    decoded.get("brightness_threshold"),
+                    decoded.get("motion_sensitivity"),
+                )
+                self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "gate_status":
+            if not self.inventory or not records:
+                return 0
+            first = records[0]
+            dev_id = first.get("id")
+            door_index = first.get("gate_door")
+            door_state = first.get("door_state")
+            door_decoded = first.get("door_decoded")
+            if not isinstance(dev_id, int) or not isinstance(door_index, int) or not isinstance(door_state, int):
+                return 0
+
+            rec = self.inventory.devices_by_id.get(dev_id)
+            if rec is None:
+                return 0
+
+            previous = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
+            previous_motion_plan = rec.runtime.door1_motion_plan if door_index == 0 else rec.runtime.door2_motion_plan
+            updated_ms = int(time.time() * 1000)
+            if not isinstance(door_decoded, dict) or not door_decoded.get("known"):
+                self._log_debug(
+                    "Gate unknown d36969 byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
+                    dev_id,
+                    door_index + 1,
+                    door_state,
+                    previous.get("state") if isinstance(previous, dict) else None,
+                    previous.get("position_percent") if isinstance(previous, dict) else None,
+                    previous.get("value_byte") if isinstance(previous, dict) else None,
+                )
+
+            update_kwargs: Dict[str, Any] = {
+                "online": 1,
+                "presence": "online",
+                "raw": {
+                    "hub_type": payload_meta.get("type"),
+                    "hub_data": ble_hex,
+                    "hub_utc": payload_meta.get("UTC"),
+                    "ble_decoded": decoded,
+                    "ble_interpreted": door_decoded,
+                },
+            }
+            if door_index == 0:
+                update_kwargs["door1_state"] = door_state
+                if isinstance(door_decoded, dict) and door_decoded.get("known"):
+                    update_kwargs["door1_decoded"] = door_decoded
+                    update_kwargs["door1_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
+                    if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
+                        update_kwargs["door1_open_duration_ms"] = door_decoded.get("runtime_ms")
+                    elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
+                        update_kwargs["door1_close_duration_ms"] = door_decoded.get("runtime_ms")
+            elif door_index == 1:
+                update_kwargs["door2_state"] = door_state
+                if isinstance(door_decoded, dict) and door_decoded.get("known"):
+                    update_kwargs["door2_decoded"] = door_decoded
+                    update_kwargs["door2_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
+                    if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
+                        update_kwargs["door2_open_duration_ms"] = door_decoded.get("runtime_ms")
+                    elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
+                        update_kwargs["door2_close_duration_ms"] = door_decoded.get("runtime_ms")
+
+            if isinstance(door_decoded, dict) and not door_decoded.get("known"):
+                if door_index == 0:
+                    update_kwargs["door1_motion_plan"] = previous_motion_plan
+                else:
+                    update_kwargs["door2_motion_plan"] = previous_motion_plan
+
+            self.inventory.apply_device_update(
+                dev_id,
+                source=source,
+                updated_ms=updated_ms,
+                **update_kwargs,
+            )
+            self._notify_inventory_updated()
+            return 1
+
+        if kind == "d36969":
+            self._log_debug(
+                "BLE d36969 unhandled: dev_id=%s flag=0x%02x data=%s",
+                decoded.get("device_id"),
+                decoded.get("flag") if isinstance(decoded.get("flag"), int) else 0,
+                decoded.get("data_hex"),
+            )
+            return 0
+
+        if not records or not self.inventory:
+            return 0
+
+        applied = 0
+        for first in records:
+            dev_id = first.get("id")
+            if not isinstance(dev_id, int):
+                continue
+            rec = self.inventory.devices_by_id.get(dev_id)
+            if not rec:
+                self._log_debug("Inventory: unknown dev_id=%s (not in inventory)", dev_id)
+                continue
+
+            value_byte = first.get("value_byte")
+            tail = first.get("tail_flag")
+            on_tail = first.get("is_on_from_tail")
+            if rec.capabilities.supports_timer:
+                self._log_debug(
+                    "TIMER bleData: dev_id=%s model=%s value=0x%02x tail=0x%02x",
+                    dev_id,
+                    rec.model_no,
+                    value_byte if isinstance(value_byte, int) else 0,
+                    tail if isinstance(tail, int) else 0,
+                )
+            self._log_debug(
+                "BLE decode: dev_id=%s online_value=%s value=0x%02x tail=0x%02x on_tail=%s",
+                dev_id,
+                first.get("online_value"),
+                value_byte if isinstance(value_byte, int) else 0,
+                tail if isinstance(tail, int) else 0,
+                on_tail,
+            )
+
+            prev_br = rec.runtime.br
+            prev_cct = rec.runtime.cct
+            prev_rgb = rec.runtime.rgb
+            prev_r = rec.runtime.r
+            prev_gate_decoded = {
+                0: rec.runtime.door1_decoded if isinstance(rec.runtime.door1_decoded, dict) else None,
+                1: rec.runtime.door2_decoded if isinstance(rec.runtime.door2_decoded, dict) else None,
+            }
+
+            interpreted = None
+            mode = None
+            rgb_from_packet = first.get("rgb") if isinstance(first.get("rgb"), list) else None
+            br_from_packet = decoded.get("brightness_0_100") if isinstance(decoded.get("brightness_0_100"), int) else None
+            record_online_value = first.get("online")
+            if isinstance(record_online_value, int):
+                update_kwargs: Dict[str, Any] = {"online": record_online_value}
+            else:
+                update_kwargs = {"online": 1, "presence": "online"}
+
+            if rgb_from_packet is not None:
+                update_kwargs["rgb"] = [int(rgb_from_packet[0]), int(rgb_from_packet[1]), int(rgb_from_packet[2])]
+                if br_from_packet is not None:
+                    update_kwargs["br"] = br_from_packet
+
+            mode_from_packet = first.get("mode")
+            relay_from_packet = first.get("relay")
+            motion_from_packet = first.get("motion")
+            if isinstance(mode_from_packet, int):
+                update_kwargs["mode"] = mode_from_packet
+            if isinstance(relay_from_packet, int):
+                update_kwargs["relay"] = relay_from_packet
+                update_kwargs["br"] = 100 if relay_from_packet else 0
+            if isinstance(motion_from_packet, bool):
+                update_kwargs["motion"] = motion_from_packet
+
+            if isinstance(value_byte, int):
+                interpreted = decode_value_byte_for_capabilities(rec.capabilities, value_byte)
+                self._log_debug("BLE interpreted: model=%s mode=%s data=%s", rec.model_no, interpreted.get("mode"), json.dumps(interpreted, ensure_ascii=False, sort_keys=True))
+                mode = interpreted.get("mode")
+
+                if mode == "brightness":
+                    update_kwargs["br"] = interpreted.get("brightness_0_100")
+                elif mode == "dual_channel":
+                    left_on = bool(interpreted.get("left_on"))
+                    right_on = bool(interpreted.get("right_on"))
+                    update_kwargs["r"] = 3 if left_on and right_on else 1 if left_on else 2 if right_on else 0
+                elif mode == "plug_with_usb":
+                    relay_on = bool(interpreted.get("main_relay_on"))
+                    usb_on = bool(interpreted.get("usb_on"))
+                    update_kwargs["r"] = (1 if relay_on else 0) | (2 if usb_on else 0)
+                    update_kwargs["br"] = 100 if relay_on else 0
+                elif mode == "sensor_controller":
+                    mode_value = interpreted.get("mode_value")
+                    relay_on = interpreted.get("relay_on")
+                    motion = interpreted.get("motion")
+                    if isinstance(mode_value, int):
+                        update_kwargs["mode"] = mode_value
+                    if isinstance(relay_on, bool):
+                        update_kwargs["relay"] = 1 if relay_on else 0
+                        update_kwargs["br"] = 100 if relay_on else 0
+                    if isinstance(motion, bool):
+                        update_kwargs["motion"] = motion
+                elif mode == "contact_sensor":
+                    if isinstance(tail, int):
+                        decoded_contact = decode_contact_runtime_state(
+                            rec.capabilities,
+                            value_byte,
+                            tail,
+                            prev_armed=rec.runtime.armed,
+                            prev_source=rec.runtime.last_source,
+                            allow_pulse=True,
+                        )
+                        if "armed" in decoded_contact:
+                            update_kwargs["armed"] = decoded_contact.get("armed")
+                        if "contact_active" in decoded_contact:
+                            update_kwargs["contact_active"] = decoded_contact.get("contact_active")
+                        update_kwargs["contact_momentary"] = bool(decoded_contact.get("pulse_event"))
+                elif mode == "timer_switch":
+                    timer_mode = interpreted.get("timer_mode")
+                    restarting = interpreted.get("restarting")
+                    self._log_debug("TIMER interpreted: dev_id=%s value=0x%02x timer_mode=%s restart=%s", dev_id, value_byte, timer_mode, restarting)
+                    suppress_restart_countdown_reset = False
+                    if restarting and isinstance(rec.runtime.local_timer_restart_at, (int, float)):
+                        since_local_restart = time.time() - rec.runtime.local_timer_restart_at
+                        suppress_restart_countdown_reset = 0 <= since_local_restart < LOCAL_TIMER_RESTART_GUARD_SECONDS
+                    if timer_mode == "timer":
+                        update_kwargs["mode"] = 1
+                        update_kwargs["br"] = 100
+                        prev_mode = rec.runtime.mode
+                        prev_on = rec.runtime.is_on
+                        if (prev_mode != 1 or (not prev_on and timer_mode == "timer")) and not suppress_restart_countdown_reset:
+                            if rec.runtime.timer_total_seconds is not None:
+                                update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+                            update_kwargs["last_timer_poll_at"] = time.time()
+                            update_kwargs["timer_needs_poll"] = True
+                    elif timer_mode == "override":
+                        update_kwargs["mode"] = 2
+                        update_kwargs["br"] = 100
+                    elif timer_mode is None:
+                        update_kwargs["br"] = 0
+                    if restarting and not suppress_restart_countdown_reset:
+                        if rec.runtime.timer_total_seconds is not None:
+                            update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+                        update_kwargs["last_timer_poll_at"] = time.time()
+                        update_kwargs["timer_needs_poll"] = True
+                    elif restarting:
+                        self._log_debug(
+                            "TIMER restart-state countdown reset suppressed: dev_id=%s guard=%.1fs",
+                            dev_id,
+                            LOCAL_TIMER_RESTART_GUARD_SECONDS,
+                        )
+                elif mode == "tunable_white":
+                    brightness = interpreted.get("brightness_0_100")
+                    if isinstance(brightness, int):
+                        update_kwargs["br"] = brightness
+                    if isinstance(tail, int):
+                        update_kwargs["cct"] = tail
+                elif mode == "color_effect":
+                    if isinstance(tail, int):
+                        decoded_color = decode_color_runtime_state_for_capabilities(rec.capabilities, value_byte, tail)
+                        brightness = decoded_color.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_kwargs["br"] = brightness
+                        if "effect" in decoded_color:
+                            update_kwargs["effect"] = decoded_color.get("effect")
+                        if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
+                            update_kwargs["rgb"] = [int(channel) for channel in decoded_color["rgb"]]
+                elif mode == "gate":
+                    if isinstance(value_byte, int):
+                        update_kwargs["door1_state"] = value_byte
+                        door1_decoded = decode_gate_state_byte(0, value_byte)
+                        if door1_decoded.get("known"):
+                            update_kwargs["door1_decoded"] = door1_decoded
+                            now_ms = int(time.time() * 1000)
+                            motion_plan = sync_gate_motion_plan(rec.runtime.door1_motion_plan, door1_decoded, now_ms)
+                            if motion_plan is None:
+                                learned_duration_ms = rec.runtime.door1_open_duration_ms if door1_decoded.get("state") == "opening" else rec.runtime.door1_close_duration_ms
+                                motion_plan = build_gate_motion_plan_from_learned_duration(door1_decoded, now_ms, learned_duration_ms)
+                            update_kwargs["door1_motion_plan"] = motion_plan
+                    if isinstance(tail, int) and rec.capabilities.gate_doors >= 2:
+                        update_kwargs["door2_state"] = tail
+                        door2_decoded = decode_gate_state_byte(1, tail)
+                        if door2_decoded.get("known"):
+                            update_kwargs["door2_decoded"] = door2_decoded
+                            now_ms = int(time.time() * 1000)
+                            motion_plan = sync_gate_motion_plan(rec.runtime.door2_motion_plan, door2_decoded, now_ms)
+                            if motion_plan is None:
+                                learned_duration_ms = rec.runtime.door2_open_duration_ms if door2_decoded.get("state") == "opening" else rec.runtime.door2_close_duration_ms
+                                motion_plan = build_gate_motion_plan_from_learned_duration(door2_decoded, now_ms, learned_duration_ms)
+                            update_kwargs["door2_motion_plan"] = motion_plan
+                elif mode == "raw":
+                    if rec.capabilities.supports_onoff and not rec.capabilities.supports_dimming and not rec.capabilities.supports_multi_channel and not rec.capabilities.supports_usb_subentity and not rec.capabilities.supports_cover:
+                        update_kwargs["br"] = 100 if value_byte > 0 else 0
+
+            update_kwargs["raw"] = {
+                "hub_type": payload_meta.get("type"),
+                "hub_data": ble_hex,
+                "hub_utc": payload_meta.get("UTC"),
+                "ble_decoded": decoded,
+                "ble_interpreted": interpreted,
+            }
+            updated_runtime = self.inventory.apply_device_update(dev_id, source=source, **update_kwargs)
+            if mode == "gate":
+                for door_index, raw_state, decoded_state in (
+                    (0, value_byte if isinstance(value_byte, int) else None, update_kwargs.get("door1_decoded")),
+                    (1, tail if isinstance(tail, int) else None, update_kwargs.get("door2_decoded")),
+                ):
+                    if isinstance(raw_state, int) and (not isinstance(decoded_state, dict)):
+                        previous = prev_gate_decoded.get(door_index)
+                        self._log_debug(
+                            "Gate unknown bleData byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
+                            dev_id,
+                            door_index + 1,
+                            raw_state,
+                            previous.get("state") if isinstance(previous, dict) else None,
+                            previous.get("position_percent") if isinstance(previous, dict) else None,
+                            previous.get("value_byte") if isinstance(previous, dict) else None,
+                        )
+            if updated_runtime is None:
+                continue
+            applied += 1
+            if rec.capabilities.supports_timer:
+                self._log_debug(
+                    "TIMER state after update: dev_id=%s br=%s mode=%s is_on=%s total=%s remaining=%s",
+                    dev_id,
+                    updated_runtime.br,
+                    updated_runtime.mode,
+                    updated_runtime.is_on,
+                    updated_runtime.timer_total_seconds,
+                    updated_runtime.timer_remaining_seconds,
+                )
+
+            self._notify_inventory_updated()
+
+            summary_parts = []
+            if isinstance(record_online_value, int):
+                summary_parts.append(f"online_value={record_online_value}")
+                summary_parts.append(f"presence={updated_runtime.presence}")
+            if rgb_from_packet is not None:
+                summary_parts.append(f"rgb {prev_rgb}->{updated_runtime.rgb}")
+                if br_from_packet is not None:
+                    summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+            elif interpreted and interpreted.get("mode") == "brightness":
+                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+            elif interpreted and interpreted.get("mode") == "dual_channel":
+                summary_parts.append(f"r {prev_r}->{updated_runtime.r}")
+                summary_parts.append(f"channel={interpreted.get('channel_state')}")
+            elif interpreted and interpreted.get("mode") == "raw" and isinstance(on_tail, bool):
+                summary_parts.append(f"on_tail={on_tail}")
+                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+            elif interpreted and interpreted.get("mode") == "tunable_white":
+                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+                summary_parts.append(f"cct {prev_cct}->{updated_runtime.cct}")
+            elif interpreted and interpreted.get("mode") == "color_effect":
+                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
+                summary_parts.append(f"rgb {prev_rgb}->{updated_runtime.rgb}")
+                if updated_runtime.effect is not None:
+                    summary_parts.append(f"effect={updated_runtime.effect}")
+            else:
+                summary_parts.append(f"value={value_byte}")
+            self._log_debug("Inventory update: id=%s name=%s %s src=%s", dev_id, rec.name, ", ".join(summary_parts), source)
+
         return applied
 
     def _apply_cloud_params(self, cloud_params: CloudParams) -> None:
@@ -1920,13 +2652,22 @@ class PixieAuthHandler:
 
             if response.status_code == 403:
                 self._log_warning("Cloud login failed: invalid credentials (403 Unauthorized)")
-                return {
-                    'netid': netid,
-                    'meshnet': meshnet,
-                    'homeid': homeid,
-                    'userid': userid,
-                    'sessiontoken': sessiontoken
-                }
+                raise PixieInvalidCredentialsError("Invalid Pixie username/password")
+
+            if response.status_code in (400, 401, 404):
+                try:
+                    error_payload = response.json()
+                except Exception:
+                    error_payload = {}
+                error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
+                error_text = str(error_payload.get("error") or "") if isinstance(error_payload, dict) else ""
+                if error_code == 101 or "invalid username/password" in error_text.lower():
+                    self._log_warning(
+                        "Cloud login failed: invalid credentials (%s %s)",
+                        response.status_code,
+                        error_text or "code 101",
+                    )
+                    raise PixieInvalidCredentialsError("Invalid Pixie username/password")
 
             response.raise_for_status()
             data = response.json()
@@ -2050,7 +2791,17 @@ class PixieAuthHandler:
 
         except httpx.HTTPStatusError as e:
             self._log_warning("Cloud API HTTP error: %s - %s", e.response.status_code, e.response.text[:100])
+            try:
+                error_payload = e.response.json()
+            except Exception:
+                error_payload = {}
+            error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
+            error_text = str(error_payload.get("error") or "") if isinstance(error_payload, dict) else ""
+            if error_code == 101 or "invalid username/password" in error_text.lower():
+                raise PixieInvalidCredentialsError("Invalid Pixie username/password") from e
         except Exception as e:
+            if isinstance(e, PixieInvalidCredentialsError):
+                raise
             self._log_warning("Could not fetch login data from cloud API: %s", e)
 
         return {
@@ -2062,6 +2813,790 @@ class PixieAuthHandler:
             'userid': userid,
             'sessiontoken': sessiontoken
         }
+
+    def _default_optimistic_brightness_percent(self, rec: Optional[Any]) -> int:
+        """Return the brightness HA should predict for commands that retain brightness."""
+        if rec and isinstance(rec.runtime.br, int):
+            return max(0, min(100, int(rec.runtime.br)))
+        return 100
+
+    def resolve_optimistic_update_intent(self, command_kwargs: Dict[str, Any]) -> Optional[PixieOptimisticUpdateIntent]:
+        """Resolve HA command kwargs into a transport-neutral optimistic update intent."""
+        if not self.inventory:
+            return None
+        try:
+            device_id = int(command_kwargs["command_device_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        rec = self.inventory.devices_by_id.get(device_id)
+        if rec is None:
+            return None
+
+        command_state = command_kwargs.get("command_state")
+        command_brightness = command_kwargs.get("command_brightness")
+        command_color_rgb = command_kwargs.get("command_color_rgb")
+        command_color_temp_cct = command_kwargs.get("command_color_temp_cct")
+        command_effect = command_kwargs.get("command_effect")
+        command_mode = command_kwargs.get("command_mode")
+        command_cover_action = command_kwargs.get("command_cover_action")
+        command_cover_action_map = command_kwargs.get("command_cover_action_map")
+        command_cover_tilt_action_map = command_kwargs.get("command_cover_tilt_action_map")
+        command_timer_action = command_kwargs.get("command_timer_action")
+        command_timer_duration = command_kwargs.get("command_timer_duration")
+        command_sensor_param = command_kwargs.get("command_sensor_param")
+        command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
+        command_target = command_kwargs.get("command_target")
+
+        if command_sensor_param is not None and command_sensor_param_value is not None:
+            target = str(command_sensor_param)
+            if target in {"hold_time", "brightness_threshold", "motion_sensitivity"}:
+                return PixieOptimisticUpdateIntent(
+                    device_id=device_id,
+                    target=target,
+                    value=int(command_sensor_param_value),
+                )
+            return None
+
+        if command_timer_action == "restart":
+            return PixieOptimisticUpdateIntent(device_id=device_id, target="timer_restart", value=True)
+        if command_timer_action == "override":
+            return PixieOptimisticUpdateIntent(device_id=device_id, target="timer_override", value=True)
+        if command_timer_action == "set_duration" and command_timer_duration is not None:
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="timer_duration",
+                value=int(command_timer_duration),
+            )
+        if command_timer_action == "poll" and rec.capabilities.supports_timer:
+            return PixieOptimisticUpdateIntent(device_id=device_id, target="timer_poll_stamp")
+
+        if command_mode is not None:
+            mode_value = int(command_mode)
+            target = "timer_mode" if rec.capabilities.supports_timer and mode_value in (1, 2) else "mode"
+            return PixieOptimisticUpdateIntent(device_id=device_id, target=target, value=mode_value)
+
+        if command_effect is not None:
+            brightness = (
+                int(command_brightness)
+                if command_brightness is not None
+                else self._default_optimistic_brightness_percent(rec)
+            )
+            effect_name = str(command_effect).strip().lower()
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="effect",
+                value=effect_name,
+                brightness_level=brightness,
+                effect_name=effect_name,
+                effect_speed=4,
+            )
+
+        if command_color_rgb is not None:
+            brightness = (
+                int(command_brightness)
+                if command_brightness is not None
+                else self._default_optimistic_brightness_percent(rec)
+            )
+            if brightness == 0:
+                brightness = 100
+            rgb = tuple(int(value) for value in command_color_rgb)
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="color",
+                value=rgb,
+                brightness_level=brightness,
+                rgb_color=rgb,
+            )
+
+        if command_color_temp_cct is not None:
+            brightness = (
+                int(command_brightness)
+                if command_brightness is not None
+                else self._default_optimistic_brightness_percent(rec)
+            )
+            if brightness == 0:
+                brightness = 100
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="color_temp",
+                value=int(command_color_temp_cct),
+                brightness_level=brightness,
+            )
+
+        if command_brightness is not None:
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="brightness",
+                value=int(command_brightness),
+            )
+
+        if command_cover_action is not None:
+            normalized_cover_action = str(command_cover_action).strip().lower().replace("-", "_")
+            cover_button_position = resolve_cover_command_position(
+                normalized_cover_action,
+                action_mapping=command_cover_action_map,
+                tilt_mapping=command_cover_tilt_action_map,
+            )
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="cover",
+                value=normalized_cover_action,
+                cover_button_position=cover_button_position,
+            )
+
+        if command_state is not None:
+            state = bool(command_state)
+            if rec.capabilities.supports_timer:
+                return PixieOptimisticUpdateIntent(device_id=device_id, target="timer_relay", value=state)
+            if rec.capabilities.supports_contact_sensor:
+                return PixieOptimisticUpdateIntent(device_id=device_id, target="arm", value=state)
+            effective_target = self._resolve_command_target_for_device(device_id, command_target)
+            if rec.capabilities.supports_sensor and effective_target == "relay":
+                return PixieOptimisticUpdateIntent(device_id=device_id, target="relay", value=state)
+            return PixieOptimisticUpdateIntent(device_id=device_id, target=effective_target, value=state)
+
+        return None
+
+    def build_core_command_plan(self, command_kwargs: Dict[str, Any]) -> PixieCoreCommandPlan:
+        """Build the transport-neutral Pixie core command packet sequence."""
+        if not self.inventory:
+            raise PixieAuthError("No Pixie inventory is available")
+        try:
+            device_id = int(command_kwargs["command_device_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PixieAuthError("Missing or invalid command_device_id") from exc
+
+        rec = self.inventory.devices_by_id.get(device_id)
+        if rec is None:
+            raise PixieAuthError(f"Unknown Pixie device id: {device_id}")
+
+        command_state = command_kwargs.get("command_state")
+        command_brightness = command_kwargs.get("command_brightness")
+        command_color_rgb = command_kwargs.get("command_color_rgb")
+        command_color_temp_cct = command_kwargs.get("command_color_temp_cct")
+        command_effect = command_kwargs.get("command_effect")
+        command_mode = command_kwargs.get("command_mode")
+        command_cover_action = command_kwargs.get("command_cover_action")
+        command_cover_action_map = command_kwargs.get("command_cover_action_map")
+        command_cover_tilt_action_map = command_kwargs.get("command_cover_tilt_action_map")
+        command_timer_action = command_kwargs.get("command_timer_action")
+        command_timer_duration = command_kwargs.get("command_timer_duration")
+        command_sensor_param = command_kwargs.get("command_sensor_param")
+        command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
+        command_gate_door = command_kwargs.get("command_gate_door")
+        command_target = command_kwargs.get("command_target")
+
+        is_cover_cmd = command_cover_action is not None
+        is_effect_cmd = command_effect is not None
+        is_color_cmd = command_color_rgb is not None
+        is_color_temp_cmd = command_color_temp_cct is not None
+        is_brightness_cmd = (
+            command_brightness is not None
+            and not is_color_cmd
+            and not is_color_temp_cmd
+            and not is_effect_cmd
+            and not is_cover_cmd
+        )
+        is_mode_cmd = command_mode is not None
+        optimistic_intent = self.resolve_optimistic_update_intent(command_kwargs)
+
+        if is_color_cmd and not rec.capabilities.supports_color:
+            raise PixieAuthError(f"Model {rec.model_no} does not support color")
+        if is_color_temp_cmd and not rec.capabilities.supports_color_temp:
+            raise PixieAuthError(f"Model {rec.model_no} does not support color temperature")
+        if is_cover_cmd and not rec.capabilities.supports_cover and not rec.capabilities.supports_gate:
+            raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
+        if is_mode_cmd and not rec.capabilities.supports_sensor and not rec.capabilities.supports_timer:
+            raise PixieAuthError(f"Model {rec.model_no} does not support mode commands")
+        if is_mode_cmd and rec.capabilities.supports_sensor:
+            allowed_sensor_modes = get_supported_sensor_mode_values_for_capabilities(rec.capabilities)
+            requested_sensor_mode = int(command_mode)
+            if requested_sensor_mode not in allowed_sensor_modes:
+                raise PixieAuthError(
+                    f"Mode {requested_sensor_mode} not allowed for model {rec.model_no}: {allowed_sensor_modes}"
+                )
+        if is_effect_cmd:
+            allowed_effects = rec.capabilities.effect_names
+            if not allowed_effects:
+                raise PixieAuthError(f"Model {rec.model_no} does not support effects")
+            if not rec.capabilities.effect_command_encoding:
+                raise PixieAuthError(f"Model {rec.model_no} supports effects but has no effect command encoding")
+            if str(command_effect).strip().lower() not in allowed_effects:
+                raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
+
+        def _packet(
+            command_hex: str,
+            *,
+            tcp_repeat: int = 0,
+            delay_after: float = 0.0,
+            log_message: Optional[str] = None,
+            log_args: Tuple[Any, ...] = (),
+        ) -> PixieCoreCommandPacket:
+            return PixieCoreCommandPacket(
+                command_hex=command_hex,
+                tcp_repeat=tcp_repeat,
+                delay_after=delay_after,
+                log_message=log_message,
+                log_args=log_args,
+            )
+
+        if is_cover_cmd and rec.capabilities.supports_gate:
+            door_index = int(command_gate_door) if command_gate_door is not None else 0
+            gate_state = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
+            if not gate_can_run_action(gate_state, str(command_cover_action)):
+                gate_state_name = gate_state.get("state") if isinstance(gate_state, dict) else "unknown"
+                next_action = gate_state.get("next_action") if isinstance(gate_state, dict) else None
+                raise PixieAuthError(
+                    f"Gate action '{command_cover_action}' is not allowed for door {door_index + 1} while state is {gate_state_name}"
+                    + (f" (next action: {next_action})" if next_action else "")
+                )
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="gate",
+                packets=(_packet(
+                    self._build_gate_command_hex(device_id, door_index),
+                    tcp_repeat=1,
+                    log_message="Sending gate command: dev_id=%s door=%s action=%s opcode=f96b69",
+                    log_args=(device_id, door_index, command_cover_action),
+                ),),
+                optimistic_intent=None,
+                result={"target": "gate", "device_id": device_id, "door": door_index},
+            )
+
+        if command_timer_action == "poll" and rec.capabilities.supports_sensor:
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="sensor_poll",
+                packets=(_packet(
+                    self._build_sensor_poll_command_hex(device_id),
+                    tcp_repeat=1,
+                    log_message="Sending sensor poll: dev_id=%s opcode=f96b69",
+                    log_args=(device_id,),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "sensor_poll", "device_id": device_id},
+            )
+
+        if command_sensor_param is not None and rec.capabilities.supports_sensor:
+            param_map = {
+                "hold_time": 5,
+                "brightness_threshold": 4,
+                "motion_sensitivity": 2,
+            }
+            param_id = param_map.get(str(command_sensor_param))
+            if param_id is None:
+                raise PixieAuthError(f"Unknown sensor param: {command_sensor_param}")
+            if command_sensor_param_value is None:
+                raise PixieAuthError(f"Missing value for sensor param: {command_sensor_param}")
+            ka = {"counter_attr": "_timer_command_counter", "minimum_counter": 0x01}
+            packets = (
+                _packet(
+                    self._build_shifted_prefix_command_hex(device_id, opcode=b"\xd9\x6b\x69", payload=b"\x77\x00", **ka),
+                    tcp_repeat=1,
+                    delay_after=0.2,
+                    log_message="Edit sequence cmd hex: %s",
+                ),
+                _packet(
+                    self._build_shifted_prefix_command_hex(device_id, opcode=b"\xf9\x6b\x69", payload=b"\x01\x00" + b"\x00" * 8, **ka),
+                    tcp_repeat=1,
+                    delay_after=0.2,
+                    log_message="Edit sequence cmd hex: %s",
+                ),
+                _packet(
+                    self._build_shifted_prefix_command_hex(device_id, opcode=b"\xfd\x6b\x69", payload=b"\x10\x00", **ka),
+                    tcp_repeat=1,
+                    delay_after=0.2,
+                    log_message="Edit sequence cmd hex: %s",
+                ),
+                _packet(
+                    self._build_sensor_param_command_hex(device_id, param_id, int(command_sensor_param_value)),
+                    log_message="Sending sensor param: dev_id=%s param=%s(%s) value=%s opcode=d26c69",
+                    log_args=(device_id, command_sensor_param, param_id, command_sensor_param_value),
+                ),
+            )
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target=str(command_sensor_param),
+                packets=packets,
+                optimistic_intent=optimistic_intent,
+                result={"target": str(command_sensor_param), "device_id": device_id},
+            )
+
+        if command_state is not None and rec.capabilities.supports_contact_sensor:
+            effective_target = self._resolve_command_target_for_device(device_id, command_target)
+            if effective_target != "arm":
+                raise PixieAuthError(f"Unsupported command target for contact sensor: {effective_target}")
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="arm",
+                packets=(_packet(
+                    self._build_contact_arm_command_hex(device_id, armed=bool(command_state)),
+                    log_message="Sending contact sensor arm command: device_id=%s state=%s opcode=ca6b69",
+                    log_args=(device_id, "armed" if command_state else "disarmed"),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "arm", "device_id": device_id},
+            )
+
+        is_timer_cmd = rec.capabilities.supports_timer and (
+            command_timer_action is not None
+            or command_timer_duration is not None
+            or (is_mode_cmd and not rec.capabilities.supports_sensor)
+            or (
+                command_state is not None
+                and not is_cover_cmd
+                and not is_effect_cmd
+                and not is_color_cmd
+                and not is_brightness_cmd
+                and not is_mode_cmd
+            )
+        )
+        if is_timer_cmd:
+            packets: List[PixieCoreCommandPacket] = []
+            target = "timer_relay"
+            if command_timer_action == "restart":
+                target = "timer_restart"
+                packets.append(_packet(
+                    self._build_timer_restart_command_hex(device_id),
+                    delay_after=0.2,
+                    log_message="Sending timer restart command: device_id=%s opcode=c16969",
+                    log_args=(device_id,),
+                ))
+                packets.append(_packet(self._build_timer_poll_command_hex(device_id), tcp_repeat=1))
+            elif command_timer_action == "override":
+                target = "timer_override"
+                packets.append(_packet(
+                    self._build_timer_override_command_hex(device_id),
+                    log_message="Sending timer override command: device_id=%s opcode=c16969",
+                    log_args=(device_id,),
+                ))
+            elif command_timer_action == "set_duration":
+                target = "timer_duration"
+                duration = int(command_timer_duration) if command_timer_duration is not None else 60
+                duration_commands = self._build_timer_set_duration_commands(device_id, duration)
+                for index, (command_hex, repeat) in enumerate(duration_commands):
+                    packets.append(_packet(
+                        command_hex,
+                        tcp_repeat=repeat,
+                        delay_after=0.3 if index == len(duration_commands) - 1 else 0.2,
+                        log_message="Edit sequence cmd hex: %s",
+                    ))
+                packets.append(_packet(self._build_timer_poll_command_hex(device_id), tcp_repeat=1))
+            elif command_timer_action == "poll":
+                target = "timer_poll"
+                packets.append(_packet(
+                    self._build_timer_poll_command_hex(device_id),
+                    tcp_repeat=1,
+                    log_message="Sending timer poll command: device_id=%s opcode=f96b69",
+                    log_args=(device_id,),
+                ))
+            elif command_mode is not None:
+                target = "timer_mode"
+                if int(command_mode) == 2:
+                    packets.append(_packet(
+                        self._build_timer_override_command_hex(device_id),
+                        log_message="Sending timer mode switch (override): device_id=%s",
+                        log_args=(device_id,),
+                    ))
+                else:
+                    packets.append(_packet(
+                        self._build_timer_onoff_command_hex(device_id, is_on=True),
+                        delay_after=0.2,
+                        log_message="Sending timer mode switch (timer, light on): device_id=%s",
+                        log_args=(device_id,),
+                    ))
+                    packets.append(_packet(self._build_timer_poll_command_hex(device_id), tcp_repeat=1))
+            elif command_state is not None:
+                target = "timer_relay"
+                packets.append(_packet(
+                    self._build_timer_onoff_command_hex(device_id, is_on=bool(command_state)),
+                    delay_after=0.2 if command_state else 0.0,
+                    log_message="Sending timer on/off command: device_id=%s state=%s opcode=ed6969",
+                    log_args=(device_id, "on" if command_state else "off"),
+                ))
+                if command_state:
+                    packets.append(_packet(self._build_timer_poll_command_hex(device_id), tcp_repeat=1))
+            else:
+                target = "timer_poll"
+                packets.append(_packet(self._build_timer_poll_command_hex(device_id), tcp_repeat=1))
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target=target,
+                packets=tuple(packets),
+                optimistic_intent=optimistic_intent,
+                result={"target": target, "device_id": device_id},
+            )
+
+        if is_cover_cmd:
+            normalized_cover_action = str(command_cover_action).strip().lower().replace("-", "_")
+            cover_button_position = resolve_cover_command_position(
+                normalized_cover_action,
+                action_mapping=command_cover_action_map,
+                tilt_mapping=command_cover_tilt_action_map,
+            )
+            if cover_button_position is None:
+                raise PixieAuthError(f"No manual button mapping configured for cover action '{normalized_cover_action}'")
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="cover",
+                packets=(_packet(
+                    self._build_cover_press_command_hex(device_id, button_position=cover_button_position),
+                    log_message="Sending local cover command: device_id=%s action=%s button_position=%s opcode=c16969",
+                    log_args=(device_id, normalized_cover_action, cover_button_position),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "cover", "device_id": device_id},
+            )
+
+        if is_effect_cmd:
+            effect_name = str(command_effect).strip().lower()
+            effect_speed = 0x04
+            effect_brightness = self._default_optimistic_brightness_percent(rec)
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="effect",
+                packets=(_packet(
+                    self._build_effect_command_hex(
+                        device_id,
+                        effect_name=effect_name,
+                        effect_speed=effect_speed,
+                        brightness_level=effect_brightness,
+                        capabilities=rec.capabilities,
+                    ),
+                    log_message="Sending effect command: device_id=%s effect=%s speed=0x%02x brightness=%s opcode=f86969",
+                    log_args=(device_id, effect_name or "none", effect_speed, effect_brightness),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "effect", "device_id": device_id},
+            )
+
+        if is_color_cmd:
+            color_brightness = int(command_brightness) if command_brightness is not None else self._default_optimistic_brightness_percent(rec)
+            if color_brightness == 0:
+                color_brightness = 100
+            rgb = tuple(int(v) for v in command_color_rgb)
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="color",
+                packets=(_packet(
+                    self._build_color_command_hex(device_id, rgb=rgb, brightness_level=color_brightness),
+                    log_message="Sending color command: device_id=%s rgb=%s brightness=%s opcode=c16969",
+                    log_args=(device_id, rgb, color_brightness),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "color", "device_id": device_id},
+            )
+
+        if is_color_temp_cmd:
+            color_brightness = int(command_brightness) if command_brightness is not None else self._default_optimistic_brightness_percent(rec)
+            if color_brightness == 0:
+                color_brightness = 100
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="color_temp",
+                packets=(_packet(
+                    self._build_tunable_white_command_hex(
+                        device_id,
+                        cct=int(command_color_temp_cct),
+                        brightness_level=color_brightness,
+                    ),
+                    log_message="Sending tunable-white command: device_id=%s cct=%s brightness=%s opcode=c16969",
+                    log_args=(device_id, command_color_temp_cct, color_brightness),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "color_temp", "device_id": device_id},
+            )
+
+        if is_brightness_cmd:
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="brightness",
+                packets=(_packet(
+                    self._build_brightness_command_hex(device_id, brightness_level=int(command_brightness)),
+                    log_message="Sending brightness command: device_id=%s brightness=%s opcode=e76969",
+                    log_args=(device_id, command_brightness),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "brightness", "device_id": device_id},
+            )
+
+        if is_mode_cmd:
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="mode",
+                packets=(_packet(
+                    self._build_mode_command_hex(device_id, mode=int(command_mode)),
+                    log_message="Sending mode command: device_id=%s mode=%s relay=0 opcode=c16969",
+                    log_args=(device_id, command_mode),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "mode", "device_id": device_id},
+            )
+
+        if command_state is not None:
+            effective_target = self._resolve_command_target_for_device(device_id, command_target)
+            if rec.capabilities.supports_sensor and effective_target == "relay":
+                command_hex = self._build_mode_command_hex(device_id, mode=0, relay=1 if bool(command_state) else 0)
+                log_args = (device_id, "relay/main", "on" if command_state else "off", "c16969", 0)
+            else:
+                command_spec = self._resolve_onoff_command_spec(effective_target)
+                if effective_target == "usb":
+                    command_hex, state_byte_used = self._build_0107_usb_command_hex(device_id, is_on=bool(command_state))
+                    log_args = (device_id, command_spec["label"], "on" if command_state else "off", command_spec["opcode_name"], command_spec["selector"], state_byte_used)
+                else:
+                    command_hex = self._build_6969_onoff_command_hex(
+                        device_id,
+                        is_on=bool(command_state),
+                        opcode=command_spec["opcode"],
+                        selector=command_spec["selector"],
+                    )
+                    log_args = (device_id, command_spec["label"], "on" if command_state else "off", command_spec["opcode_name"], command_spec["selector"], None)
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target=effective_target,
+                packets=(_packet(
+                    command_hex,
+                    log_message="Sending local on/off command: device_id=%s target=%s state=%s opcode=%s selector=%s",
+                    log_args=log_args[:5],
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": effective_target, "device_id": device_id},
+            )
+
+        raise PixieAuthError(f"Unsupported Pixie command kwargs: {sorted(command_kwargs)}")
+
+    def apply_optimistic_update_intent(self, intent: PixieOptimisticUpdateIntent) -> bool:
+        """Apply a transport-neutral optimistic state update after a command send."""
+        return self._apply_local_command_optimistic_update(
+            intent.device_id,
+            intent.value,
+            None,
+            target=intent.target,
+            opcode_name="",
+            brightness_level=intent.brightness_level,
+            rgb_color=intent.rgb_color,
+            effect_name=intent.effect_name,
+            effect_speed=intent.effect_speed,
+            cover_button_position=intent.cover_button_position,
+        )
+
+    def _apply_local_command_optimistic_update(
+        self,
+        device_id: int,
+        value: Any,
+        command_hex: Optional[str],
+        *,
+        target: str,
+        opcode_name: str,
+        brightness_level: Optional[int] = None,
+        rgb_color: Optional[Tuple[int, int, int]] = None,
+        effect_name: Optional[str] = None,
+        effect_speed: Optional[int] = None,
+        cover_button_position: Optional[int] = None,
+    ) -> bool:
+        """Apply a transport-neutral optimistic state update after a command send."""
+        if not self.inventory:
+            return False
+
+        rec = self.inventory.devices_by_id.get(int(device_id))
+        if not rec:
+            self._log_debug("Inventory optimistic update skipped: unknown dev_id=%s", device_id)
+            return False
+
+        prev_br = rec.runtime.br
+        prev_cct = rec.runtime.cct
+        prev_rgb = rec.runtime.rgb
+        prev_effect = rec.runtime.effect
+        prev_effect_speed = rec.runtime.effect_speed
+        prev_r = rec.runtime.r
+        prev_source = rec.runtime.last_source
+        prev_mode = rec.runtime.mode
+        prev_relay = rec.runtime.relay
+        prev_motion = rec.runtime.motion
+        prev_armed = rec.runtime.armed
+        prev_contact = rec.runtime.contact_active
+        update_kwargs: Dict[str, Any] = {}
+
+        def _remembered_turn_on_brightness() -> int:
+            for candidate in (rec.runtime.last_nonzero_br, rec.runtime.br):
+                if isinstance(candidate, int) and candidate > 0:
+                    return max(1, min(100, candidate))
+            return 100
+
+        if target == "brightness":
+            if isinstance(value, int):
+                update_kwargs["br"] = value
+        elif target == "color":
+            if isinstance(brightness_level, int):
+                update_kwargs["br"] = brightness_level
+            if rgb_color is not None:
+                update_kwargs["rgb"] = [int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2])]
+            update_kwargs["effect"] = None
+        elif target == "color_temp":
+            if isinstance(brightness_level, int):
+                update_kwargs["br"] = brightness_level
+            update_kwargs["cct"] = int(value) if value is not None else None
+            update_kwargs["effect"] = None
+        elif target == "effect":
+            if isinstance(brightness_level, int):
+                update_kwargs["br"] = brightness_level
+            update_kwargs["effect"] = effect_name
+            update_kwargs["effect_speed"] = effect_speed
+        elif target == "speed":
+            if isinstance(brightness_level, int):
+                update_kwargs["br"] = brightness_level
+            update_kwargs["effect"] = effect_name
+            update_kwargs["effect_speed"] = effect_speed
+        elif target == "cover":
+            pass
+        elif target == "timer_relay":
+            update_kwargs["br"] = 100 if value else 0
+            if value:
+                update_kwargs["mode"] = 1
+                if rec.runtime.timer_total_seconds is not None:
+                    update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+                    update_kwargs["last_timer_poll_at"] = time.time()
+        elif target == "timer_override":
+            update_kwargs["br"] = 100
+            update_kwargs["mode"] = 2
+        elif target == "timer_restart":
+            update_kwargs["br"] = 100
+            update_kwargs["mode"] = 1
+            update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
+        elif target == "timer_mode":
+            mode_value = int(value) if value is not None else 1
+            update_kwargs["mode"] = mode_value
+            if mode_value == 2:
+                update_kwargs["br"] = 100
+            elif mode_value == 1:
+                update_kwargs["br"] = 100
+        elif target == "timer_duration":
+            pass
+        elif target == "hold_time":
+            update_kwargs["hold_time_seconds"] = int(value) if value is not None else None
+        elif target == "brightness_threshold":
+            update_kwargs["brightness_threshold"] = int(value) if value is not None else None
+        elif target == "motion_sensitivity":
+            update_kwargs["motion_sensitivity"] = int(value) if value is not None else None
+        elif target == "timer_poll_stamp":
+            import time as _time
+            update_kwargs["last_timer_poll_requested_at"] = _time.time()
+        elif target == "mode":
+            mode_value = int(value)
+            update_kwargs["mode"] = mode_value
+            update_kwargs["relay"] = 0
+            update_kwargs["motion"] = False
+            update_kwargs["br"] = 0
+        elif target == "arm":
+            update_kwargs["armed"] = bool(value)
+            update_kwargs["contact_momentary"] = False
+            if value:
+                update_kwargs["contact_active"] = False
+            else:
+                update_kwargs["contact_active"] = None
+        elif target == "relay" and rec.capabilities.supports_sensor:
+            update_kwargs["mode"] = 0
+            update_kwargs["relay"] = 1 if value else 0
+            update_kwargs["motion"] = False
+            update_kwargs["br"] = 100 if value else 0
+        elif rec.capabilities.supports_dimming:
+            update_kwargs["br"] = _remembered_turn_on_brightness() if value else 0
+        elif rec.capabilities.supports_usb_subentity:
+            if isinstance(rec.runtime.r, int):
+                current_relay_on = bool(rec.runtime.r & 0x01)
+                current_usb_on = bool(rec.runtime.r & 0x02)
+            elif isinstance(rec.runtime.br, int):
+                current_relay_on = rec.runtime.br > 0
+                current_usb_on = False
+            else:
+                current_relay_on = False
+                current_usb_on = False
+
+            if target == "usb":
+                next_relay_on = current_relay_on
+                next_usb_on = value
+            else:
+                next_relay_on = value
+                next_usb_on = current_usb_on
+
+            update_kwargs["r"] = (1 if next_relay_on else 0) | (2 if next_usb_on else 0)
+            update_kwargs["br"] = 100 if next_relay_on else 0
+        else:
+            update_kwargs["br"] = 100 if value else 0
+
+        if target in ("left", "right", "both"):
+            current_r = rec.runtime.r if isinstance(rec.runtime.r, int) else 0
+            if target == "left":
+                if value:
+                    update_kwargs["r"] = current_r | 0x01
+                else:
+                    update_kwargs["r"] = current_r & ~0x01
+            elif target == "right":
+                if value:
+                    update_kwargs["r"] = current_r | 0x02
+                else:
+                    update_kwargs["r"] = current_r & ~0x02
+            else:
+                update_kwargs["r"] = 3 if value else 0
+
+        update_kwargs["raw"] = {
+            "optimistic_update": {
+                "device_id": int(device_id),
+                "target": target,
+                "requested_state": (
+                    f"{value}"
+                    if target in ("brightness", "color", "color_temp", "effect", "speed", "cover", "mode")
+                    else ("on" if value else "off")
+                ),
+                "brightness_level": brightness_level,
+                "cct": update_kwargs.get("cct"),
+                "rgb_color": list(rgb_color) if rgb_color is not None else None,
+                "effect_name": effect_name,
+                "effect_speed": effect_speed,
+                "cover_button_position": cover_button_position,
+                "pending_verification": True,
+            }
+        }
+        updated_runtime = self.inventory.apply_device_update(
+            device_id,
+            source="local_command_optimistic",
+            **update_kwargs,
+        )
+        if updated_runtime is None:
+            return False
+        if target == "timer_restart":
+            updated_runtime.local_timer_restart_at = time.time()
+
+        summary_parts = [
+            f"br {prev_br}->{updated_runtime.br}",
+            f"cct {prev_cct}->{updated_runtime.cct}",
+            f"rgb {prev_rgb}->{updated_runtime.rgb}",
+            f"effect {prev_effect}->{updated_runtime.effect}",
+            f"speed {prev_effect_speed}->{updated_runtime.effect_speed}",
+            f"r {prev_r}->{updated_runtime.r}",
+        ]
+        if prev_mode != updated_runtime.mode:
+            summary_parts.append(f"mode {prev_mode}->{updated_runtime.mode}")
+        if prev_relay != updated_runtime.relay:
+            summary_parts.append(f"relay {prev_relay}->{updated_runtime.relay}")
+        if prev_motion != updated_runtime.motion:
+            summary_parts.append(f"motion {prev_motion}->{updated_runtime.motion}")
+        if prev_armed != updated_runtime.armed:
+            summary_parts.append(f"armed {prev_armed}->{updated_runtime.armed}")
+        if prev_contact != updated_runtime.contact_active:
+            summary_parts.append(f"contact {prev_contact}->{updated_runtime.contact_active}")
+
+        self._log_debug(
+            "Inventory optimistic update: id=%s name=%s target=%s %s src %s->%s",
+            rec.id,
+            rec.name,
+            target,
+            " ".join(summary_parts),
+            prev_source,
+            updated_runtime.last_source,
+        )
+        return True
 
     def _perform_handshake_capture(
         self,
@@ -2261,232 +3796,7 @@ class PixieAuthHandler:
 
         def _decode_ble_data(hex_payload: str) -> Optional[Dict[str, Any]]:
             """Decode bleData payloads into normalized single or bulk records."""
-            if not isinstance(hex_payload, str):
-                return None
-
-            clean = hex_payload.strip().lower()
-            if not clean or len(clean) % 2 != 0:
-                return None
-
-            try:
-                raw = bytes.fromhex(clean)
-            except Exception:
-                return None
-
-            decoded: Dict[str, Any] = {
-                "hex": clean,
-                "length": len(raw),
-                "bytes": [int(b) for b in raw],
-            }
-
-            # GwData bulk snapshot:
-            # 6-byte header + repeated 4-byte records (id, online, br, rssi_enc).
-            if len(raw) >= 18 and (len(raw) - 6) % 4 == 0:
-                records: List[Dict[str, Any]] = []
-                for i in range(6, len(raw) - 3, 4):
-                    dev_id = int(raw[i])
-                    online = int(raw[i + 1])
-                    br_raw = int(raw[i + 2])
-                    rssi_raw = int(raw[i + 3])
-                    if dev_id in (0, 255):
-                        continue
-                    records.append({
-                        "id": dev_id,
-                        "online": online,
-                        "br_raw": br_raw,
-                        "br": self._decode_bulk_br(br_raw),
-                        "rssi_raw": rssi_raw,
-                    })
-
-                if len(records) >= 2:
-                    decoded["kind"] = "bulk"
-                    decoded["records"] = records
-                    return decoded
-
-            # 3001 command-style c16969 payload carries mode/relay explicitly.
-            # Captured format:
-            # [seq3][src_le=0304][dst_le][c16969][03][mode][relay][00][00][00][01][1e][00][00]
-            mode_command = self._decode_sensor_mode_command(raw)
-            if mode_command is not None:
-                decoded["kind"] = "single"
-                decoded["opcode"] = "c16969"
-                decoded["device_id"] = mode_command["device_id"]
-                decoded["mode"] = mode_command["mode"]
-                decoded["relay"] = mode_command["relay"]
-                decoded["records"] = [{
-                    "id": decoded["device_id"],
-                    "online": None,
-                    "br_raw": None,
-                    "br": {"type": "single", "raw": None, "pct": 100 if decoded["relay"] else 0},
-                    "mode": decoded["mode"],
-                    "relay": decoded["relay"],
-                    "rgb": None,
-                    "value_byte": None,
-                    "tail_flag": None,
-                    "is_on_from_tail": None,
-                    "sequence_or_counter": None,
-                }]
-                return decoded
-
-            # Command-style c16969 payloads can carry RGB + brightness directly.
-            # Format observed on local command path:
-            # [seq3][src_le=0304][dst_le][00][c1][69][69][R][G][B][brightness]
-            if len(raw) >= 14 and raw[7] == 0xC1 and raw[8] == 0x69 and raw[9] == 0x69:
-                decoded["kind"] = "single"
-                decoded["opcode"] = "c16969"
-                decoded["device_id"] = int(raw[5])
-                decoded["rgb"] = [int(raw[10]), int(raw[11]), int(raw[12])]
-                brightness_raw = int(raw[13])
-                decoded["brightness_raw"] = brightness_raw
-                decoded["brightness_0_100"] = max(0, min(100, round((brightness_raw * 100) / 256)))
-                decoded["records"] = [{
-                    "id": decoded["device_id"],
-                    "online": None,
-                    "br_raw": brightness_raw,
-                    "br": {"type": "single", "raw": brightness_raw, "pct": decoded["brightness_0_100"]},
-                    "rgb": list(decoded["rgb"]),
-                    "value_byte": None,
-                    "tail_flag": None,
-                    "is_on_from_tail": None,
-                    "sequence_or_counter": None,
-                }]
-                return decoded
-
-            # d36969 response — opcode d3 69 69 at a variable offset (the zero-padding
-            # between the device-id and the opcode varies).  Search for it dynamically.
-            # Format: 01 02 03 [dev_le:2] [zeros:N] [d3 69 69] [flag] [data...]
-            d3_pos = raw.find(b"\xd3\x69\x69")
-            if d3_pos >= 0 and len(raw) >= d3_pos + 10:
-                flag_byte = raw[d3_pos + 3]
-                dev_id = int.from_bytes(raw[3:5], byteorder="little")
-                data_start = d3_pos + 4  # first byte after the flag
-
-                # Only flag 0xb9 carries data we parse.  Other flags (0x94 = edit
-                # mode entered, 0x99 = timer edit ack, 0xbd = value ack) are
-                # acknowledgments with no data we need.
-                if flag_byte != 0xb9:
-                    return None
-
-                rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
-                if rec and rec.capabilities.supports_timer:
-                    decoded["kind"] = "timer_status"
-                    decoded["device_id"] = dev_id
-                    try:
-                        decoded["timer_total_seconds"] = int.from_bytes(raw[data_start + 1 : data_start + 5], byteorder="little")
-                        decoded["timer_remaining_seconds"] = int.from_bytes(raw[data_start + 5 : data_start + 9], byteorder="little")
-                    except Exception:
-                        decoded["timer_total_seconds"] = None
-                        decoded["timer_remaining_seconds"] = None
-                elif rec and rec.capabilities.supports_sensor:
-                        # 3001 sensor params (flag 0xb9):
-                        # [10] [?] [brightness] [00] [hold_sec_le:2] [sensitivity] [???:2]
-                        decoded["kind"] = "sensor_params"
-                        decoded["device_id"] = dev_id
-                        try:
-                            decoded["brightness_threshold"] = int(raw[data_start + 2])
-                            decoded["hold_time_seconds"] = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
-                            decoded["motion_sensitivity"] = int(raw[data_start + 6])
-                        except Exception:
-                            decoded["brightness_threshold"] = None
-                            decoded["hold_time_seconds"] = None
-                            decoded["motion_sensitivity"] = None
-                        decoded["records"] = [{
-                            "id": dev_id,
-                            "online": None,
-                            "br_raw": None,
-                            "br": {"type": "single", "raw": None, "pct": None},
-                            "hold_time_seconds": decoded.get("hold_time_seconds"),
-                            "brightness_threshold": decoded.get("brightness_threshold"),
-                            "motion_sensitivity": decoded.get("motion_sensitivity"),
-                            "value_byte": None,
-                            "tail_flag": None,
-                            "is_on_from_tail": None,
-                            "sequence_or_counter": None,
-                        }]
-                        return decoded
-                elif rec and rec.capabilities.supports_gate:
-                    decoded["kind"] = "gate_status"
-                    decoded["device_id"] = dev_id
-                    try:
-                        door_index = int(raw[data_start + 1])
-                        state_byte = int(raw[data_start + 3])
-                        position_raw = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
-                        runtime_ms = int.from_bytes(raw[data_start + 6 : data_start + 9], byteorder="little")
-                        decoded_state = decode_gate_command_reply(door_index, state_byte, position_raw, runtime_ms)
-                    except Exception:
-                        door_index = None
-                        state_byte = None
-                        position_raw = None
-                        runtime_ms = None
-                        decoded_state = None
-                    decoded["records"] = [{
-                        "id": dev_id,
-                        "online": None,
-                        "br_raw": None,
-                        "br": {"type": "single", "raw": None, "pct": None},
-                        "gate_door": door_index,
-                        "door_state": state_byte,
-                        "door_decoded": decoded_state,
-                        "position_raw": position_raw,
-                        "runtime_ms": runtime_ms,
-                        "value_byte": None,
-                        "tail_flag": None,
-                        "is_on_from_tail": None,
-                        "sequence_or_counter": None,
-                    }]
-                    return decoded
-                decoded["records"] = [{
-                    "id": decoded["device_id"],
-                    "online": None,
-                    "br_raw": None,
-                    "br": {"type": "single", "raw": None, "pct": None},
-                    "timer_total_seconds": decoded["timer_total_seconds"],
-                    "timer_remaining_seconds": decoded["timer_remaining_seconds"],
-                    "value_byte": None,
-                    "tail_flag": None,
-                    "is_on_from_tail": None,
-                    "sequence_or_counter": None,
-                }]
-                return decoded
-
-            # Observed switch/light BLE payload shape currently appears to be:
-            # [.. .. .. .. .. .. .. .. .. .. dev_id seq level tail]
-            # with examples like:
-            # 641b1000000000dc1102569b0080 (off)
-            # 641b1000000000dc110256e36490 (on)
-            if len(raw) >= 11:
-                decoded["device_id"] = int(raw[10])
-            if len(raw) >= 12:
-                decoded["sequence_or_counter"] = int(raw[11])
-            if len(raw) >= 13:
-                decoded["value_byte"] = int(raw[12])
-                decoded["level"] = decoded["value_byte"]
-            if len(raw) >= 14:
-                tail = int(raw[13])
-                decoded["tail_flag"] = tail
-                decoded["is_on_from_tail"] = bool(tail & 0x10)
-
-            if isinstance(decoded.get("device_id"), int):
-                value_byte = decoded.get("value_byte")
-                record_br: Dict[str, Any]
-                if isinstance(value_byte, int):
-                    record_br = self._decode_bulk_br(value_byte)
-                else:
-                    record_br = {"type": "single", "raw": None, "pct": None}
-                decoded["kind"] = "single"
-                decoded["records"] = [{
-                    "id": decoded["device_id"],
-                    "online": None,
-                    "br_raw": value_byte if isinstance(value_byte, int) else None,
-                    "br": record_br,
-                    "rgb": decoded.get("rgb") if isinstance(decoded.get("rgb"), list) else None,
-                    "value_byte": value_byte,
-                    "tail_flag": decoded.get("tail_flag"),
-                    "is_on_from_tail": decoded.get("is_on_from_tail"),
-                    "sequence_or_counter": decoded.get("sequence_or_counter"),
-                }]
-
-            return decoded
+            return self.decode_bledata_hex(hex_payload)
 
         def _apply_flag1_update(parsed: Dict[str, Any]) -> None:
             """Apply known flag=1 bleData updates into inventory runtime state."""
@@ -2498,729 +3808,24 @@ class PixieAuthHandler:
                 return
 
             ble_hex = payload.get("data")
-            decoded = _decode_ble_data(ble_hex)
+            decoded = self.decode_bledata_hex(ble_hex)
             if not decoded:
                 self._log_debug("BLE decode: unable to parse data field")
                 return
-
-            kind = decoded.get("kind")
-            self._log_debug("BLE apply: kind=%s hex_preview=%s", kind, ble_hex[:40] if ble_hex else "none")
-            records = decoded.get("records") if isinstance(decoded.get("records"), list) else []
-
-            if kind == "bulk":
-                self._log_debug("BLE decode (bulk): records=%s", len(records))
+            full_snapshot = False
+            if decoded.get("kind") == "bulk":
                 full_snapshot = self._awaiting_initial_gwdata_bulk
                 if full_snapshot:
                     self._awaiting_initial_gwdata_bulk = False
                 _update_ready_state(saw_bulk_bledata=True)
-                self._queue_bulk_ble_records(records, source="hub_gwdata", full_snapshot=full_snapshot)
-                if self.inventory:
-                    applied = self._apply_bulk_ble_records_to_inventory(
-                        records,
-                        source="hub_gwdata",
-                        full_snapshot=full_snapshot,
-                    )
-                    self._log_debug("Inventory bulk update: applied=%s", applied)
-                return
-
-            if kind == "timer_status":
-                if not self.inventory:
-                    return
-                first = records[0] if records else {}
-                dev_id = first.get("id")
-                timer_total = first.get("timer_total_seconds")
-                timer_remaining = first.get("timer_remaining_seconds")
-                if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
-                    import time as _time
-                    self.inventory.apply_device_update(
-                        dev_id,
-                        source="hub_update",
-                        timer_total_seconds=timer_total,
-                        timer_remaining_seconds=timer_remaining,
-                        last_timer_poll_at=_time.time(),
-                    )
-                    self._log_debug(
-                        "Timer status update: dev_id=%s total=%s remaining=%s",
-                        dev_id,
-                        timer_total,
-                        timer_remaining,
-                    )
-                    self._notify_inventory_updated()
-                return
-
-            if kind == "sensor_params":
-                if not self.inventory:
-                    return
-                dev_id = decoded.get("device_id")
-                if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
-                    self.inventory.apply_device_update(
-                        dev_id,
-                        source="hub_update",
-                        hold_time_seconds=decoded.get("hold_time_seconds"),
-                        brightness_threshold=decoded.get("brightness_threshold"),
-                        motion_sensitivity=decoded.get("motion_sensitivity"),
-                    )
-                    self._log_debug(
-                        "Sensor params update: dev_id=%s hold=%s bright=%s sens=%s",
-                        dev_id,
-                        decoded.get("hold_time_seconds"),
-                        decoded.get("brightness_threshold"),
-                        decoded.get("motion_sensitivity"),
-                    )
-                    self._notify_inventory_updated()
-                return
-
-            if kind == "gate_status":
-                if not self.inventory or not records:
-                    return
-                first = records[0]
-                dev_id = first.get("id")
-                door_index = first.get("gate_door")
-                door_state = first.get("door_state")
-                door_decoded = first.get("door_decoded")
-                if not isinstance(dev_id, int) or not isinstance(door_index, int) or not isinstance(door_state, int):
-                    return
-
-                rec = self.inventory.devices_by_id.get(dev_id)
-                if rec is None:
-                    return
-
-                previous = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
-                previous_motion_plan = rec.runtime.door1_motion_plan if door_index == 0 else rec.runtime.door2_motion_plan
-                updated_ms = int(time.time() * 1000)
-                if not isinstance(door_decoded, dict) or not door_decoded.get("known"):
-                    self._log_debug(
-                        "Gate unknown d36969 byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
-                        dev_id,
-                        door_index + 1,
-                        door_state,
-                        previous.get("state") if isinstance(previous, dict) else None,
-                        previous.get("position_percent") if isinstance(previous, dict) else None,
-                        previous.get("value_byte") if isinstance(previous, dict) else None,
-                    )
-
-                update_kwargs: Dict[str, Any] = {
-                    "online": 1,
-                    "presence": "online",
-                    "raw": {
-                        "hub_type": payload.get("type"),
-                        "hub_data": ble_hex,
-                        "hub_utc": payload.get("UTC"),
-                        "ble_decoded": decoded,
-                        "ble_interpreted": door_decoded,
-                    },
-                }
-                if door_index == 0:
-                    update_kwargs["door1_state"] = door_state
-                    if isinstance(door_decoded, dict) and door_decoded.get("known"):
-                        update_kwargs["door1_decoded"] = door_decoded
-                        update_kwargs["door1_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
-                        if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
-                            update_kwargs["door1_open_duration_ms"] = door_decoded.get("runtime_ms")
-                        elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
-                            update_kwargs["door1_close_duration_ms"] = door_decoded.get("runtime_ms")
-                elif door_index == 1:
-                    update_kwargs["door2_state"] = door_state
-                    if isinstance(door_decoded, dict) and door_decoded.get("known"):
-                        update_kwargs["door2_decoded"] = door_decoded
-                        update_kwargs["door2_motion_plan"] = build_gate_motion_plan(door_decoded, updated_ms)
-                        if door_decoded.get("state") == "opening" and door_decoded.get("position_raw") == 0:
-                            update_kwargs["door2_open_duration_ms"] = door_decoded.get("runtime_ms")
-                        elif door_decoded.get("state") == "closing" and door_decoded.get("position_raw") == 1000:
-                            update_kwargs["door2_close_duration_ms"] = door_decoded.get("runtime_ms")
-
-                if isinstance(door_decoded, dict) and not door_decoded.get("known"):
-                    if door_index == 0:
-                        update_kwargs["door1_motion_plan"] = previous_motion_plan
-                    else:
-                        update_kwargs["door2_motion_plan"] = previous_motion_plan
-
-                self.inventory.apply_device_update(
-                    dev_id,
-                    source="hub_update",
-                    updated_ms=updated_ms,
-                    **update_kwargs,
-                )
-                self._notify_inventory_updated()
-                return
-
-            if not records:
-                return
-
-            if not self.inventory:
-                return
-
-            first = records[0]
-            dev_id = first.get("id")
-            if not isinstance(dev_id, int):
-                return
-
-            rec = self.inventory.devices_by_id.get(dev_id)
-            if not rec:
-                self._log_debug("Inventory: unknown dev_id=%s (not in inventory)", dev_id)
-                return
-
-            value_byte = first.get("value_byte")
-            tail = first.get("tail_flag")
-            on_tail = first.get("is_on_from_tail")
-            if rec.capabilities.supports_timer:
-                self._log_debug(
-                    "TIMER bleData: dev_id=%s model=%s value=0x%02x tail=0x%02x",
-                    dev_id,
-                    rec.model_no,
-                    value_byte if isinstance(value_byte, int) else 0,
-                    tail if isinstance(tail, int) else 0,
-                )
-            self._log_debug(
-                "BLE decode: dev_id=%s seq=%s value=0x%02x tail=0x%02x on_tail=%s",
-                dev_id,
-                first.get("sequence_or_counter"),
-                value_byte if isinstance(value_byte, int) else 0,
-                tail if isinstance(tail, int) else 0,
-                on_tail,
-            )
-
-            prev_br = rec.runtime.br
-            prev_cct = rec.runtime.cct
-            prev_rgb = rec.runtime.rgb
-            prev_r = rec.runtime.r
-            prev_gate_decoded = {
-                0: rec.runtime.door1_decoded if isinstance(rec.runtime.door1_decoded, dict) else None,
-                1: rec.runtime.door2_decoded if isinstance(rec.runtime.door2_decoded, dict) else None,
-            }
-
-            interpreted = None
-            mode = None
-            rgb_from_packet = first.get("rgb") if isinstance(first.get("rgb"), list) else None
-            br_from_packet = decoded.get("brightness_0_100") if isinstance(decoded.get("brightness_0_100"), int) else None
-            update_kwargs: Dict[str, Any] = {
-                "online": 1,
-                "presence": "online",
-            }
-
-            if rgb_from_packet is not None:
-                update_kwargs["rgb"] = [int(rgb_from_packet[0]), int(rgb_from_packet[1]), int(rgb_from_packet[2])]
-                if br_from_packet is not None:
-                    update_kwargs["br"] = br_from_packet
-
-            mode_from_packet = first.get("mode")
-            relay_from_packet = first.get("relay")
-            motion_from_packet = first.get("motion")
-            if isinstance(mode_from_packet, int):
-                update_kwargs["mode"] = mode_from_packet
-            if isinstance(relay_from_packet, int):
-                update_kwargs["relay"] = relay_from_packet
-                update_kwargs["br"] = 100 if relay_from_packet else 0
-            if isinstance(motion_from_packet, bool):
-                update_kwargs["motion"] = motion_from_packet
-
-            if isinstance(value_byte, int):
-                interpreted = decode_value_byte(rec.model_no, value_byte)
-                self._log_debug(
-                    "BLE interpreted: model=%s mode=%s data=%s",
-                    rec.model_no,
-                    interpreted.get("mode"),
-                    json.dumps(interpreted, ensure_ascii=False, sort_keys=True),
-                )
-
-                mode = interpreted.get("mode")
-
-                if mode == "brightness":
-                    update_kwargs["br"] = interpreted.get("brightness_0_100")
-                elif mode == "dual_channel":
-                    left_on = bool(interpreted.get("left_on"))
-                    right_on = bool(interpreted.get("right_on"))
-                    if left_on and right_on:
-                        update_kwargs["r"] = 3
-                    elif left_on:
-                        update_kwargs["r"] = 1
-                    elif right_on:
-                        update_kwargs["r"] = 2
-                    else:
-                        update_kwargs["r"] = 0
-                elif mode == "plug_with_usb":
-                    relay_on = bool(interpreted.get("main_relay_on"))
-                    usb_on = bool(interpreted.get("usb_on"))
-                    update_kwargs["r"] = (1 if relay_on else 0) | (2 if usb_on else 0)
-                    update_kwargs["br"] = 100 if relay_on else 0
-                elif mode == "sensor_controller":
-                    mode_value = interpreted.get("mode_value")
-                    relay_on = interpreted.get("relay_on")
-                    motion = interpreted.get("motion")
-                    if isinstance(mode_value, int):
-                        update_kwargs["mode"] = mode_value
-                    if isinstance(relay_on, bool):
-                        update_kwargs["relay"] = 1 if relay_on else 0
-                        update_kwargs["br"] = 100 if relay_on else 0
-                    if isinstance(motion, bool):
-                        update_kwargs["motion"] = motion
-                elif mode == "contact_sensor":
-                    if isinstance(tail, int):
-                        decoded_contact = decode_contact_runtime_state(
-                            rec.model_no,
-                            value_byte,
-                            tail,
-                            prev_armed=rec.runtime.armed,
-                            prev_source=rec.runtime.last_source,
-                            allow_pulse=True,
-                        )
-                        if "armed" in decoded_contact:
-                            update_kwargs["armed"] = decoded_contact.get("armed")
-                        if "contact_active" in decoded_contact:
-                            update_kwargs["contact_active"] = decoded_contact.get("contact_active")
-                        update_kwargs["contact_momentary"] = bool(decoded_contact.get("pulse_event"))
-                elif mode == "timer_switch":
-                    timer_mode = interpreted.get("timer_mode")
-                    restarting = interpreted.get("restarting")
-                    self._log_debug(
-                        "TIMER interpreted: dev_id=%s value=0x%02x timer_mode=%s restart=%s",
-                        dev_id,
-                        value_byte,
-                        timer_mode,
-                        restarting,
-                    )
-                    if timer_mode == "timer":
-                        update_kwargs["mode"] = 1
-                        update_kwargs["br"] = 100
-                        # If mode changed to timer externally (was override/None),
-                        # or the light just turned on in timer mode externally,
-                        # estimate remaining = total and flag that a poll is needed.
-                        prev_mode = rec.runtime.mode
-                        prev_on = rec.runtime.is_on
-                        if prev_mode != 1 or (not prev_on and timer_mode == "timer"):
-                            import time as _time
-                            if rec.runtime.timer_total_seconds is not None:
-                                update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
-                            update_kwargs["last_timer_poll_at"] = _time.time()
-                            update_kwargs["timer_needs_poll"] = True
-                    elif timer_mode == "override":
-                        update_kwargs["mode"] = 2
-                        update_kwargs["br"] = 100
-                    elif timer_mode is None:
-                        # Light is off — only update br; keep the last known mode
-                        # so the select entity doesn't flip to "unknown"
-                        update_kwargs["br"] = 0
-                    if restarting:
-                        # Reset local countdown estimation so the sensor shows
-                        # the full duration immediately, and flag for an early poll.
-                        import time as _time
-                        if rec.runtime.timer_total_seconds is not None:
-                            update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
-                        update_kwargs["last_timer_poll_at"] = _time.time()
-                        update_kwargs["timer_needs_poll"] = True
-                elif mode == "tunable_white":
-                    brightness = interpreted.get("brightness_0_100")
-                    if isinstance(brightness, int):
-                        update_kwargs["br"] = brightness
-                    if isinstance(tail, int):
-                        update_kwargs["cct"] = tail
-                elif mode == "color_effect":
-                    if isinstance(tail, int):
-                        decoded_color = decode_color_runtime_state(rec.model_no, value_byte, tail)
-                        brightness = decoded_color.get("brightness_0_100")
-                        if isinstance(brightness, int):
-                            update_kwargs["br"] = brightness
-                        if "effect" in decoded_color:
-                            update_kwargs["effect"] = decoded_color.get("effect")
-                        if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
-                            update_kwargs["rgb"] = [int(channel) for channel in decoded_color["rgb"]]
-                elif mode == "gate":
-                    # Gate device: value_byte = door1 position, tail = door2 position
-                    if isinstance(value_byte, int):
-                        update_kwargs["door1_state"] = value_byte
-                        door1_decoded = decode_gate_state_byte(0, value_byte)
-                        if door1_decoded.get("known"):
-                            update_kwargs["door1_decoded"] = door1_decoded
-                            now_ms = int(time.time() * 1000)
-                            motion_plan = sync_gate_motion_plan(
-                                rec.runtime.door1_motion_plan,
-                                door1_decoded,
-                                now_ms,
-                            )
-                            if motion_plan is None:
-                                learned_duration_ms = (
-                                    rec.runtime.door1_open_duration_ms
-                                    if door1_decoded.get("state") == "opening"
-                                    else rec.runtime.door1_close_duration_ms
-                                )
-                                motion_plan = build_gate_motion_plan_from_learned_duration(
-                                    door1_decoded,
-                                    now_ms,
-                                    learned_duration_ms,
-                                )
-                            update_kwargs["door1_motion_plan"] = motion_plan
-                    if isinstance(tail, int) and rec.capabilities.gate_doors >= 2:
-                        update_kwargs["door2_state"] = tail
-                        door2_decoded = decode_gate_state_byte(1, tail)
-                        if door2_decoded.get("known"):
-                            update_kwargs["door2_decoded"] = door2_decoded
-                            now_ms = int(time.time() * 1000)
-                            motion_plan = sync_gate_motion_plan(
-                                rec.runtime.door2_motion_plan,
-                                door2_decoded,
-                                now_ms,
-                            )
-                            if motion_plan is None:
-                                learned_duration_ms = (
-                                    rec.runtime.door2_open_duration_ms
-                                    if door2_decoded.get("state") == "opening"
-                                    else rec.runtime.door2_close_duration_ms
-                                )
-                                motion_plan = build_gate_motion_plan_from_learned_duration(
-                                    door2_decoded,
-                                    now_ms,
-                                    learned_duration_ms,
-                                )
-                            update_kwargs["door2_motion_plan"] = motion_plan
-                elif mode == "raw":
-                    # Raw on/off-only models use the value byte directly.
-                    # Keep tail-derived fields for debugging only until their
-                    # protocol meaning is understood.
-                    if (
-                        rec.capabilities.supports_onoff
-                        and not rec.capabilities.supports_dimming
-                        and not rec.capabilities.supports_multi_channel
-                        and not rec.capabilities.supports_usb_subentity
-                        and not rec.capabilities.supports_cover
-                        and isinstance(value_byte, int)
-                    ):
-                        update_kwargs["br"] = 100 if value_byte > 0 else 0
-
-            update_kwargs["raw"] = {
-                "hub_type": payload.get("type"),
-                "hub_data": ble_hex,
-                "hub_utc": payload.get("UTC"),
-                "ble_decoded": decoded,
-                "ble_interpreted": interpreted,
-            }
-            updated_runtime = self.inventory.apply_device_update(
-                dev_id,
+            self.apply_bledata_hex(
+                ble_hex,
+                payload_meta=payload,
                 source="hub_update",
-                **update_kwargs,
+                bulk_source="hub_gwdata",
+                full_snapshot=full_snapshot,
+                queue_bulk=decoded.get("kind") == "bulk",
             )
-            if mode == "gate":
-                for door_index, raw_state, decoded_state in (
-                    (0, value_byte if isinstance(value_byte, int) else None, update_kwargs.get("door1_decoded")),
-                    (1, tail if isinstance(tail, int) else None, update_kwargs.get("door2_decoded")),
-                ):
-                    if isinstance(raw_state, int) and (not isinstance(decoded_state, dict)):
-                        previous = prev_gate_decoded.get(door_index)
-                        self._log_debug(
-                            "Gate unknown bleData byte: dev_id=%s door=%s raw=0x%02x prev_state=%s prev_pos=%s prev_raw=%s",
-                            dev_id,
-                            door_index + 1,
-                            raw_state,
-                            previous.get("state") if isinstance(previous, dict) else None,
-                            previous.get("position_percent") if isinstance(previous, dict) else None,
-                            previous.get("value_byte") if isinstance(previous, dict) else None,
-                        )
-            if updated_runtime is None:
-                return
-
-            if rec.capabilities.supports_timer:
-                self._log_debug(
-                    "TIMER state after update: dev_id=%s br=%s mode=%s is_on=%s total=%s remaining=%s",
-                    dev_id,
-                    updated_runtime.br,
-                    updated_runtime.mode,
-                    updated_runtime.is_on,
-                    updated_runtime.timer_total_seconds,
-                    updated_runtime.timer_remaining_seconds,
-                )
-
-            self._notify_inventory_updated()
-
-            summary_parts = []
-            if rgb_from_packet is not None:
-                summary_parts.append(f"rgb {prev_rgb}->{updated_runtime.rgb}")
-                if br_from_packet is not None:
-                    summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
-            elif interpreted and interpreted.get("mode") == "brightness":
-                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
-            elif interpreted and interpreted.get("mode") == "dual_channel":
-                summary_parts.append(f"r {prev_r}->{updated_runtime.r}")
-                summary_parts.append(f"channel={interpreted.get('channel_state')}")
-            elif interpreted and interpreted.get("mode") == "raw" and isinstance(on_tail, bool):
-                summary_parts.append(f"on_tail={on_tail}")
-                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
-            elif interpreted and interpreted.get("mode") == "tunable_white":
-                summary_parts.append(f"br {prev_br}->{updated_runtime.br}")
-                summary_parts.append(f"cct {prev_cct}->{updated_runtime.cct}")
-            else:
-                summary_parts.append(f"value={value_byte}")
-
-            self._log_debug(
-                "Inventory update: id=%s name=%s %s src=hub_update",
-                rec.id,
-                rec.name,
-                ", ".join(summary_parts),
-            )
-
-        def _apply_local_command_optimistic_update(
-            device_id: int,
-            value: Any,
-            command_hex: str,
-            *,
-            target: str,
-            opcode_name: str,
-            brightness_level: Optional[int] = None,
-            rgb_color: Optional[Tuple[int, int, int]] = None,
-            effect_name: Optional[str] = None,
-            effect_speed: Optional[int] = None,
-            cover_button_position: Optional[int] = None,
-        ) -> None:
-            """Apply an optimistic state update immediately after local command send.
-
-            Args:
-                device_id: Device to update
-                value: bool for on/off commands, int (0-100) for brightness
-                command_hex: Hex string of command sent
-                target: Command target (relay, usb, left, right, both, brightness)
-                opcode_name: Opcode name for logging
-
-            Hub-originated bleData updates remain authoritative and will overwrite
-            this optimistic snapshot via _apply_flag1_update.
-            """
-            if not self.inventory:
-                return
-
-            rec = self.inventory.devices_by_id.get(int(device_id))
-            if not rec:
-                self._log_debug("Inventory optimistic update skipped: unknown dev_id=%s", device_id)
-                return
-
-            prev_br = rec.runtime.br
-            prev_cct = rec.runtime.cct
-            prev_rgb = rec.runtime.rgb
-            prev_effect = rec.runtime.effect
-            prev_effect_speed = rec.runtime.effect_speed
-            prev_r = rec.runtime.r
-            prev_source = rec.runtime.last_source
-            update_kwargs: Dict[str, Any] = {}
-
-            def _remembered_turn_on_brightness() -> int:
-                for candidate in (rec.runtime.last_nonzero_br, rec.runtime.br):
-                    if isinstance(candidate, int) and candidate > 0:
-                        return max(1, min(100, candidate))
-                return 100
-
-            # Handle brightness/color/effect commands
-            if target == "brightness":
-                if isinstance(value, int):
-                    update_kwargs["br"] = value
-            elif target == "color":
-                if isinstance(brightness_level, int):
-                    update_kwargs["br"] = brightness_level
-                if rgb_color is not None:
-                    update_kwargs["rgb"] = [int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2])]
-                update_kwargs["effect"] = None
-            elif target == "color_temp":
-                if isinstance(brightness_level, int):
-                    update_kwargs["br"] = brightness_level
-                update_kwargs["cct"] = int(value) if value is not None else None
-                update_kwargs["effect"] = None
-            elif target == "effect":
-                if isinstance(brightness_level, int):
-                    update_kwargs["br"] = brightness_level
-                update_kwargs["effect"] = effect_name
-                update_kwargs["effect_speed"] = effect_speed
-            elif target == "speed":
-                if isinstance(brightness_level, int):
-                    update_kwargs["br"] = brightness_level
-                update_kwargs["effect"] = effect_name
-                update_kwargs["effect_speed"] = effect_speed
-            elif target == "cover":
-                # Cover commands are button presses, not authoritative state updates.
-                pass
-            elif target == "timer_relay":
-                update_kwargs["br"] = 100 if value else 0
-                if value:
-                    update_kwargs["mode"] = 1  # Timer mode on turn-on; on turn-off leave mode unchanged
-            elif target == "timer_override":
-                update_kwargs["br"] = 100
-                update_kwargs["mode"] = 2  # Override mode
-            elif target == "timer_restart":
-                update_kwargs["br"] = 100
-                update_kwargs["mode"] = 1  # Timer mode
-                # Reset local countdown estimation
-                update_kwargs["timer_remaining_seconds"] = rec.runtime.timer_total_seconds
-            elif target == "timer_mode":
-                mode_value = int(value) if value is not None else 1
-                update_kwargs["mode"] = mode_value
-                if mode_value == 2:
-                    update_kwargs["br"] = 100
-                elif mode_value == 1:
-                    update_kwargs["br"] = 100
-            elif target == "timer_duration":
-                pass  # Duration changes are confirmed by hub response
-            elif target == "hold_time":
-                update_kwargs["hold_time_seconds"] = int(value) if value is not None else None
-            elif target == "brightness_threshold":
-                update_kwargs["brightness_threshold"] = int(value) if value is not None else None
-            elif target == "motion_sensitivity":
-                update_kwargs["motion_sensitivity"] = int(value) if value is not None else None
-            elif target == "timer_poll_stamp":
-                # Record poll timestamp for countdown estimation
-                import time as _time
-                update_kwargs["last_timer_poll_at"] = _time.time()
-            elif target == "mode":
-                # Sensor mode commands normalize switch/manual to mode 0 and default relay to off.
-                mode_value = int(value)
-                update_kwargs["mode"] = mode_value
-                update_kwargs["relay"] = 0
-                update_kwargs["motion"] = False
-                update_kwargs["br"] = 0
-            elif target == "arm":
-                update_kwargs["armed"] = bool(value)
-                update_kwargs["contact_momentary"] = False
-                if value:
-                    update_kwargs["contact_active"] = False
-                else:
-                    update_kwargs["contact_active"] = None
-            elif target == "relay" and rec.capabilities.supports_sensor:
-                # Sensor-family manual light control uses relay in switch mode.
-                update_kwargs["mode"] = 0
-                update_kwargs["relay"] = 1 if value else 0
-                update_kwargs["motion"] = False
-                update_kwargs["br"] = 100 if value else 0
-            elif rec.capabilities.supports_dimming:
-                update_kwargs["br"] = _remembered_turn_on_brightness() if value else 0
-            elif rec.model_no == "0107":
-                # 0107 fallback can start cloud-only with br and no USB detail.
-                if isinstance(rec.runtime.r, int):
-                    current_relay_on = bool(rec.runtime.r & 0x01)
-                    current_usb_on = bool(rec.runtime.r & 0x02)
-                elif isinstance(rec.runtime.br, int):
-                    current_relay_on = rec.runtime.br > 0
-                    current_usb_on = False
-                else:
-                    current_relay_on = False
-                    current_usb_on = False
-
-                if target == "usb":
-                    next_relay_on = current_relay_on
-                    next_usb_on = value
-                else:
-                    next_relay_on = value
-                    next_usb_on = current_usb_on
-
-                update_kwargs["r"] = (1 if next_relay_on else 0) | (2 if next_usb_on else 0)
-                update_kwargs["br"] = 100 if next_relay_on else 0
-            else:
-                update_kwargs["br"] = 100 if value else 0
-
-            if target in ("left", "right", "both"):
-                current_r = rec.runtime.r if isinstance(rec.runtime.r, int) else 0
-                if target == "left":
-                    if value:
-                        update_kwargs["r"] = current_r | 0x01
-                    else:
-                        update_kwargs["r"] = current_r & ~0x01
-                elif target == "right":
-                    if value:
-                        update_kwargs["r"] = current_r | 0x02
-                    else:
-                        update_kwargs["r"] = current_r & ~0x02
-                else:
-                    update_kwargs["r"] = 3 if value else 0
-
-            update_kwargs["raw"] = {
-                "local_command": {
-                    "opcode": opcode_name,
-                    "device_id": int(device_id),
-                    "target": target,
-                    "requested_state": (
-                        f"{value}"
-                        if target in ("brightness", "color", "color_temp", "effect", "speed", "cover", "mode")
-                        else ("on" if value else "off")
-                    ),
-                    "command_hex": command_hex,
-                    "brightness_level": brightness_level,
-                    "cct": update_kwargs.get("cct"),
-                    "rgb_color": list(rgb_color) if rgb_color is not None else None,
-                    "effect_name": effect_name,
-                    "effect_speed": effect_speed,
-                    "cover_button_position": cover_button_position,
-                    "pending_verification": True,
-                }
-            }
-            updated_runtime = self.inventory.apply_device_update(
-                device_id,
-                source="local_command_optimistic",
-                **update_kwargs,
-            )
-            if updated_runtime is None:
-                return
-
-            prev_mode = rec.runtime.mode
-            prev_relay = rec.runtime.relay
-            prev_motion = rec.runtime.motion
-            prev_armed = rec.runtime.armed
-            prev_contact = rec.runtime.contact_active
-            
-            summary_parts = [
-                f"br {prev_br}->{updated_runtime.br}",
-                f"cct {prev_cct}->{updated_runtime.cct}",
-                f"rgb {prev_rgb}->{updated_runtime.rgb}",
-                f"effect {prev_effect}->{updated_runtime.effect}",
-                f"speed {prev_effect_speed}->{updated_runtime.effect_speed}",
-                f"r {prev_r}->{updated_runtime.r}",
-            ]
-            if prev_mode != updated_runtime.mode:
-                summary_parts.append(f"mode {prev_mode}->{updated_runtime.mode}")
-            if prev_relay != updated_runtime.relay:
-                summary_parts.append(f"relay {prev_relay}->{updated_runtime.relay}")
-            if prev_motion != updated_runtime.motion:
-                summary_parts.append(f"motion {prev_motion}->{updated_runtime.motion}")
-            if prev_armed != updated_runtime.armed:
-                summary_parts.append(f"armed {prev_armed}->{updated_runtime.armed}")
-            if prev_contact != updated_runtime.contact_active:
-                summary_parts.append(f"contact {prev_contact}->{updated_runtime.contact_active}")
-            
-            self._log_debug(
-                "Inventory optimistic update: id=%s name=%s %s src %s->%s",
-                rec.id,
-                rec.name,
-                " ".join(summary_parts),
-                prev_source,
-                updated_runtime.last_source,
-            )
-
-        def _default_brightness_percent(rec: Optional[Any]) -> int:
-            if rec and isinstance(rec.runtime.br, int):
-                return max(0, min(100, int(rec.runtime.br)))
-            return 100
-
-        def _default_effect_name(rec: Optional[Any]) -> Optional[str]:
-            if rec and isinstance(rec.runtime.effect, str):
-                normalized = rec.runtime.effect.strip().lower()
-                if normalized:
-                    return normalized
-            return None
-
-        def _default_effect_speed(rec: Optional[Any]) -> int:
-            return 0x04
-
-        def _send_edit_sequence(command_list, from_email):
-            """Send a list of (hex, repeat) edit-mode commands with 200 ms delays.
-
-            Used before parameter changes (timer set-duration, sensor hold time /
-            brightness / sensitivity) so the hub has time to process each command
-            before the next one arrives.
-            """
-            for ch, repeat in command_list:
-                cmd_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=ch,
-                    from_email=from_email,
-                    repeat=repeat,
-                )
-                self._log_debug("Edit sequence cmd hex: %s", ch)
-                sock.sendall(cmd_debug["base64"].encode("utf-8"))
-                if runtime_session is not None:
-                    runtime_session.mark_command_sent()
-                _drain_incoming()
-                time.sleep(0.2)
 
         def _send_requested_local_command(
             *,
@@ -3270,321 +3875,44 @@ class PixieAuthHandler:
             if not sender_identity:
                 raise PixieAuthError("No sender identity available for local command")
 
-            is_cover_cmd = command_cover_action is not None
-            is_effect_cmd = command_effect is not None
-            is_color_cmd = command_color_rgb is not None
-            is_color_temp_cmd = command_color_temp_cct is not None
-            is_brightness_cmd = (
-                (command_brightness is not None)
-                and not is_color_cmd
-                and not is_color_temp_cmd
-                and not is_effect_cmd
-                and not is_cover_cmd
-            )
-            is_mode_cmd = command_mode is not None
-            state_byte_used = None
+            command_kwargs = {
+                "command_device_id": command_device_id,
+                "command_state": command_state,
+                "command_brightness": command_brightness,
+                "command_color_rgb": command_color_rgb,
+                "command_color_temp_cct": command_color_temp_cct,
+                "command_effect": command_effect,
+                "command_target": command_target,
+                "command_mode": command_mode,
+                "command_cover_action": command_cover_action,
+                "command_cover_action_map": command_cover_action_map,
+                "command_cover_tilt_action_map": command_cover_tilt_action_map,
+                "command_timer_action": command_timer_action,
+                "command_timer_duration": command_timer_duration,
+                "command_sensor_param": command_sensor_param,
+                "command_sensor_param_value": command_sensor_param_value,
+                "command_gate_door": command_gate_door,
+            }
+            plan = self.build_core_command_plan(command_kwargs)
 
-            rec = None
-            if self.inventory:
-                rec = self.inventory.devices_by_id.get(int(command_device_id))
-
-            if is_color_cmd and rec and not rec.capabilities.supports_color:
-                raise PixieAuthError(f"Model {rec.model_no} does not support color")
-
-            if is_color_temp_cmd and rec and not rec.capabilities.supports_color_temp:
-                raise PixieAuthError(f"Model {rec.model_no} does not support color temperature")
-
-            if is_cover_cmd and rec and not rec.capabilities.supports_cover:
-                raise PixieAuthError(f"Model {rec.model_no} does not support cover commands")
-
-            if is_mode_cmd and rec and not rec.capabilities.supports_sensor and not rec.capabilities.supports_timer:
-                raise PixieAuthError(f"Model {rec.model_no} does not support mode commands")
-
-            if is_mode_cmd and rec and rec.capabilities.supports_sensor:
-                allowed_sensor_modes = get_supported_sensor_mode_values(rec.model_no)
-                requested_sensor_mode = int(command_mode)
-                if requested_sensor_mode not in allowed_sensor_modes:
-                    raise PixieAuthError(
-                        f"Mode {requested_sensor_mode} not allowed for model {rec.model_no}: {allowed_sensor_modes}"
-                    )
-
-            if is_effect_cmd and rec:
-                allowed_effects = rec.capabilities.effect_names or get_model_effect_names(rec.model_no)
-                if not allowed_effects:
-                    raise PixieAuthError(f"Model {rec.model_no} does not support effects")
-                if not rec.capabilities.effect_command_encoding:
-                    raise PixieAuthError(f"Model {rec.model_no} supports effects but has no effect command encoding")
-                if command_effect.strip().lower() not in allowed_effects:
-                    raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
-
-            # ── Gate (1217) command dispatch ──
-            is_gate_cmd = (
-                command_cover_action is not None
-                and rec
-                and rec.capabilities.supports_gate
-            )
-            if is_gate_cmd:
-                door_index = command_gate_door if command_gate_door is not None else 0
-                gate_state = rec.runtime.door1_decoded if door_index == 0 else rec.runtime.door2_decoded
-                if not gate_can_run_action(gate_state, command_cover_action):
-                    gate_state_name = gate_state.get("state") if isinstance(gate_state, dict) else "unknown"
-                    next_action = gate_state.get("next_action") if isinstance(gate_state, dict) else None
-                    raise PixieAuthError(
-                        f"Gate action '{command_cover_action}' is not allowed for door {door_index + 1} while state is {gate_state_name}"
-                        + (f" (next action: {next_action})" if next_action else "")
-                    )
-                command_hex = self._build_gate_command_hex(command_device_id, door_index)
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                    repeat=1,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending gate command: dev_id=%s door=%s action=%s opcode=f96b69",
-                    command_device_id,
-                    door_index,
-                    command_cover_action,
-                )
-                if self.verbose:
-                    self._print_local_command_debug(command_debug)
-                command_parsed = _parse_message(command_b64, extracted_key)
-                command_route, command_match = _classify_message("out", command_parsed)
-                _log_message("out", command_parsed, command_route, command_match)
-                sock.sendall(command_b64.encode("utf-8"))
-                if runtime_session is not None:
-                    runtime_session.mark_command_sent()
-                _drain_incoming()
-                return {"target": "gate", "device_id": command_device_id, "door": door_index}
-
-            # ── Sensor (3001/3002) poll dispatch ──
-            if command_timer_action == "poll" and rec and rec.capabilities.supports_sensor:
-                command_hex = self._build_sensor_poll_command_hex(command_device_id)
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                    repeat=1,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug("Sending sensor poll: dev_id=%s opcode=f96b69", command_device_id)
-                if self.verbose:
-                    self._print_local_command_debug(command_debug)
-                command_parsed = _parse_message(command_b64, extracted_key)
-                command_route, command_match = _classify_message("out", command_parsed)
-                _log_message("out", command_parsed, command_route, command_match)
-                sock.sendall(command_b64.encode("utf-8"))
-                if runtime_session is not None:
-                    runtime_session.mark_command_sent()
-                _drain_incoming()
-                return {"target": "sensor_poll", "device_id": command_device_id}
-
-            # ── Sensor (3001/3002) parameter command dispatch ──
-            if command_sensor_param is not None and rec and rec.capabilities.supports_sensor:
-                param_map = {
-                    "hold_time": 5,
-                    "brightness_threshold": 4,
-                    "motion_sensitivity": 2,
-                }
-                param_id = param_map.get(command_sensor_param)
-                if param_id is None:
-                    raise PixieAuthError(f"Unknown sensor param: {command_sensor_param}")
-                if command_sensor_param_value is None:
-                    raise PixieAuthError(f"Missing value for sensor param: {command_sensor_param}")
-
-                # Enter edit mode before changing parameters (same 3-command
-                # sequence the app uses), then send the parameter change.
-                ka = {"counter_attr": "_timer_command_counter", "minimum_counter": 0x01}
-                edit_list: list[tuple[str, int]] = [
-                    (self._build_shifted_prefix_command_hex(
-                        command_device_id, opcode=b"\xd9\x6b\x69", payload=b"\x77\x00", **ka,
-                    ), 1),
-                    (self._build_shifted_prefix_command_hex(
-                        command_device_id, opcode=b"\xf9\x6b\x69", payload=b"\x01\x00" + b"\x00" * 8, **ka,
-                    ), 1),
-                    (self._build_shifted_prefix_command_hex(
-                        command_device_id, opcode=b"\xfd\x6b\x69", payload=b"\x10\x00", **ka,
-                    ), 1),
-                ]
-                _send_edit_sequence(edit_list, sender_identity)
-
-                command_hex = self._build_sensor_param_command_hex(
-                    command_device_id, param_id, command_sensor_param_value
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending sensor param: dev_id=%s param=%s(%s) value=%s opcode=d26c69",
-                    command_device_id,
-                    command_sensor_param,
-                    param_id,
-                    command_sensor_param_value,
-                )
-                if self.verbose:
-                    self._print_local_command_debug(command_debug)
-
-                command_parsed = _parse_message(command_b64, extracted_key)
-                command_route, command_match = _classify_message("out", command_parsed)
-                _log_message("out", command_parsed, command_route, command_match)
-                sock.sendall(command_b64.encode("utf-8"))
-                if runtime_session is not None:
-                    runtime_session.mark_command_sent()
-                _drain_incoming()
-
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    command_sensor_param_value,
-                    command_hex,
-                    target=command_sensor_param,
-                    opcode_name="d26c69",
-                )
-                return {"target": command_sensor_param, "device_id": command_device_id}
-
-            # ── Contact sensor (3012) arm/disarm dispatch ──
-            if command_state is not None and rec and rec.capabilities.supports_contact_sensor:
-                effective_target = self._resolve_command_target_for_device(
-                    command_device_id,
-                    command_target,
-                )
-                if effective_target != "arm":
-                    raise PixieAuthError(f"Unsupported command target for contact sensor: {effective_target}")
-
-                command_hex = self._build_contact_arm_command_hex(command_device_id, armed=bool(command_state))
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending contact sensor arm command: device_id=%s state=%s opcode=ca6b69",
-                    command_device_id,
-                    "armed" if command_state else "disarmed",
-                )
-                if self.verbose:
-                    self._log_debug("Contact sensor arm command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-
-                command_parsed = _parse_message(command_b64, extracted_key)
-                command_route, command_match = _classify_message("out", command_parsed)
-                _log_message("out", command_parsed, command_route, command_match)
-                sock.sendall(command_b64.encode("utf-8"))
-                if runtime_session is not None:
-                    runtime_session.mark_command_sent()
-
-                _drain_incoming()
-
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    command_state,
-                    command_hex,
-                    target="arm",
-                    opcode_name="ca6b69",
-                )
-                return {"target": "arm", "device_id": command_device_id}
-
-            # ── Timer switch (2113) command dispatch ──
-            is_timer_cmd = rec and rec.capabilities.supports_timer and (
-                command_timer_action is not None
-                or command_timer_duration is not None
-                or (is_mode_cmd and not rec.capabilities.supports_sensor)
-                or (command_state is not None and not is_cover_cmd and not is_effect_cmd and not is_color_cmd and not is_brightness_cmd and not is_mode_cmd)
-            )
-
-            if is_timer_cmd:
-                self._log_debug(
-                    "TIMER dispatch: dev_id=%s action=%s state=%s mode=%s duration=%s",
-                    command_device_id,
-                    command_timer_action,
-                    command_state,
-                    command_mode,
-                    command_timer_duration,
-                )
-                if command_timer_action == "restart":
-                    command_hex = self._build_timer_restart_command_hex(command_device_id)
-                    self._log_debug("Sending timer restart command: device_id=%s opcode=c16969", command_device_id)
-                elif command_timer_action == "override":
-                    command_hex = self._build_timer_override_command_hex(command_device_id)
-                    self._log_debug("Sending timer override command: device_id=%s opcode=c16969", command_device_id)
-                elif command_timer_action == "set_duration":
-                    duration = int(command_timer_duration) if command_timer_duration is not None else 60
-                    command_hex_list = self._build_timer_set_duration_commands(command_device_id, duration)
-                    self._log_debug(
-                        "Sending timer set-duration sequence (%s commands): device_id=%s duration=%s",
-                        len(command_hex_list),
-                        command_device_id,
-                        duration,
-                    )
-                    _send_edit_sequence(command_hex_list, sender_identity)
-                    # Wait for the save to take effect, then poll for the new value
-                    time.sleep(0.1)
-                    # Send a poll after save to read back the updated timer_total_seconds
-                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
-                    poll_debug = self._build_local_bledata_command_debug(
-                        key=extracted_key,
-                        command_hex=poll_hex,
-                        from_email=sender_identity,
-                        repeat=1,
-                    )
-                    sock.sendall(poll_debug["base64"].encode("utf-8"))
-                    if runtime_session is not None:
-                        runtime_session.mark_command_sent()
-                    _drain_incoming()
-
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        duration,
-                        "",
-                        target="timer_duration",
-                        opcode_name="c46969",
-                    )
-                    return {"target": "timer_duration", "device_id": command_device_id}
-                elif command_timer_action == "poll":
-                    command_hex = self._build_timer_poll_command_hex(command_device_id)
-                    self._log_debug("Sending timer poll command: device_id=%s opcode=f96b69", command_device_id)
-                    # Stamp poll time before send so the sensor can estimate elapsed time
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        None,
-                        command_hex,
-                        target="timer_poll_stamp",
-                        opcode_name="f96b69",
-                    )
-                elif command_mode is not None:
-                    # Mode switch: mode=1→timer, mode=2→override
-                    if command_mode == 2:
-                        command_hex = self._build_timer_override_command_hex(command_device_id)
-                        self._log_debug("Sending timer mode switch (override): device_id=%s", command_device_id)
+            for packet in plan.packets:
+                if packet.log_message:
+                    if packet.log_args:
+                        self._log_debug(packet.log_message, *packet.log_args)
+                    elif "%s" in packet.log_message:
+                        self._log_debug(packet.log_message, packet.command_hex)
                     else:
-                        # Mode=timer: turn on with timer mode (ed6969)
-                        command_hex = self._build_timer_onoff_command_hex(command_device_id, is_on=True)
-                        self._log_debug("Sending timer mode switch (timer, light on): device_id=%s", command_device_id)
-                elif command_state is not None:
-                    command_hex = self._build_timer_onoff_command_hex(command_device_id, is_on=command_state)
-                    self._log_debug(
-                        "Sending timer on/off command: device_id=%s state=%s opcode=ed6969",
-                        command_device_id,
-                        "on" if command_state else "off",
-                    )
-                else:
-                    # Fallback: treat as poll
-                    command_hex = self._build_timer_poll_command_hex(command_device_id)
+                        self._log_debug(packet.log_message)
 
-                cmd_repeat = 1 if command_timer_action == "poll" else 0
                 command_debug = self._build_local_bledata_command_debug(
                     key=extracted_key,
-                    command_hex=command_hex,
+                    command_hex=packet.command_hex,
                     from_email=sender_identity,
-                    repeat=cmd_repeat,
+                    repeat=packet.tcp_repeat,
                 )
                 command_b64 = command_debug["base64"]
                 if self.verbose:
-                    self._log_debug("Timer command hex: %s", command_hex)
+                    self._log_debug("Core command hex: %s", packet.command_hex)
                     self._print_local_command_debug(command_debug)
 
                 command_parsed = _parse_message(command_b64, extracted_key)
@@ -3593,386 +3921,13 @@ class PixieAuthHandler:
                 sock.sendall(command_b64.encode("utf-8"))
                 if runtime_session is not None:
                     runtime_session.mark_command_sent()
-
                 _drain_incoming()
+                if packet.delay_after:
+                    time.sleep(packet.delay_after)
 
-                if command_timer_action == "restart":
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        True,
-                        command_hex,
-                        target="timer_restart",
-                        opcode_name="c16969",
-                    )
-
-                    # After restart, poll immediately for fresh countdown
-                    time.sleep(0.2)
-                    _drain_incoming()
-                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
-                    poll_debug = self._build_local_bledata_command_debug(
-                        key=extracted_key,
-                        command_hex=poll_hex,
-                        from_email=sender_identity,
-                        repeat=1,
-                    )
-                    sock.sendall(poll_debug["base64"].encode("utf-8"))
-                    if runtime_session is not None:
-                        runtime_session.mark_command_sent()
-                    _drain_incoming()
-                    return {"target": "timer_restart", "device_id": command_device_id}
-                if command_timer_action == "override":
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        True,
-                        command_hex,
-                        target="timer_override",
-                        opcode_name="c16969",
-                    )
-                    return {"target": "timer_override", "device_id": command_device_id}
-                if command_timer_action == "poll":
-                    return {"target": "timer_poll", "device_id": command_device_id}
-                if command_mode is not None:
-                    # After switching to timer mode (mode=1), poll for countdown.
-                    if command_mode == 1:
-                        time.sleep(0.2)
-                        _drain_incoming()
-                        poll_hex = self._build_timer_poll_command_hex(command_device_id)
-                        poll_debug = self._build_local_bledata_command_debug(
-                            key=extracted_key,
-                            command_hex=poll_hex,
-                            from_email=sender_identity,
-                            repeat=1,
-                        )
-                        sock.sendall(poll_debug["base64"].encode("utf-8"))
-                        if runtime_session is not None:
-                            runtime_session.mark_command_sent()
-                        _drain_incoming()
-
-                    _apply_local_command_optimistic_update(
-                        command_device_id,
-                        int(command_mode),
-                        command_hex,
-                        target="timer_mode",
-                        opcode_name="ed6969" if command_mode == 1 else "c16969",
-                    )
-                    return {"target": "timer_mode", "device_id": command_device_id}
-                # After turning on in timer mode, poll for initial countdown.
-                # Brief delay so the hub finishes processing the turn-on first.
-                if command_state:
-                    time.sleep(0.2)
-                    _drain_incoming()
-                    poll_hex = self._build_timer_poll_command_hex(command_device_id)
-                    self._log_debug(
-                        "TIMER post-on poll: dev_id=%s hex=%s",
-                        command_device_id,
-                        poll_hex,
-                    )
-                    poll_debug = self._build_local_bledata_command_debug(
-                        key=extracted_key,
-                        command_hex=poll_hex,
-                        from_email=sender_identity,
-                        repeat=1,
-                    )
-                    sock.sendall(poll_debug["base64"].encode("utf-8"))
-                    if runtime_session is not None:
-                        runtime_session.mark_command_sent()
-                    _drain_incoming()
-
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    command_state,
-                    command_hex,
-                    target="timer_relay",
-                    opcode_name="ed6969",
-                )
-                return {"target": "timer_relay", "device_id": command_device_id}
-
-            if is_effect_cmd:
-                effect_name = command_effect.strip().lower()
-                effect_speed = _default_effect_speed(rec)
-                effect_brightness = _default_brightness_percent(rec)
-            else:
-                effect_name = None
-                effect_speed = None
-                effect_brightness = None
-
-            if is_cover_cmd:
-                normalized_cover_action = command_cover_action.strip().lower().replace("-", "_")
-                cover_button_position = resolve_cover_command_position(
-                    normalized_cover_action,
-                    action_mapping=command_cover_action_map,
-                    tilt_mapping=command_cover_tilt_action_map,
-                )
-                if cover_button_position is None:
-                    raise PixieAuthError(
-                        f"No manual button mapping configured for cover action '{normalized_cover_action}'"
-                    )
-                command_hex = self._build_cover_press_command_hex(
-                    command_device_id,
-                    button_position=cover_button_position,
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending local cover command: device_id=%s action=%s button_position=%s opcode=c16969",
-                    command_device_id,
-                    normalized_cover_action,
-                    cover_button_position,
-                )
-                if self.verbose:
-                    self._log_debug("Cover command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            elif is_effect_cmd:
-                command_hex = self._build_effect_command_hex(
-                    command_device_id,
-                    effect_name=effect_name,
-                    effect_speed=effect_speed,
-                    brightness_level=effect_brightness,
-                    capabilities=rec.capabilities if rec else None,
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending effect command: device_id=%s effect=%s speed=0x%02x brightness=%s opcode=f86969",
-                    command_device_id,
-                    effect_name or "none",
-                    effect_speed,
-                    effect_brightness,
-                )
-                if self.verbose:
-                    self._log_debug("Effect command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            elif is_color_cmd:
-                if command_brightness is not None:
-                    color_brightness = max(0, min(100, int(command_brightness)))
-                else:
-                    color_brightness = _default_brightness_percent(rec)
-                if color_brightness == 0:
-                    color_brightness = 100
-
-                command_hex = self._build_color_command_hex(
-                    command_device_id,
-                    rgb=command_color_rgb,
-                    brightness_level=color_brightness,
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending color command: device_id=%s rgb=%s brightness=%s opcode=c16969",
-                    command_device_id,
-                    command_color_rgb,
-                    color_brightness,
-                )
-                if self.verbose:
-                    self._log_debug("Color command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            elif is_color_temp_cmd:
-                if command_brightness is not None:
-                    color_brightness = max(0, min(100, int(command_brightness)))
-                else:
-                    color_brightness = _default_brightness_percent(rec)
-                if color_brightness == 0:
-                    color_brightness = 100
-
-                command_hex = self._build_tunable_white_command_hex(
-                    command_device_id,
-                    cct=int(command_color_temp_cct),
-                    brightness_level=color_brightness,
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending tunable-white command: device_id=%s cct=%s brightness=%s opcode=c16969",
-                    command_device_id,
-                    command_color_temp_cct,
-                    color_brightness,
-                )
-                if self.verbose:
-                    self._log_debug("Tunable-white command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            elif is_brightness_cmd:
-                command_hex = self._build_brightness_command_hex(
-                    command_device_id,
-                    brightness_level=command_brightness,
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending brightness command: device_id=%s brightness=%s opcode=e76969",
-                    command_device_id,
-                    command_brightness,
-                )
-                if self.verbose:
-                    self._log_debug("Brightness command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            elif is_mode_cmd:
-                command_hex = self._build_mode_command_hex(
-                    command_device_id,
-                    mode=int(command_mode),
-                )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending mode command: device_id=%s mode=%s relay=0 opcode=c16969",
-                    command_device_id,
-                    command_mode,
-                )
-                if self.verbose:
-                    self._log_debug("Mode command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-            else:
-                effective_target = self._resolve_command_target_for_device(
-                    command_device_id,
-                    command_target,
-                )
-                if rec and rec.capabilities.supports_sensor and effective_target == "relay":
-                    command_hex = self._build_mode_command_hex(
-                        command_device_id,
-                        mode=0,
-                        relay=1 if bool(command_state) else 0,
-                    )
-                    command_spec = {
-                        "label": "relay/main",
-                        "opcode_name": "c16969",
-                        "selector": 0,
-                    }
-                else:
-                    command_spec = self._resolve_onoff_command_spec(effective_target)
-                    if effective_target == "usb":
-                        command_hex, state_byte_used = self._build_0107_usb_command_hex(
-                            command_device_id,
-                            is_on=command_state,
-                        )
-                    else:
-                        command_hex = self._build_6969_onoff_command_hex(
-                            command_device_id,
-                            is_on=command_state,
-                            opcode=command_spec["opcode"],
-                            selector=command_spec["selector"],
-                        )
-                command_debug = self._build_local_bledata_command_debug(
-                    key=extracted_key,
-                    command_hex=command_hex,
-                    from_email=sender_identity,
-                )
-                command_b64 = command_debug["base64"]
-                self._log_debug(
-                    "Sending local on/off command: device_id=%s target=%s state=%s opcode=%s selector=%s",
-                    command_device_id,
-                    command_spec["label"],
-                    "on" if command_state else "off",
-                    command_spec["opcode_name"],
-                    command_spec["selector"],
-                )
-                if state_byte_used is not None:
-                    self._log_debug("On/off command state byte: 0x%02x", state_byte_used)
-                if self.verbose:
-                    self._log_debug("On/off command hex: %s", command_hex)
-                    self._print_local_command_debug(command_debug)
-
-            command_parsed = _parse_message(command_b64, extracted_key)
-            command_route, command_match = _classify_message("out", command_parsed)
-            _log_message("out", command_parsed, command_route, command_match)
-            sock.sendall(command_b64.encode("utf-8"))
-            if runtime_session is not None:
-                runtime_session.mark_command_sent()
-
-            _drain_incoming()
-
-            if is_cover_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    normalized_cover_action,
-                    command_hex,
-                    target="cover",
-                    opcode_name="c16969",
-                    cover_button_position=cover_button_position,
-                )
-                return {"target": "cover", "device_id": command_device_id}
-            if is_brightness_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    command_brightness,
-                    command_hex,
-                    target="brightness",
-                    opcode_name="e76969",
-                )
-                return {"target": "brightness", "device_id": command_device_id}
-            if is_color_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    command_color_rgb,
-                    command_hex,
-                    target="color",
-                    opcode_name="c16969",
-                    brightness_level=color_brightness,
-                    rgb_color=command_color_rgb,
-                )
-                return {"target": "color", "device_id": command_device_id}
-            if is_color_temp_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    int(command_color_temp_cct),
-                    command_hex,
-                    target="color_temp",
-                    opcode_name="c16969",
-                    brightness_level=color_brightness,
-                )
-                return {"target": "color_temp", "device_id": command_device_id}
-            if is_effect_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    effect_name,
-                    command_hex,
-                    target="effect",
-                    opcode_name="f86969",
-                    brightness_level=effect_brightness,
-                    effect_name=effect_name,
-                    effect_speed=effect_speed,
-                )
-                return {"target": "effect", "device_id": command_device_id}
-            if is_mode_cmd:
-                _apply_local_command_optimistic_update(
-                    command_device_id,
-                    int(command_mode),
-                    command_hex,
-                    target="mode",
-                    opcode_name="c16969",
-                )
-                return {"target": "mode", "device_id": command_device_id}
-
-            _apply_local_command_optimistic_update(
-                command_device_id,
-                command_state,
-                command_hex,
-                target=effective_target,
-                opcode_name=command_spec["opcode_name"],
-            )
-            return {"target": effective_target, "device_id": command_device_id}
+            if plan.optimistic_intent is not None:
+                self.apply_optimistic_update_intent(plan.optimistic_intent)
+            return dict(plan.result or {"target": plan.target, "device_id": plan.device_id})
 
         def _log_message(
             direction: str,
@@ -4679,7 +4634,7 @@ class PixieAuthHandler:
 
         if self.inventory:
             rec = self.inventory.devices_by_id.get(int(device_id))
-            if rec and rec.model_no == "0107":
+            if rec and rec.capabilities.supports_usb_subentity:
                 return "relay"
 
         return "relay"
@@ -4722,7 +4677,7 @@ class PixieAuthHandler:
     # ------------------------------------------------------------------
 
     def _build_sensor_poll_command_hex(self, device_id: int) -> str:
-        """Build the 3001-specific f96b69 poll to query hold time, brightness, sensitivity."""
+        """Build the f96b69 sensor-parameter poll to query hold time, brightness, sensitivity."""
         payload = b"\x01\x00" + b"\x00" * 8
         return self._build_shifted_prefix_command_hex(
             device_id,

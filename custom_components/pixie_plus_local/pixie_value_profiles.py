@@ -63,6 +63,7 @@ hardware_list = {
 # Unified model capability truth.
 MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "0102": {
+        "is_gateway": True,
         "is_light": False,
         "is_switch": False,
         "supports_onoff": False,
@@ -76,6 +77,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "0107": {
         "is_light": False,
         "is_switch": True,
+        "switch_type": "outlet",
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -87,6 +89,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "0208": {
         "is_light": False,
         "is_switch": True,
+        "switch_type": "outlet",
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -98,6 +101,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "1002": {
         "is_light": False,
         "is_switch": True,
+        "switch_type": "switch",
         "supports_onoff": True,
         "supports_dimming": False,
         "supports_color": False,
@@ -116,6 +120,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_multi_channel": False,
         "supports_usb_subentity": False,
         "supports_cover": True,
+        "cover_type": "blind",
     },
     "2213": {
         "is_light": True,
@@ -241,6 +246,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_usb_subentity": False,
         "supports_cover": False,
         "supports_contact_sensor": True,
+        "contact_sensor_type": "inverted_door",
     },
     "3011": {
         "is_light": False,
@@ -253,6 +259,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_usb_subentity": False,
         "supports_cover": False,
         "supports_contact_sensor": True,
+        "contact_sensor_type": "standard_contact",
     },
     "3001": {
         "is_light": True,
@@ -303,6 +310,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_usb_subentity": False,
         "supports_cover": False,
         "supports_contact_sensor": True,
+        "contact_sensor_type": "pulse_value_04",
     },
     "2113": {
         "is_light": True,
@@ -361,6 +369,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_multi_channel": False,
         "supports_usb_subentity": False,
         "supports_cover": True,
+        "cover_type": "door",
         "supports_gate": True,
         "gate_doors": 2,
     },
@@ -388,9 +397,13 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     effect_names = [str(effect_name) for effect_name in caps.get("effect_names", [])]
     if not effect_names and effect_command_encoding in EFFECT_COMMAND_ENCODINGS:
         effect_names = list(EFFECT_COMMAND_ENCODINGS[effect_command_encoding].keys())
+    is_switch = bool(caps.get("is_switch", False))
+    supports_contact_sensor = bool(caps.get("supports_contact_sensor", False))
     return {
+        "is_gateway": bool(caps.get("is_gateway", False)),
         "is_light": bool(caps.get("is_light", False)),
-        "is_switch": bool(caps.get("is_switch", False)),
+        "is_switch": is_switch,
+        "switch_type": str(caps.get("switch_type", "switch" if is_switch else "")),
         "supports_onoff": bool(caps.get("supports_onoff", False)),
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),
@@ -406,8 +419,10 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_multi_channel": bool(caps.get("supports_multi_channel", False)),
         "supports_usb_subentity": bool(caps.get("supports_usb_subentity", False)),
         "supports_cover": bool(caps.get("supports_cover", False)),
+        "cover_type": str(caps.get("cover_type", "")),
         "supports_sensor": bool(caps.get("supports_sensor", caps.get("supports_mode", False))),
-        "supports_contact_sensor": bool(caps.get("supports_contact_sensor", False)),
+        "supports_contact_sensor": supports_contact_sensor,
+        "contact_sensor_type": str(caps.get("contact_sensor_type", "standard_contact" if supports_contact_sensor else "")),
         "supports_motion_sensor": bool(caps.get("supports_motion_sensor", False)),
         "supports_photocell_sensor": bool(caps.get("supports_photocell_sensor", False)),
         "supports_timer": bool(caps.get("supports_timer", False)),
@@ -422,76 +437,73 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     }
 
 
-def get_model_effect_names(model_no: str) -> list[str]:
-    """Return the supported effect names for a model number."""
-    return get_model_capabilities(model_no)["effect_names"]
+def _cap(capabilities: Any, name: str, default: Any = None) -> Any:
+    """Read a capability field from a DeviceCapabilities object or dict."""
+    if isinstance(capabilities, dict):
+        return capabilities.get(name, default)
+    return getattr(capabilities, name, default)
 
 
-def get_supported_sensor_mode_values(model_no: str) -> list[int]:
-    """Return supported normalized sensor mode values for a model."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_sensor"]:
+def get_supported_sensor_mode_values_for_capabilities(capabilities: Any) -> list[int]:
+    """Return supported normalized sensor mode values for capabilities."""
+    if not _cap(capabilities, "supports_sensor", False):
         return []
 
     mode_values = [0]
-    if capabilities["supports_motion_sensor"]:
+    if _cap(capabilities, "supports_motion_sensor", False):
         mode_values.append(1)
-    if capabilities["supports_photocell_sensor"]:
+    if _cap(capabilities, "supports_photocell_sensor", False):
         mode_values.append(2)
     return mode_values
 
 
-def get_sensor_select_options(model_no: str) -> list[str]:
-    """Return ordered HA-facing select options for sensor-capable models."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_sensor"]:
+def get_sensor_select_options_for_capabilities(capabilities: Any) -> list[str]:
+    """Return ordered HA-facing select options for sensor-capable capabilities."""
+    if not _cap(capabilities, "supports_sensor", False):
         return []
 
     options: list[str] = []
-    if capabilities["supports_motion_sensor"]:
+    if _cap(capabilities, "supports_motion_sensor", False):
         options.append("motion")
-    if capabilities["supports_photocell_sensor"]:
+    if _cap(capabilities, "supports_photocell_sensor", False):
         options.append("photocell")
     options.append("switch")
     return options
 
 
-def sensor_mode_value_to_option(model_no: str, mode_value: int) -> Optional[str]:
+def sensor_mode_value_to_option_for_capabilities(capabilities: Any, mode_value: int) -> Optional[str]:
     """Map a normalized sensor mode value into a HA-facing option string."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_sensor"]:
+    if not _cap(capabilities, "supports_sensor", False):
         return None
-    if mode_value == 1 and capabilities["supports_motion_sensor"]:
+    if mode_value == 1 and _cap(capabilities, "supports_motion_sensor", False):
         return "motion"
-    if mode_value == 2 and capabilities["supports_photocell_sensor"]:
+    if mode_value == 2 and _cap(capabilities, "supports_photocell_sensor", False):
         return "photocell"
     if mode_value == 0:
         return "switch"
     return None
 
 
-def sensor_option_to_mode_value(model_no: str, option: str) -> Optional[int]:
+def sensor_option_to_mode_value_for_capabilities(capabilities: Any, option: str) -> Optional[int]:
     """Map a HA-facing sensor option into a normalized mode value."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_sensor"]:
+    if not _cap(capabilities, "supports_sensor", False):
         return None
 
     normalized = str(option or "").strip().lower()
-    if normalized == "motion" and capabilities["supports_motion_sensor"]:
+    if normalized == "motion" and _cap(capabilities, "supports_motion_sensor", False):
         return 1
-    if normalized == "photocell" and capabilities["supports_photocell_sensor"]:
+    if normalized == "photocell" and _cap(capabilities, "supports_photocell_sensor", False):
         return 2
     if normalized == "switch":
         return 0
     return None
 
 
-def get_timer_select_options(model_no: str) -> list[str]:
-    """Return ordered HA-facing select options for timer-capable models."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_timer"]:
+def get_timer_select_options_for_capabilities(capabilities: Any) -> list[str]:
+    """Return ordered HA-facing select options for timer-capable capabilities."""
+    if not _cap(capabilities, "supports_timer", False):
         return []
-    return list(capabilities["timer_modes"])
+    return list(_cap(capabilities, "timer_modes", []) or [])
 
 
 def timer_mode_value_to_option(mode_value: int) -> Optional[str]:
@@ -511,16 +523,6 @@ def timer_option_to_mode_value(option: str) -> Optional[int]:
     if normalized == "override":
         return 2
     return None
-
-
-def get_all_effect_names() -> list[str]:
-    """Return all known effect names across effect-capable models."""
-    seen: list[str] = []
-    for model_no in MODEL_CAPABILITIES:
-        for effect_name in get_model_effect_names(model_no):
-            if effect_name not in seen:
-                seen.append(effect_name)
-    return seen
 
 
 # Static cover mapping used by local press-command control.
@@ -964,36 +966,34 @@ def estimate_gate_motion_position_percent(plan: Optional[Dict[str, Any]], now_ms
         return None
     return _quantize_gate_percent_to_bucket(_gate_position_raw_to_percent(estimated_raw))
 
-def _decode_mode_from_capabilities(model_no: str) -> str:
+def _decode_mode_from_capabilities(capabilities: Any) -> str:
     """Resolve value-byte decoding mode from the model capability flags.
 
     Precedence matters here: USB and multi-channel devices also support on/off,
     but their value-byte encoding is more specific than plain relay semantics.
     """
-    capabilities = get_model_capabilities(model_no)
-
-    if capabilities["supports_gate"]:
+    if _cap(capabilities, "supports_gate", False):
         return MODE_GATE
-    if capabilities["supports_timer"]:
+    if _cap(capabilities, "supports_timer", False):
         return MODE_TIMER_SWITCH
-    if capabilities["supports_sensor"]:
+    if _cap(capabilities, "supports_sensor", False):
         return MODE_SENSOR_CONTROLLER
-    if capabilities["supports_contact_sensor"]:
+    if _cap(capabilities, "supports_contact_sensor", False):
         return MODE_CONTACT_SENSOR
-    if capabilities["supports_usb_subentity"]:
+    if _cap(capabilities, "supports_usb_subentity", False):
         return MODE_PLUG_WITH_USB
-    if capabilities["supports_multi_channel"]:
+    if _cap(capabilities, "supports_multi_channel", False):
         return MODE_DUAL_CHANNEL
-    if capabilities["color_runtime_encoding"]:
+    if _cap(capabilities, "color_runtime_encoding", ""):
         return MODE_COLOR_EFFECT
-    if capabilities["supports_color_temp"]:
+    if _cap(capabilities, "supports_color_temp", False):
         return MODE_TUNABLE_WHITE
-    if capabilities["supports_dimming"]:
+    if _cap(capabilities, "supports_dimming", False):
         return MODE_BRIGHTNESS
     return MODE_RAW
 
 
-def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
+def decode_value_byte_for_capabilities(capabilities: Any, value_byte: int) -> Dict[str, Any]:
     """Decode value byte using capability-derived device semantics.
 
     Returns a dict with at least:
@@ -1001,7 +1001,7 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
     - value_byte
     and optionally inferred semantic fields.
     """
-    mode = _decode_mode_from_capabilities(model_no)
+    mode = _decode_mode_from_capabilities(capabilities)
     result: Dict[str, Any] = {
         "mode": mode,
         "value_byte": value_byte,
@@ -1013,8 +1013,7 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
         return result
 
     if mode == MODE_COLOR_EFFECT:
-        capabilities = get_model_capabilities(model_no)
-        encoding = capabilities["color_runtime_encoding"]
+        encoding = _cap(capabilities, "color_runtime_encoding", "")
         if encoding == "tail_hue_extended":
             result["brightness_0_100"] = max(0, min(100, value_byte & 0x7F))
             result["is_on"] = (value_byte & 0x7F) > 0
@@ -1075,19 +1074,18 @@ def decode_value_byte(model_no: str, value_byte: int) -> Dict[str, Any]:
         return result
 
     if mode == MODE_SENSOR_CONTROLLER:
-        capabilities = get_model_capabilities(model_no)
         # Sensor-controller bitfield:
         # - bit 0: relay/light state (1=on, 0=off)
         # - bit 1: motion event
         # - bit 2: motion mode
         # - bit 3: photocell mode
         sensor_mode = 0
-        if capabilities["supports_photocell_sensor"] and (value_byte & 0x08):
+        if _cap(capabilities, "supports_photocell_sensor", False) and (value_byte & 0x08):
             sensor_mode = 2
-        elif capabilities["supports_motion_sensor"] and (value_byte & 0x04):
+        elif _cap(capabilities, "supports_motion_sensor", False) and (value_byte & 0x04):
             sensor_mode = 1
         relay_on = bool(value_byte & 0x01)
-        motion = bool(value_byte & 0x02) if capabilities["supports_motion_sensor"] else False
+        motion = bool(value_byte & 0x02) if _cap(capabilities, "supports_motion_sensor", False) else False
         result["mode_value"] = sensor_mode
         result["relay_on"] = relay_on
         result["motion"] = motion
@@ -1115,10 +1113,9 @@ def _hue_degrees_to_rgb(hue_degrees: int) -> list[int]:
     ]
 
 
-def decode_color_runtime_state(model_no: str, value_byte: int, tail_byte: int) -> Dict[str, Any]:
+def decode_color_runtime_state_for_capabilities(capabilities: Any, value_byte: int, tail_byte: int) -> Dict[str, Any]:
     """Decode compact runtime bytes for RGB strip families that report color/effects."""
-    capabilities = get_model_capabilities(model_no)
-    encoding = capabilities["color_runtime_encoding"]
+    encoding = _cap(capabilities, "color_runtime_encoding", "")
     if not encoding:
         return {}
 
@@ -1176,10 +1173,9 @@ def decode_color_runtime_state(model_no: str, value_byte: int, tail_byte: int) -
     return decoded
 
 
-def decode_color_runtime_hue(model_no: str, hue_value: Any) -> Dict[str, Any]:
+def decode_color_runtime_hue_for_capabilities(capabilities: Any, hue_value: Any) -> Dict[str, Any]:
     """Decode fallback onlineList hue values for RGB strips."""
-    capabilities = get_model_capabilities(model_no)
-    if capabilities["color_runtime_encoding"] != "tail_hue_extended":
+    if _cap(capabilities, "color_runtime_encoding", "") != "tail_hue_extended":
         return {}
 
     try:
@@ -1211,7 +1207,7 @@ def decode_color_runtime_hue(model_no: str, hue_value: Any) -> Dict[str, Any]:
 
 
 def decode_contact_runtime_state(
-    model_no: str,
+    capabilities: Any,
     value_byte: int,
     tail_byte: int,
     *,
@@ -1220,12 +1216,12 @@ def decode_contact_runtime_state(
     allow_pulse: bool = True,
 ) -> Dict[str, Any]:
     """Decode contact-sensor runtime bytes from single bleData or bulk GwData."""
-    capabilities = get_model_capabilities(model_no)
-    if not capabilities["supports_contact_sensor"]:
+    if not _cap(capabilities, "supports_contact_sensor", False):
         return {}
 
     value = int(value_byte) & 0xFF
     tail = int(tail_byte) & 0xFF
+    contact_sensor_type = str(_cap(capabilities, "contact_sensor_type", "standard_contact") or "standard_contact")
 
     if value == 0x01:
         return {
@@ -1237,7 +1233,7 @@ def decode_contact_runtime_state(
             "tail_byte": tail,
         }
 
-    if model_no == "3012" and value == 0x04:
+    if contact_sensor_type == "pulse_value_04" and value == 0x04:
         return {
             "mode": MODE_CONTACT_SENSOR,
             "armed": True,

@@ -17,13 +17,28 @@
           "gateway_ip": "Gateway IP address"
         }
       },
+      "bluetooth": {
+        "title": "Bluetooth support",
+        "description": "Enable the optional Pixie Bluetooth pathway. This requires an ESPHome Bluetooth proxy device already added to Home Assistant. If no working proxy is found, setup will continue using TCP only.",
+        "data": {
+          "enable_bt": "Enable Bluetooth support"
+        }
+      },
       "reconfigure": {
         "title": "Reconfigure Pixie entry",
         "description": "Choose what you want to update for this Pixie integration.",
         "data": {},
         "menu_options": {
           "reconfigure_credentials": "Update fallback credentials",
-          "reconfigure_gateway_connection": "Gateway connection settings"
+          "reconfigure_gateway_connection": "Gateway connection settings",
+          "reconfigure_bluetooth": "Bluetooth support"
+        }
+      },
+      "reconfigure_bluetooth": {
+        "title": "Bluetooth support",
+        "description": "Enable or disable the optional Pixie Bluetooth pathway. Bluetooth requires an ESPHome Bluetooth proxy device already added to Home Assistant.",
+        "data": {
+          "enable_bt": "Enable Bluetooth support"
         }
       },
       "reconfigure_credentials": {
@@ -73,6 +88,7 @@
       "invalid_auth": "Authentication failed.",
       "invalid_gateway_ip": "Enter a valid IPv4 address.",
       "cannot_connect": "Could not connect to the Pixie gateway.",
+      "bt_proxy_unavailable": "No working ESPHome Bluetooth proxy was found. Disable Bluetooth support to continue using TCP only.",
       "unknown": "Unexpected error. Check the logs."
     },
     "abort": {
@@ -89,11 +105,30 @@
     "gateway_ip_required": {
       "title": "Pixie gateway connection requires attention",
       "description": "The integration could not reach the Pixie gateway for {entry_title}. Reconfigure the integration to enter a working gateway IP address or switch back to UDP discovery."
+    },
+    "bt_proxy_unavailable": {
+      "title": "Pixie Bluetooth proxy unavailable",
+      "description": "Bluetooth support was requested for {entry_title}, but the integration could not find a working ESPHome Bluetooth proxy. Error: {error}"
     }
   },
   "options": {
     "step": {
       "init": {
+        "title": "Pixie options",
+        "description": "Choose which Pixie option to change.",
+        "menu_options": {
+          "transport": "Command transport",
+          "cover_controller": "Blind mapping"
+        }
+      },
+      "transport": {
+        "title": "Command transport",
+        "description": "Choose which local pathway should be tried first when sending commands.",
+        "data": {
+          "command_transport": "Command transport"
+        }
+      },
+      "cover_controller": {
         "title": "Blind mapping",
         "description": "Adjust the button positions used for blind commands.",
         "data": {

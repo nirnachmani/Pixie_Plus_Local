@@ -34,10 +34,27 @@ from . import (
     CONF_PIXIE_PASSWORD,
     CONF_PIXIE_USERNAME,
     CONF_USER_ID,
+    CONF_BT_ACCESS_NODE,
+    CONF_BT_ENABLED,
+    CONF_BT_RESPONSE_ACCESS_NODE,
+    CONF_BT_SOURCE,
+    CONF_BT_STATE,
+    CONF_COMMAND_TRANSPORT,
     DOMAIN,
     INVENTORY_MODE_CLOUD_FALLBACK,
+    COMMAND_TRANSPORT_BT_ONLY,
+    COMMAND_TRANSPORT_BT_PRIMARY,
+    COMMAND_TRANSPORT_TCP_ONLY,
+    COMMAND_TRANSPORT_TCP_PRIMARY,
     _async_delete_missing_credentials_issue,
     _async_delete_gateway_ip_issue,
+    _entry_bt_enabled,
+)
+from .pixie_ble import (
+    BT_STATE_DISABLED,
+    BT_STATE_NO_WORKING_PROXY,
+    BT_STATE_READY,
+    async_probe_pixie_bluetooth_proxy,
 )
 from .pixie_runtime import (
     CloudParams,
@@ -66,9 +83,119 @@ CONF_COVER_OPEN_TILT_POSITION = "cover_open_tilt_position"
 CONF_COVER_STOP_TILT_POSITION = "cover_stop_tilt_position"
 CONF_COVER_CLOSE_TILT_POSITION = "cover_close_tilt_position"
 CONF_GATEWAY_CONNECTION_MODE = "gateway_connection_mode"
+CONF_ENABLE_BT = "enable_bt"
+CONF_ENABLE_BT_LABEL = "Enable Bluetooth support (requires ESPHome Bluetooth proxy)"
+BT_INSTALL_PROBE_TIMEOUT = 75.0
 
 GATEWAY_CONNECTION_MODE_AUTO = "auto"
 GATEWAY_CONNECTION_MODE_MANUAL = "manual"
+
+
+def _enable_bt_from_user_input(user_input: dict[str, Any]) -> bool:
+    """Return the Bluetooth checkbox value from translated or fallback form keys."""
+    return bool(user_input.get(CONF_ENABLE_BT_LABEL, user_input.get(CONF_ENABLE_BT, False)))
+
+
+def _bluetooth_data_schema(*, default: bool) -> vol.Schema:
+    """Build a Bluetooth form schema with a readable fallback field label."""
+    return vol.Schema({vol.Required(CONF_ENABLE_BT_LABEL, default=default): bool})
+
+
+async def _async_probe_bt_for_flow(
+    hass: Any,
+    cloud_params: CloudParams,
+    inventory: Any | None = None,
+    *,
+    preferred_source: str | None = None,
+    preferred_access_node: str | None = None,
+):
+    """Run a blocking Pixie BLE capability probe for config flows."""
+    return await async_probe_pixie_bluetooth_proxy(
+        hass,
+        cloud_params,
+        inventory,
+        preferred_source=preferred_source,
+        preferred_access_node=preferred_access_node,
+        timeout=BT_INSTALL_PROBE_TIMEOUT,
+    )
+
+
+def _cloud_params_from_entry_data(data: dict[str, Any], title: str = INTEGRATION_TITLE) -> CloudParams:
+    """Build cloud params from already validated config-entry data."""
+    return CloudParams(
+        home_id=str(data[CONF_HOME_ID]),
+        home_name=str(data.get(CONF_HOME_NAME) or title),
+        user_id=str(data[CONF_USER_ID]),
+        meshnet=str(data[CONF_MESHNET]),
+        meshnet2=str(data[CONF_MESHNET2]),
+        netid=str(data[CONF_NETID]),
+    )
+
+
+async def _async_apply_bluetooth_choice(
+    hass: Any,
+    *,
+    data: dict[str, Any],
+    options: dict[str, Any] | None,
+    enable_bt: bool,
+    cloud_params: CloudParams,
+    inventory: Any | None,
+    log_label: str,
+    preferred_source: str | None = None,
+    preferred_access_node: str | None = None,
+    previous_response_access_node: str | None = None,
+) -> str | None:
+    """Apply the BT enable choice to entry data; return an error key if probing fails."""
+    data[CONF_BT_ENABLED] = False
+    data[CONF_BT_STATE] = BT_STATE_DISABLED
+    data.pop(CONF_BT_SOURCE, None)
+    data.pop(CONF_BT_ACCESS_NODE, None)
+    data.pop(CONF_BT_RESPONSE_ACCESS_NODE, None)
+
+    if not enable_bt:
+        if options is not None:
+            options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_TCP_PRIMARY
+        return None
+
+    if options is not None:
+        options.setdefault(CONF_COMMAND_TRANSPORT, COMMAND_TRANSPORT_TCP_PRIMARY)
+
+    probe = await _async_probe_bt_for_flow(
+        hass,
+        cloud_params,
+        inventory,
+        preferred_source=preferred_source,
+        preferred_access_node=preferred_access_node,
+    )
+    if probe is not None and probe.healthy:
+        LOGGER.info(
+            "Pixie Bluetooth %s accepted source=%s access_node=%s state=%s",
+            log_label,
+            probe.source,
+            probe.access_node,
+            probe.state,
+        )
+        data[CONF_BT_ENABLED] = True
+        data[CONF_BT_STATE] = BT_STATE_READY
+        if probe.source:
+            data[CONF_BT_SOURCE] = probe.source
+        if probe.access_node:
+            data[CONF_BT_ACCESS_NODE] = probe.access_node
+        if previous_response_access_node:
+            data[CONF_BT_RESPONSE_ACCESS_NODE] = previous_response_access_node
+        return None
+
+    LOGGER.warning(
+        "Pixie Bluetooth %s rejected probe=%s state=%s source=%s access_node=%s error=%s",
+        log_label,
+        probe is not None,
+        getattr(probe, "state", None),
+        getattr(probe, "source", None),
+        getattr(probe, "access_node", None),
+        getattr(probe, "last_error", None),
+    )
+    data[CONF_BT_STATE] = BT_STATE_NO_WORKING_PROXY
+    return "bt_proxy_unavailable"
 
 
 class InvalidAuth(Exception):
@@ -90,6 +217,7 @@ class ValidatedSetup:
     title: str
     data: dict[str, Any]
     options: dict[str, Any]
+    inventory: Any | None
     has_cover_devices: bool
     cover_devices: dict[str, str]
 
@@ -136,7 +264,7 @@ def _cover_controller_choices(inventory) -> dict[str, str]:
     choices: dict[str, str] = {}
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
-        if record.model_no != "1102":
+        if record.capabilities.cover_type != "blind":
             continue
         choices[str(record.id)] = f"{record.name} ({record.id})"
     return choices
@@ -241,7 +369,7 @@ def _has_cover_devices(handler: PixieAuthHandler) -> bool:
     if inventory is None:
         return False
 
-    return any(device.model_no == "1102" for device in inventory.devices_by_id.values())
+    return any(device.capabilities.cover_type == "blind" for device in inventory.devices_by_id.values())
 
 
 def _build_entry_title(handler: PixieAuthHandler, cloud_params: CloudParams) -> str:
@@ -383,6 +511,7 @@ async def _async_validate_setup_input(
             gateway_ip=gateway_ip,
         ),
         options=options,
+        inventory=handler.inventory,
         has_cover_devices=has_cover_devices,
         cover_devices=cover_devices,
     )
@@ -407,6 +536,9 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
 
         await self.async_set_unique_id(self._validated_setup.data[CONF_HOME_ID])
         self._abort_if_unique_id_configured()
+
+        if CONF_BT_ENABLED not in self._validated_setup.data:
+            return await self.async_step_bluetooth()
 
         if self._validated_setup.has_cover_devices:
             return await self.async_step_cover_controller()
@@ -500,12 +632,89 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="gateway_ip", data_schema=data_schema, errors=errors)
 
+    async def async_step_bluetooth(self, user_input: dict[str, Any] | None = None):
+        """Ask whether to enable the optional Pixie Bluetooth pathway."""
+        if self._validated_setup is None:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            enable_bt = _enable_bt_from_user_input(user_input)
+            error = await _async_apply_bluetooth_choice(
+                self.hass,
+                data=self._validated_setup.data,
+                options=self._validated_setup.options,
+                enable_bt=enable_bt,
+                cloud_params=_cloud_params_from_entry_data(self._validated_setup.data, self._validated_setup.title),
+                inventory=self._validated_setup.inventory,
+                log_label="setup",
+            )
+            if error is not None:
+                errors["base"] = error
+                data_schema = _bluetooth_data_schema(default=False)
+                return self.async_show_form(step_id="bluetooth", data_schema=data_schema, errors=errors)
+
+            LOGGER.info(
+                "Pixie Bluetooth setup step completed enabled=%s state=%s",
+                self._validated_setup.data.get(CONF_BT_ENABLED),
+                self._validated_setup.data.get(CONF_BT_STATE),
+            )
+            return await self._async_finish_validated_setup()
+
+        data_schema = _bluetooth_data_schema(default=False)
+        return self.async_show_form(step_id="bluetooth", data_schema=data_schema, errors=errors)
+
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
         """Present reconfiguration actions for the config entry."""
         return self.async_show_menu(
             step_id="reconfigure",
-            menu_options=["reconfigure_credentials", "reconfigure_gateway_connection"],
+            menu_options=["reconfigure_credentials", "reconfigure_gateway_connection", "reconfigure_bluetooth"],
         )
+
+    async def async_step_reconfigure_bluetooth(self, user_input: dict[str, Any] | None = None):
+        """Enable or disable the optional Bluetooth runtime path."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            enable_bt = _enable_bt_from_user_input(user_input)
+            previous_response_access_node = str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "") or None
+            data = dict(entry.data)
+            options = dict(entry.options)
+            runtime_data = getattr(entry, "runtime_data", None)
+            pixie_runtime = getattr(runtime_data, "pixie_runtime", None) if runtime_data is not None else None
+            error = await _async_apply_bluetooth_choice(
+                self.hass,
+                data=data,
+                options=options,
+                enable_bt=enable_bt,
+                cloud_params=_entry_cloud_params(entry),
+                inventory=getattr(pixie_runtime, "inventory", None),
+                log_label="reconfigure",
+                preferred_source=str(entry.data.get(CONF_BT_SOURCE) or "") or None,
+                preferred_access_node=(
+                    str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "")
+                    or str(entry.data.get(CONF_BT_ACCESS_NODE) or "")
+                    or None
+                ),
+                previous_response_access_node=previous_response_access_node,
+            )
+            if error is not None:
+                errors["base"] = error
+                data_schema = _bluetooth_data_schema(default=False)
+                return self.async_show_form(
+                    step_id="reconfigure_bluetooth",
+                    data_schema=data_schema,
+                    errors=errors,
+                )
+
+            if options != dict(entry.options):
+                self.hass.config_entries.async_update_entry(entry, options=options)
+            return self.async_update_reload_and_abort(entry, data=data)
+
+        data_schema = _bluetooth_data_schema(default=bool(entry.data.get(CONF_BT_ENABLED)))
+        return self.async_show_form(step_id="reconfigure_bluetooth", data_schema=data_schema, errors=errors)
 
     async def async_step_reconfigure_credentials(self, user_input: dict[str, Any] | None = None):
         """Store Pixie credentials so the entry can use cloud fallback when local inventory fails."""
@@ -745,6 +954,44 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         return _cover_controller_choices(inventory)
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
+        """Choose which Pixie options to configure."""
+        menu_options = ["cover_controller"]
+        if _entry_bt_enabled(self.config_entry):
+            menu_options.insert(0, "transport")
+
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=menu_options,
+        )
+
+    async def async_step_transport(self, user_input: dict[str, Any] | None = None):
+        """Configure command transport preference."""
+        if not _entry_bt_enabled(self.config_entry):
+            options = dict(self.config_entry.options)
+            options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_TCP_PRIMARY
+            return self.async_create_entry(title="", data=options)
+
+        if user_input is not None:
+            options = dict(self.config_entry.options)
+            options[CONF_COMMAND_TRANSPORT] = str(user_input[CONF_COMMAND_TRANSPORT])
+            return self.async_create_entry(title="", data=options)
+
+        current = str(self.config_entry.options.get(CONF_COMMAND_TRANSPORT) or COMMAND_TRANSPORT_TCP_PRIMARY)
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_COMMAND_TRANSPORT, default=current): vol.In(
+                    {
+                        COMMAND_TRANSPORT_TCP_PRIMARY: "TCP primary, BT fallback",
+                        COMMAND_TRANSPORT_BT_PRIMARY: "BT primary, TCP fallback",
+                        COMMAND_TRANSPORT_TCP_ONLY: "TCP only",
+                        COMMAND_TRANSPORT_BT_ONLY: "BT only",
+                    }
+                ),
+            }
+        )
+        return self.async_show_form(step_id="transport", data_schema=data_schema)
+
+    async def async_step_cover_controller(self, user_input: dict[str, Any] | None = None):
         """Choose which blind controller to configure."""
         cover_devices = self._cover_devices()
         if not cover_devices:

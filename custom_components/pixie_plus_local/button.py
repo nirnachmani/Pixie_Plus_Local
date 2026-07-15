@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -116,6 +117,8 @@ class PixiePlusTimerRestartButtonEntity(PixiePlusCoordinatorEntity, ButtonEntity
 
 class PixiePlusSensorRefreshButtonEntity(PixiePlusCoordinatorEntity, ButtonEntity):
     """Refresh button for sensor device settings (hold time, brightness, sensitivity)."""
+
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
