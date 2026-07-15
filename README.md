@@ -79,7 +79,7 @@ Entity ID should remain the same as with the old integration but check that this
 
 ## Bluetooth functionality
 
-- Bluetooth (BT) functionality requires an ESPHome bluetooth proxy. See [here](https://esphome.io/components/bluetooth_proxy/). It will not work without one.
+- Bluetooth (BT) functionality requires an ESPHome bluetooth proxy. See [here](https://esphome.io/components/bluetooth_proxy/). ***It will not work without one***.
 - The integration will connect to one Pixie device via BT and will use the BLE mesh to send commands and get updates. Because some updates are only available from the gateway (e.g. timer duration left) the integration will attempt to connect to the gateway if possible.
 - Once enabled, the user can select if commands will be sent via TCP or BT through the integration's configuration (cogwheel icon) -> Command transport. There are 4 options: TCP primary, BT fallback; BT Primary, TCP fallback: TCP only; BT only. Because the ESPHome bluetooth proxy requires LAN access, BT modes still depend on the LAN. Updates from devices will arrive from both TCP and BT, and will race.
 - BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via reconfigure (under ⋮ after clicking on the integration ) -> Bluetooth support.
