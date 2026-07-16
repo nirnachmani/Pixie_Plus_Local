@@ -37,6 +37,7 @@ RUNTIME_COMMAND_MAX_TIMEOUT_SECONDS = 60.0
 RUNTIME_COMMAND_MIN_GAP_SECONDS = 0.25
 LOCAL_TIMER_RESTART_GUARD_SECONDS = 4.0
 TIMER_STATUS_CORRECTION_DEADBAND_SECONDS = 1.0
+LOCAL_AMBIGUOUS_BLUE_CONFIRM_SECONDS = 8.0
 from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -46,6 +47,7 @@ from .pixie_inventory import GatewayIdentity, PixieInventory
 from .pixie_value_profiles import (
     EFFECT_COMMAND_ENCODINGS,
     decode_color_runtime_state_for_capabilities,
+    decode_color_temp_runtime_state_for_capabilities,
     decode_contact_runtime_state,
     build_gate_motion_plan,
     build_gate_motion_plan_from_learned_duration,
@@ -1274,21 +1276,42 @@ class PixieAuthHandler:
                             LOCAL_TIMER_RESTART_GUARD_SECONDS,
                         )
                 elif mode == "tunable_white":
-                    brightness = interpreted.get("brightness_0_100")
-                    if isinstance(brightness, int):
-                        update_kwargs["br"] = brightness
                     if isinstance(tail, int):
-                        update_kwargs["cct"] = tail
+                        decoded_temp = decode_color_temp_runtime_state_for_capabilities(rec.capabilities, value_byte, tail)
+                        brightness = decoded_temp.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_kwargs["br"] = brightness
+                        cct = decoded_temp.get("cct")
+                        if isinstance(cct, int):
+                            update_kwargs["cct"] = cct
                 elif mode == "color_effect":
                     if isinstance(tail, int):
                         decoded_color = decode_color_runtime_state_for_capabilities(rec.capabilities, value_byte, tail)
                         brightness = decoded_color.get("brightness_0_100")
                         if isinstance(brightness, int):
                             update_kwargs["br"] = brightness
-                        if "effect" in decoded_color:
-                            update_kwargs["effect"] = decoded_color.get("effect")
-                        if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
-                            update_kwargs["rgb"] = [int(channel) for channel in decoded_color["rgb"]]
+                        if decoded_color.get("mode") == "tunable_white":
+                            cct = decoded_color.get("cct")
+                            if isinstance(cct, int):
+                                update_kwargs["cct"] = cct
+                            update_kwargs["effect"] = None
+                        else:
+                            if rec.capabilities.combined_runtime_encoding:
+                                update_kwargs["cct"] = None
+                            if "effect" in decoded_color:
+                                update_kwargs["effect"] = decoded_color.get("effect")
+                            if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
+                                rgb_update = [int(channel) for channel in decoded_color["rgb"]]
+                                if decoded_color.get("white_preferred_tail") and isinstance(rec.runtime.local_ambiguous_blue_intent_until, (int, float)):
+                                    now = time.time()
+                                    if now <= rec.runtime.local_ambiguous_blue_intent_until:
+                                        rgb_update = [0, 0, 255]
+                                        self._log_debug(
+                                            "BLE color decode: preserving recent local blue intent for white-preferred tail dev_id=%s tail=0x%02x",
+                                            dev_id,
+                                            tail,
+                                        )
+                                update_kwargs["rgb"] = rgb_update
                 elif mode == "gate":
                     if isinstance(value_byte, int):
                         update_kwargs["door1_state"] = value_byte
@@ -1383,7 +1406,6 @@ class PixieAuthHandler:
             else:
                 summary_parts.append(f"value={value_byte}")
             self._log_debug("Inventory update: id=%s name=%s %s src=%s", dev_id, rec.name, ", ".join(summary_parts), source)
-
         return applied
 
     def _apply_cloud_params(self, cloud_params: CloudParams) -> None:
@@ -3418,12 +3440,6 @@ class PixieAuthHandler:
         prev_contact = rec.runtime.contact_active
         update_kwargs: Dict[str, Any] = {}
 
-        def _remembered_turn_on_brightness() -> int:
-            for candidate in (rec.runtime.last_nonzero_br, rec.runtime.br):
-                if isinstance(candidate, int) and candidate > 0:
-                    return max(1, min(100, candidate))
-            return 100
-
         if target == "brightness":
             if isinstance(value, int):
                 update_kwargs["br"] = value
@@ -3501,6 +3517,12 @@ class PixieAuthHandler:
             update_kwargs["motion"] = False
             update_kwargs["br"] = 100 if value else 0
         elif rec.capabilities.supports_dimming:
+            def _remembered_turn_on_brightness() -> int:
+                for candidate in (rec.runtime.last_nonzero_br, rec.runtime.br):
+                    if isinstance(candidate, int) and candidate > 0:
+                        return max(1, min(100, candidate))
+                return 100
+
             update_kwargs["br"] = _remembered_turn_on_brightness() if value else 0
         elif rec.capabilities.supports_usb_subentity:
             if isinstance(rec.runtime.r, int):
@@ -3565,6 +3587,13 @@ class PixieAuthHandler:
         )
         if updated_runtime is None:
             return False
+        if target == "color" and int(rec.capabilities.color_runtime_white_preferred_tail) >= 0:
+            if rgb_color is not None and tuple(int(channel) for channel in rgb_color[:3]) == (0, 0, 255):
+                updated_runtime.local_ambiguous_blue_intent_until = time.time() + LOCAL_AMBIGUOUS_BLUE_CONFIRM_SECONDS
+            else:
+                updated_runtime.local_ambiguous_blue_intent_until = None
+        elif target in ("color_temp", "effect", "brightness"):
+            updated_runtime.local_ambiguous_blue_intent_until = None
         if target == "timer_restart":
             updated_runtime.local_timer_restart_at = time.time()
 

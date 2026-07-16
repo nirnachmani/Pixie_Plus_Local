@@ -690,6 +690,14 @@ class PixiePlusConfigEntryRuntimeData:
         ble_runtime = self.ble_runtime if self.ble_runtime is not None and self.ble_runtime.health.healthy else None
         if ble_runtime is None and wait_for_ready:
             ble_runtime = await self.async_wait_for_ble_runtime_ready()
+        if ble_runtime is not None and ble_runtime.is_notification_stale():
+            age = ble_runtime.notification_age()
+            await ble_runtime.async_request_reconnect(
+                f"BLE notification stream stale before command"
+                f"{f' ({age:.1f}s)' if age is not None else ''}"
+            )
+            if wait_for_ready:
+                ble_runtime = await self.async_wait_for_ble_runtime_ready()
         if ble_runtime is None or not ble_runtime.health.healthy:
             ble_error = self.ble_runtime.health.last_error if self.ble_runtime is not None else None
             raise ConfigEntryError(

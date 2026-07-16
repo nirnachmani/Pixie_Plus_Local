@@ -29,6 +29,10 @@ from . import (
 )
 
 
+ATTR_WHITE = "white"
+RGB_WHITE = (255, 255, 255)
+
+
 def ha_brightness_to_percent(brightness: int | None) -> int | None:
     """Convert HA 1..255 brightness to device 0..100 percent."""
     if brightness is None:
@@ -120,7 +124,20 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
         self._attr_supported_features = features
 
     @property
+    def _supports_white_mode(self) -> bool:
+        return self.record.capabilities.supports_color and not self.record.capabilities.supports_color_temp
+
+    @property
     def supported_color_modes(self) -> set[ColorMode]:
+        modes: set[ColorMode] = set()
+        if self.record.capabilities.supports_color:
+            modes.add(ColorMode.RGB)
+        if self._supports_white_mode:
+            modes.add(ColorMode.WHITE)
+        if self.record.capabilities.supports_color_temp:
+            modes.add(ColorMode.COLOR_TEMP)
+        if modes:
+            return modes
         if self.record.capabilities.supports_color_temp:
             return {ColorMode.COLOR_TEMP}
         if self.record.capabilities.supports_color:
@@ -131,9 +148,16 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
 
     @property
     def color_mode(self) -> ColorMode:
+        if self.record.capabilities.supports_color and self.record.capabilities.supports_color_temp:
+            if self.record.runtime.cct is not None:
+                return ColorMode.COLOR_TEMP
+            return ColorMode.RGB
         if self.record.capabilities.supports_color_temp:
             return ColorMode.COLOR_TEMP
         if self.record.capabilities.supports_color:
+            rgb = self.record.runtime.rgb
+            if self._supports_white_mode and isinstance(rgb, list) and tuple(int(v) for v in rgb[:3]) == RGB_WHITE:
+                return ColorMode.WHITE
             return ColorMode.RGB
         if self.record.capabilities.supports_dimming:
             return ColorMode.BRIGHTNESS
@@ -220,6 +244,18 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
                 )
                 return
 
+            if self._supports_white_mode and ATTR_WHITE in kwargs:
+                white_pct = ha_brightness_to_percent(kwargs.get(ATTR_WHITE))
+                if brightness_pct is not None:
+                    white_pct = brightness_pct
+                await self.runtime_data.async_send_local_command(
+                    self.hass,
+                    command_device_id=self.record.id,
+                    command_color_rgb=RGB_WHITE,
+                    command_brightness=white_pct,
+                )
+                return
+
             if self.record.capabilities.supports_color and ATTR_RGB_COLOR in kwargs:
                 await self.runtime_data.async_send_local_command(
                     self.hass,
@@ -246,11 +282,11 @@ class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):
                 )
                 return
 
-            if self.record.capabilities.supports_color_temp:
+            if self.record.capabilities.supports_color_temp and brightness_pct is not None:
                 await self.runtime_data.async_send_local_command(
                     self.hass,
                     command_device_id=self.record.id,
-                    command_brightness=brightness_pct if brightness_pct is not None else 100,
+                    command_brightness=brightness_pct,
                 )
                 return
 
