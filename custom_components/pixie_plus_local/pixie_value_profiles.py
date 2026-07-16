@@ -58,6 +58,11 @@ hardware_list = {
     "2452": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
     "1217": "Gate & Door Control - PC206GD/R/BTAM",
     "2704": "Strip Kit RGB - FLBP24V2RGB/BTAM",
+    "2450": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (single colour mode)",
+    "2550": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (tunable white mode)",
+    "2650": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (RGBW mode)",
+    "2750": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (RGB mode)",
+    "2850": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (RGBTW mode)",
 }
 
 # Unified model capability truth.
@@ -387,6 +392,84 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_usb_subentity": False,
         "supports_cover": False,
     },
+    "2450": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2550": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": False,
+        "supports_color_temp": True,
+        "color_temp_runtime_encoding": "tail_7bit_brightness",
+        "color_temp_min_kelvin": 3000,
+        "color_temp_max_kelvin": 6500,
+        "color_temp_cct_min": 0,
+        "color_temp_cct_max": 255,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2650": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": True,
+        "supports_effects": True,
+        "effect_command_encoding": "template",
+        "effect_names": ["flash", "strobe", "fade", "smooth"],
+        "color_runtime_encoding": "tail_hue_extended",
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2750": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": True,
+        "supports_effects": True,
+        "effect_command_encoding": "template",
+        "effect_names": ["flash", "strobe", "fade", "smooth"],
+        "color_runtime_encoding": "tail_hue_extended",
+        "color_runtime_white_preferred_tail": 0x78,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
+    "2850": {
+        "is_light": True,
+        "is_switch": False,
+        "supports_onoff": True,
+        "supports_dimming": True,
+        "supports_color": True,
+        "supports_color_temp": True,
+        "color_temp_runtime_encoding": "tail_7bit_brightness",
+        "color_temp_min_kelvin": 3000,
+        "color_temp_max_kelvin": 6500,
+        "color_temp_cct_min": 0,
+        "color_temp_cct_max": 255,
+        "supports_effects": True,
+        "effect_command_encoding": "template",
+        "effect_names": ["flash", "strobe", "fade", "smooth"],
+        "color_runtime_encoding": "tail_hue_extended",
+        "combined_runtime_encoding": "rgb_effect_color_temp_tail",
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },
 }
 
 
@@ -408,7 +491,10 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),
         "color_runtime_encoding": str(caps.get("color_runtime_encoding", "")),
+        "color_runtime_white_preferred_tail": int(caps.get("color_runtime_white_preferred_tail", -1)),
         "supports_color_temp": bool(caps.get("supports_color_temp", False)),
+        "color_temp_runtime_encoding": str(caps.get("color_temp_runtime_encoding", "")),
+        "combined_runtime_encoding": str(caps.get("combined_runtime_encoding", "")),
         "color_temp_min_kelvin": int(caps.get("color_temp_min_kelvin", 0)),
         "color_temp_max_kelvin": int(caps.get("color_temp_max_kelvin", 0)),
         "color_temp_cct_min": int(caps.get("color_temp_cct_min", 0)),
@@ -984,6 +1070,8 @@ def _decode_mode_from_capabilities(capabilities: Any) -> str:
         return MODE_PLUG_WITH_USB
     if _cap(capabilities, "supports_multi_channel", False):
         return MODE_DUAL_CHANNEL
+    if _cap(capabilities, "combined_runtime_encoding", ""):
+        return MODE_COLOR_EFFECT
     if _cap(capabilities, "color_runtime_encoding", ""):
         return MODE_COLOR_EFFECT
     if _cap(capabilities, "supports_color_temp", False):
@@ -1025,9 +1113,13 @@ def decode_value_byte_for_capabilities(capabilities: Any, value_byte: int) -> Di
         return result
 
     if mode == MODE_TUNABLE_WHITE:
-        brightness = max(0, min(100, value_byte - 0x80))
+        if _cap(capabilities, "color_temp_runtime_encoding", "") == "tail_7bit_brightness":
+            brightness = value_byte & 0x7F
+        else:
+            brightness = value_byte - 0x80
+        brightness = max(0, min(100, brightness))
         result["brightness_0_100"] = brightness
-        result["is_on"] = value_byte > 0x80
+        result["is_on"] = brightness > 0
         return result
 
     if mode == MODE_DUAL_CHANNEL:
@@ -1116,7 +1208,8 @@ def _hue_degrees_to_rgb(hue_degrees: int) -> list[int]:
 def decode_color_runtime_state_for_capabilities(capabilities: Any, value_byte: int, tail_byte: int) -> Dict[str, Any]:
     """Decode compact runtime bytes for RGB strip families that report color/effects."""
     encoding = _cap(capabilities, "color_runtime_encoding", "")
-    if not encoding:
+    combined_encoding = _cap(capabilities, "combined_runtime_encoding", "")
+    if not encoding and not combined_encoding:
         return {}
 
     tail = max(0, min(255, int(tail_byte)))
@@ -1134,6 +1227,35 @@ def decode_color_runtime_state_for_capabilities(capabilities: Any, value_byte: i
 
     brightness = max(0, min(100, value & 0x7F))
     high_bit_set = bool(value & 0x80)
+
+    if combined_encoding == "rgb_effect_color_temp_tail":
+        is_cct_tail = (0xB5 <= tail <= 0xD4) or (tail == 0xB4 and high_bit_set)
+        if is_cct_tail:
+            cct = round(((tail - 0xB4) * 255) / (0xD4 - 0xB4))
+            return {
+                "mode": MODE_TUNABLE_WHITE,
+                "brightness_0_100": brightness,
+                "is_on": brightness > 0,
+                "high_bit_set": high_bit_set,
+                "tail_byte": tail,
+                "cct": max(0, min(255, cct)),
+                "effect": None,
+            }
+        combined_effect_map = {
+            0xD5: "flash",
+            0xDF: "strobe",
+            0xE9: "smooth",
+            0xF3: "fade",
+        }
+        if tail in combined_effect_map:
+            return {
+                "mode": MODE_COLOR_EFFECT,
+                "brightness_0_100": brightness,
+                "is_on": brightness > 0,
+                "high_bit_set": high_bit_set,
+                "tail_byte": tail,
+                "effect": combined_effect_map[tail],
+            }
 
     if tail == 0xFF:
         return {
@@ -1169,8 +1291,35 @@ def decode_color_runtime_state_for_capabilities(capabilities: Any, value_byte: i
         hue_degrees = (tail * 2) % 360
         decoded["hue_degrees"] = hue_degrees
         decoded["rgb"] = _hue_degrees_to_rgb(hue_degrees)
+        white_preferred_tail = int(_cap(capabilities, "color_runtime_white_preferred_tail", -1))
+        if tail == white_preferred_tail:
+            decoded["white_preferred_tail"] = True
+            decoded["rgb"] = [255, 255, 255]
 
     return decoded
+
+
+def decode_color_temp_runtime_state_for_capabilities(capabilities: Any, value_byte: int, tail_byte: int) -> Dict[str, Any]:
+    """Decode compact runtime bytes for tunable-white/CCT devices."""
+    encoding = _cap(capabilities, "color_temp_runtime_encoding", "")
+    value = max(0, min(255, int(value_byte)))
+    tail = max(0, min(255, int(tail_byte)))
+
+    if encoding == "tail_7bit_brightness":
+        brightness = max(0, min(100, value & 0x7F))
+        cct = max(0, min(255, round((tail * 255) / 127))) if tail <= 0x7F else tail
+    else:
+        brightness = max(0, min(100, value - 0x80))
+        cct = tail
+
+    return {
+        "mode": MODE_TUNABLE_WHITE,
+        "brightness_0_100": brightness,
+        "is_on": brightness > 0,
+        "high_bit_set": bool(value & 0x80),
+        "tail_byte": tail,
+        "cct": cct,
+    }
 
 
 def decode_color_runtime_hue_for_capabilities(capabilities: Any, hue_value: Any) -> Dict[str, Any]:

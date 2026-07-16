@@ -27,12 +27,18 @@ PIXIE_CHAR_1911_SUFFIX = "1911"
 PIXIE_CHAR_1912_SUFFIX = "1912"
 PIXIE_CHAR_1914_SUFFIX = "1914"
 PIXIE_DEFAULT_NAME = "Smart Light"
+BLE_PASSIVE_STALE_SECONDS = 300.0
+BLE_NOTIFY_WAIT_SECONDS = 5.0
 
 
 BT_STATE_DISABLED = "disabled"
 BT_STATE_READY = "ready"
 BT_STATE_NO_WORKING_PROXY = "no_working_proxy"
 BT_STATE_UNAVAILABLE = "unavailable"
+
+
+class _PixieBleReconnectRequested(RuntimeError):
+    """Internal signal used to restart a stale BLE session without long backoff."""
 
 
 @dataclass
@@ -98,6 +104,8 @@ class PixieBluetoothRuntime:
     _notify_remove: Callable[[], None] | None = None
     _char_1912: int | None = None
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _reconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
+    _reconnect_reason: str | None = None
 
     async def async_start(self) -> None:
         """Start the BLE runtime if enabled."""
@@ -147,6 +155,16 @@ class PixieBluetoothRuntime:
                 await self._connect_and_run_once()
             except asyncio.CancelledError:
                 raise
+            except _PixieBleReconnectRequested as err:
+                self.health.state = BT_STATE_UNAVAILABLE
+                self.health.last_error = str(err)
+                self.health.reconnect_count += 1
+                LOGGER.warning("Pixie BLE session reconnect requested: %s", err)
+                await self._disconnect_client()
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=0.25)
+                except TimeoutError:
+                    continue
             except Exception as err:
                 self.health.state = BT_STATE_UNAVAILABLE
                 self.health.last_error = str(err)
@@ -160,11 +178,25 @@ class PixieBluetoothRuntime:
 
     async def _connect_and_run_once(self) -> None:
         """Connect, login, enable notifications, and wait until disconnected."""
+        self._reconnect_event.clear()
+        self._reconnect_reason = None
         notify_queue = await self._connect_login_enable()
         while not self._stop_event.is_set():
+            if self._reconnect_event.is_set():
+                reason = self._reconnect_reason or "BLE reconnect requested"
+                self._reconnect_event.clear()
+                self._reconnect_reason = None
+                raise _PixieBleReconnectRequested(reason)
             try:
-                raw = await asyncio.wait_for(notify_queue.get(), timeout=30.0)
+                raw = await asyncio.wait_for(notify_queue.get(), timeout=BLE_NOTIFY_WAIT_SECONDS)
             except TimeoutError:
+                if self.is_notification_stale():
+                    age = self.notification_age()
+                    raise _PixieBleReconnectRequested(
+                        f"BLE notification stream stale for {age:.1f}s"
+                        if age is not None
+                        else "BLE notification stream stale"
+                    )
                 continue
             self._handle_notification(raw)
 
@@ -285,6 +317,7 @@ class PixieBluetoothRuntime:
         self.health.enabled = self.enabled
         self.health.state = BT_STATE_READY
         self.health.last_error = None
+        self.health.last_update_at = time.time()
         LOGGER.info("Pixie BLE session ready via %s source=%s", address, self.health.source)
         self._mark_access_node_capability(response_capable=False)
         return notify_queue
@@ -322,6 +355,13 @@ class PixieBluetoothRuntime:
 
     async def async_send_command(self, command_kwargs: dict[str, Any]) -> None:
         """Send a command via BLE 1912."""
+        if self.is_notification_stale():
+            age = self.notification_age()
+            raise RuntimeError(
+                f"Pixie BLE notification stream is stale for {age:.1f}s"
+                if age is not None
+                else "Pixie BLE notification stream is stale"
+            )
         if self._client is None or self._session_key is None or self._device_mac is None or self._char_1912 is None:
             raise RuntimeError("Pixie BLE session is not ready")
         plain_packets = self._build_plain_1912_packets(command_kwargs)
@@ -445,6 +485,28 @@ class PixieBluetoothRuntime:
         self.health.last_update_at = time.time()
         self.health.last_error = None
         self.health.state = BT_STATE_READY
+
+    def notification_age(self) -> float | None:
+        """Return seconds since the last direct BLE notification/liveness mark."""
+        last = self.health.last_update_at or self.health.last_connected_at
+        if last is None:
+            return None
+        return max(0.0, time.time() - last)
+
+    def is_notification_stale(self, stale_seconds: float = BLE_PASSIVE_STALE_SECONDS) -> bool:
+        """Return True when the direct BLE notification stream has gone quiet."""
+        if not self.enabled or self.health.state != BT_STATE_READY:
+            return False
+        age = self.notification_age()
+        return age is not None and age > stale_seconds
+
+    async def async_request_reconnect(self, reason: str) -> None:
+        """Ask the runtime loop to reconnect the current BLE session."""
+        self._reconnect_reason = reason
+        self._reconnect_event.set()
+        self.health.state = BT_STATE_UNAVAILABLE
+        self.health.last_error = reason
+        await self._disconnect_client()
 
 
 async def async_probe_pixie_bluetooth_proxy(

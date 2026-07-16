@@ -17,6 +17,7 @@ import logging
 from .pixie_value_profiles import (
     decode_color_runtime_hue_for_capabilities,
     decode_color_runtime_state_for_capabilities,
+    decode_color_temp_runtime_state_for_capabilities,
     decode_contact_runtime_state,
     decode_gate_state_byte,
     decode_value_byte_for_capabilities,
@@ -194,6 +195,7 @@ class RuntimeState:
     raw: Dict[str, Any] = field(default_factory=dict)
     last_source: str = "cloud_seed"
     last_updated_ms: Optional[int] = None
+    local_ambiguous_blue_intent_until: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -557,16 +559,44 @@ class DeviceStateStore:
                             update_mode = 1
                         elif pct == 2:
                             update_mode = 2
-                elif inv_rec.capabilities.supports_color_temp:
+                elif inv_rec.capabilities.combined_runtime_encoding:
                     raw_value = _normalize_optional_int(br_obj.get("raw"))
-                    if isinstance(raw_value, int):
-                        interpreted = decode_value_byte_for_capabilities(inv_rec.capabilities, raw_value)
-                        brightness = interpreted.get("brightness_0_100")
+                    rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
+                    if isinstance(raw_value, int) and isinstance(rssi_raw, int):
+                        decoded_color = decode_color_runtime_state_for_capabilities(
+                            inv_rec.capabilities,
+                            raw_value,
+                            rssi_raw,
+                        )
+                        brightness = decoded_color.get("brightness_0_100")
                         if isinstance(brightness, int):
                             update_br = brightness
-                    rssi_raw = rec_data.get("rssi_raw")
-                    if rssi_raw is not None:
-                        update_cct = _normalize_optional_int(rssi_raw)
+                        if decoded_color.get("mode") == "tunable_white":
+                            cct = decoded_color.get("cct")
+                            if isinstance(cct, int):
+                                update_cct = cct
+                            update_effect = None
+                        else:
+                            update_cct = None
+                            if "effect" in decoded_color:
+                                update_effect = decoded_color.get("effect")
+                            if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
+                                update_rgb = [int(channel) for channel in decoded_color["rgb"]]
+                elif inv_rec.capabilities.supports_color_temp:
+                    raw_value = _normalize_optional_int(br_obj.get("raw"))
+                    rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
+                    if isinstance(raw_value, int) and isinstance(rssi_raw, int):
+                        decoded_temp = decode_color_temp_runtime_state_for_capabilities(
+                            inv_rec.capabilities,
+                            raw_value,
+                            rssi_raw,
+                        )
+                        brightness = decoded_temp.get("brightness_0_100")
+                        if isinstance(brightness, int):
+                            update_br = brightness
+                        cct = decoded_temp.get("cct")
+                        if isinstance(cct, int):
+                            update_cct = cct
                 elif inv_rec.capabilities.color_runtime_encoding:
                     raw_value = _normalize_optional_int(br_obj.get("raw"))
                     rssi_raw = _normalize_optional_int(rec_data.get("rssi_raw"))
@@ -669,7 +699,10 @@ class DeviceCapabilities:
     supports_dimming: bool = False
     supports_color: bool = False
     color_runtime_encoding: str = ""
+    color_runtime_white_preferred_tail: int = -1
     supports_color_temp: bool = False
+    color_temp_runtime_encoding: str = ""
+    combined_runtime_encoding: str = ""
     color_temp_min_kelvin: int = 0
     color_temp_max_kelvin: int = 0
     color_temp_cct_min: int = 0
@@ -707,7 +740,10 @@ class DeviceCapabilities:
             "supports_dimming": self.supports_dimming,
             "supports_color": self.supports_color,
             "color_runtime_encoding": self.color_runtime_encoding,
+            "color_runtime_white_preferred_tail": self.color_runtime_white_preferred_tail,
             "supports_color_temp": self.supports_color_temp,
+            "color_temp_runtime_encoding": self.color_temp_runtime_encoding,
+            "combined_runtime_encoding": self.combined_runtime_encoding,
             "color_temp_min_kelvin": self.color_temp_min_kelvin,
             "color_temp_max_kelvin": self.color_temp_max_kelvin,
             "color_temp_cct_min": self.color_temp_cct_min,
@@ -747,7 +783,10 @@ class DeviceCapabilities:
             supports_dimming=bool(data.get("supports_dimming", False)),
             supports_color=bool(data.get("supports_color", False)),
             color_runtime_encoding=str(data.get("color_runtime_encoding", "")),
+            color_runtime_white_preferred_tail=int(data.get("color_runtime_white_preferred_tail", -1)),
             supports_color_temp=bool(data.get("supports_color_temp", False)),
+            color_temp_runtime_encoding=str(data.get("color_temp_runtime_encoding", "")),
+            combined_runtime_encoding=str(data.get("combined_runtime_encoding", "")),
             color_temp_min_kelvin=int(data.get("color_temp_min_kelvin", 0)),
             color_temp_max_kelvin=int(data.get("color_temp_max_kelvin", 0)),
             color_temp_cct_min=int(data.get("color_temp_cct_min", 0)),
@@ -832,6 +871,8 @@ class DeviceRecord:
             capabilities.effect_command_encoding = str(model_caps.get("effect_command_encoding", ""))
             if not capabilities.effect_names:
                 capabilities.effect_names = list(model_caps.get("effect_names") or [])
+        if capabilities.color_runtime_white_preferred_tail < 0:
+            capabilities.color_runtime_white_preferred_tail = int(model_caps.get("color_runtime_white_preferred_tail", -1))
         return cls(
             id=int(data.get("id", 0)),
             type=int(data.get("type", 0)),
@@ -884,7 +925,10 @@ class PixieInventory:
         cap.supports_dimming = model_caps["supports_dimming"]
         cap.supports_color = model_caps["supports_color"]
         cap.color_runtime_encoding = model_caps["color_runtime_encoding"]
+        cap.color_runtime_white_preferred_tail = int(model_caps["color_runtime_white_preferred_tail"])
         cap.supports_color_temp = model_caps["supports_color_temp"]
+        cap.color_temp_runtime_encoding = model_caps["color_temp_runtime_encoding"]
+        cap.combined_runtime_encoding = model_caps["combined_runtime_encoding"]
         cap.color_temp_min_kelvin = int(model_caps["color_temp_min_kelvin"])
         cap.color_temp_max_kelvin = int(model_caps["color_temp_max_kelvin"])
         cap.color_temp_cct_min = int(model_caps["color_temp_cct_min"])
