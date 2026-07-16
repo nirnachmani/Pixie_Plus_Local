@@ -43,7 +43,8 @@ The current code includes support for these models:
 - Smart Dimmer rippleSHIELD - SDD400RS/BTAM
 - SFI Dimmer - SDD400SFI
 - Contact Sensor Transceiver - PC100CS/R/BTAM
-- Strip Kit RGB - FLBP24V2RGB/BTAM 
+- Strip Kit RGB - FLBP24V2RGB/BTAM
+- Smart RGBTW LED strip controller - LT8915RTW/BTAM
 
 ## Installation
 
