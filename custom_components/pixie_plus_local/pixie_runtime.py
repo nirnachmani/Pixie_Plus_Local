@@ -77,6 +77,9 @@ class PixieHub:
         self.host = host
         self.port = port
         self.is_valid = False
+        self.meshnet: Optional[str] = None
+        self.meshnet2: Optional[str] = None
+        self.from_value: Optional[str] = None
 
     def __repr__(self):
         return f"Hub({self.host}:{self.port})"
@@ -109,6 +112,16 @@ class CloudParams:
     meshnet: str
     meshnet2: str
     netid: str
+
+
+@dataclass(frozen=True)
+class CloudHomeList:
+    """Cloud login result plus the homes visible to that account."""
+
+    user_id: str
+    session_token: str
+    current_home_id: str | None
+    homes: Tuple[Dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -475,10 +488,12 @@ def listen_for_responses(sock: socket.socket, timeout: int = 10) -> Tuple[List[P
                             continue
                         hub = PixieHub(src_ip, UDP_DISCOVERY_PORT)
                         hub.is_valid = True
+                        hub.meshnet = str(gateway_meshnet or "") or None
+                        hub.meshnet2 = str(gateway_meshnet2 or "") or None
+                        hub.from_value = str(gateway_from or "") or None
                         hubs_found.append(hub)
                         seen_ips.add(src_ip)
                         LOGGER.debug("Valid gateway discovered at %s:%s", src_ip, src_port)
-                        break
 
                 except json.JSONDecodeError:
                     # Fallback: try to decode as raw envelope
@@ -508,10 +523,12 @@ def listen_for_responses(sock: socket.socket, timeout: int = 10) -> Tuple[List[P
                                 continue
                             hub = PixieHub(src_ip, UDP_DISCOVERY_PORT)
                             hub.is_valid = True
+                            hub.meshnet = str(gateway_meshnet or "") or None
+                            hub.meshnet2 = str(gateway_meshnet2 or "") or None
+                            hub.from_value = str(gateway_from or "") or None
                             hubs_found.append(hub)
                             seen_ips.add(src_ip)
                             LOGGER.debug("Valid gateway discovered at %s:%s", src_ip, src_port)
-                            break
                     else:
                         LOGGER.debug("Could not decode UDP response from %s:%s (len=%s)", src_ip, src_port, len(data))
 
@@ -595,28 +612,34 @@ class PixieAuthHandler:
     def _debug_enabled(self) -> bool:
         return self.verbose or LOGGER.isEnabledFor(logging.DEBUG)
 
+    def _log_message(self, message: str) -> str:
+        home_name = str(self.home_name or "").strip()
+        if home_name and home_name not in ("unknown", "None"):
+            return f"[{home_name}] {message}"
+        return message
+
     def _log_debug(self, message: str, *args: Any) -> None:
-        LOGGER.debug(message, *args)
+        LOGGER.debug(self._log_message(message), *args)
 
     def _log_info(self, message: str, *args: Any) -> None:
-        LOGGER.info(message, *args)
+        LOGGER.info(self._log_message(message), *args)
 
     def _log_warning(self, message: str, *args: Any) -> None:
-        LOGGER.warning(message, *args)
+        LOGGER.warning(self._log_message(message), *args)
 
     def _log_error(self, message: str, *args: Any) -> None:
-        LOGGER.error(message, *args)
+        LOGGER.error(self._log_message(message), *args)
 
     def _log_exception(self, message: str, *args: Any) -> None:
-        LOGGER.exception(message, *args)
+        LOGGER.exception(self._log_message(message), *args)
 
     def _log_multiline_debug(self, header: str, lines: List[str]) -> None:
         if not self._debug_enabled():
             return
         if lines:
-            LOGGER.debug("%s\n%s", header, "\n".join(lines))
+            LOGGER.debug("%s\n%s", self._log_message(header), "\n".join(lines))
         else:
-            LOGGER.debug("%s", header)
+            LOGGER.debug("%s", self._log_message(header))
 
     def set_inventory_update_callback(
         self,
@@ -1439,9 +1462,19 @@ class PixieAuthHandler:
 
     def _resolve_gateway_ip(self, gateway_ip: Optional[str]) -> str:
         """Resolve a gateway IP either from the caller or via UDP discovery."""
+        candidates = self._resolve_gateway_candidates(gateway_ip)
+        if len(candidates) == 1:
+            return candidates[0]
+        self._log_warning("Multiple gateways discovered; unable to choose automatically")
+        raise PixieGatewayResolutionError(
+            "Multiple Pixie gateways were discovered; enter the gateway IP explicitly"
+        )
+
+    def _resolve_gateway_candidates(self, gateway_ip: Optional[str]) -> List[str]:
+        """Return gateway IP candidates ordered by confidence."""
         if gateway_ip:
             self._log_debug("Using explicit gateway IP: %s", gateway_ip)
-            return gateway_ip
+            return [gateway_ip]
 
         self._log_debug("Scanning LAN for Pixie gateways")
         discovered_hubs = self.scan_lan_for_hubs()
@@ -1452,15 +1485,16 @@ class PixieAuthHandler:
                 "No Pixie gateway was discovered via UDP within 10 seconds"
             )
 
-        if len(discovered_hubs) == 1 and discovered_hubs[0].is_valid:
-            resolved_host = discovered_hubs[0].host
-            self._log_debug("Auto-selected gateway: %s", resolved_host)
-            return resolved_host
+        expected_values = {str(v) for v in (self.meshnet, self.meshnet2) if v not in (None, "", "unknown")}
 
-        self._log_warning("Multiple gateways discovered; unable to choose automatically")
-        raise PixieGatewayResolutionError(
-            "Multiple Pixie gateways were discovered; enter the gateway IP explicitly"
-        )
+        def _candidate_rank(hub: PixieHub) -> tuple[int, str]:
+            advertised_values = {str(v) for v in (hub.meshnet, hub.meshnet2) if v not in (None, "", "unknown")}
+            return (0 if expected_values & advertised_values else 1, hub.host)
+
+        ordered_hubs = sorted((hub for hub in discovered_hubs if hub.is_valid), key=_candidate_rank)
+        candidates = [hub.host for hub in ordered_hubs]
+        self._log_debug("Gateway candidates discovered: %s", candidates)
+        return candidates
 
     def _start_runtime_session(
         self,
@@ -1530,8 +1564,20 @@ class PixieAuthHandler:
         inventory_loaded = False
         hub_payload: Optional[Dict[str, Any]] = None
         net_id_int = int(str(self.netid_seed)) if self.netid_seed not in (None, "", "unknown") else None
+        gateway_identity = self._current_gateway_identity()
+        supports_53216 = (
+            gateway_identity.supports_local_inventory_53216
+            if gateway_identity is not None
+            else True
+        )
 
-        if net_id_int is not None:
+        if not supports_53216:
+            self._log_debug(
+                "Gateway model %s does not support %s inventory; using cloud inventory snapshot",
+                gateway_identity.model_no if gateway_identity is not None else "unknown",
+                TCP_SYNC_PORT,
+            )
+        elif net_id_int is not None:
             try:
                 self._log_debug("Attempting one-shot %s inventory request", TCP_SYNC_PORT)
                 sync_result = self._sync_inventory_53216_once(
@@ -1658,9 +1704,15 @@ class PixieAuthHandler:
         password: str,
         *,
         include_inventory_seed: bool = True,
+        selected_home_id: Optional[str] = None,
     ) -> CloudParams:
         """Fetch cloud-derived parameters required to access the local gateway."""
-        config = self._fetch_login_data(username, password, include_inventory_seed=include_inventory_seed)
+        config = self._fetch_login_data(
+            username,
+            password,
+            include_inventory_seed=include_inventory_seed,
+            selected_home_id=selected_home_id,
+        )
         cloud_params = CloudParams(
             home_id=str(config.get("homeid") or "unknown"),
             home_name=str(config.get("home_name") or "unknown"),
@@ -1679,6 +1731,7 @@ class PixieAuthHandler:
         password: str,
         *,
         include_inventory_seed: bool = True,
+        selected_home_id: Optional[str] = None,
     ) -> CloudParams:
         """Async wrapper for cloud parameter retrieval."""
         return await asyncio.to_thread(
@@ -1686,6 +1739,7 @@ class PixieAuthHandler:
             username,
             password,
             include_inventory_seed=include_inventory_seed,
+            selected_home_id=selected_home_id,
         )
 
     def bootstrap_gateway(
@@ -1800,11 +1854,11 @@ class PixieAuthHandler:
 
             if decoded:
                 meshnet = decoded.get("meshNet")
-                if meshnet:
+                if meshnet and self.meshnet in (None, "", "unknown"):
                     self.meshnet = meshnet
                     self._log_debug("Updated meshNet from UDP response: %s", meshnet)
                 meshnet2 = decoded.get("meshNet2")
-                if meshnet2:
+                if meshnet2 and self.meshnet2 in (None, "", "unknown"):
                     self.meshnet2 = meshnet2
                     self._log_debug("Updated meshNet2 from UDP response: %s", meshnet2)
                 if meshnet2 and not self.meshnet:
@@ -1917,6 +1971,52 @@ class PixieAuthHandler:
 
         self._log_debug("Bootstrap metadata: meshNet=%s meshNet2=%s netID=%s", self.meshnet, self.meshnet2, self.netid_seed)
 
+        if hub_ip is None:
+            candidate_hosts = self._resolve_gateway_candidates(None)
+            last_error: Optional[Exception] = None
+            for candidate_host in candidate_hosts:
+                self._log_debug("Trying Pixie gateway candidate %s for home %s", candidate_host, self.home_id)
+                try:
+                    return self.discover_and_connect(
+                        username=username,
+                        password=password,
+                        hub_ip=candidate_host,
+                        login_required=False,
+                        sync_timeout=sync_timeout,
+                        command_device_id=command_device_id,
+                        command_state=command_state,
+                        command_brightness=command_brightness,
+                        command_color_rgb=command_color_rgb,
+                        command_color_temp_cct=command_color_temp_cct,
+                        command_white=command_white,
+                        command_effect=command_effect,
+                        command_target=command_target,
+                        command_mode=command_mode,
+                        command_cover_action=command_cover_action,
+                        command_cover_action_map=command_cover_action_map,
+                        command_cover_tilt_action_map=command_cover_tilt_action_map,
+                        command_timer_action=command_timer_action,
+                        command_timer_duration=command_timer_duration,
+                        command_sensor_param=command_sensor_param,
+                        command_sensor_param_value=command_sensor_param_value,
+                        command_gate_door=command_gate_door,
+                        stop_event=stop_event,
+                        keep_control_alive=keep_control_alive,
+                        wait_for_shutdown=wait_for_shutdown,
+                        hydrate_inventory=hydrate_inventory,
+                    )
+                except PixieAuthError as exc:
+                    last_error = exc
+                    self._log_debug("Pixie gateway candidate %s rejected: %s", candidate_host, exc)
+                    if self.runtime_session is not None:
+                        self.runtime_session.stop_and_join(timeout=5.0)
+                    self.runtime_session = None
+                    self.session_key_hex = None
+
+            raise PixieGatewayResolutionError(
+                f"No discovered Pixie gateway matched the selected home ({last_error})"
+            )
+
         hub_ip = self._resolve_gateway_ip(hub_ip)
 
         # Step 3: Start 41578 control loop in background and keep it alive.
@@ -1947,7 +2047,10 @@ class PixieAuthHandler:
         priming_timeout = 5.0
         primed = runtime_session.wait_until_primed(timeout=priming_timeout)
         if primed:
-            self._log_debug("41578 primed; starting one-shot %s inventory hydration", TCP_SYNC_PORT)
+            if hydrate_inventory:
+                self._log_debug("41578 primed; starting one-shot %s inventory hydration", TCP_SYNC_PORT)
+            else:
+                self._log_debug("41578 primed; using cloud inventory snapshot")
         else:
             self._log_warning("41578 priming timeout; continuing startup inventory with state=%s", runtime_session.ready_state)
 
@@ -2304,13 +2407,15 @@ class PixieAuthHandler:
         show_devices: Optional[bool] = None,
     ) -> None:
         """Build and assign normalized inventory from a Home-like object payload."""
+        previous_inventory = self.inventory
         self.inventory = PixieInventory.from_home_object(
             home_obj,
             user_id=str(user_id or "unknown"),
             source=source,
         )
+        preserved_versions = self.inventory.preserve_ble_advertised_versions_from(previous_inventory)
         self.gateway_identity = self.inventory.gateway
-        self._log_debug("Built inventory from %s", source)
+        self._log_debug("Built inventory from %s%s", source, f"; preserved {preserved_versions} BLE firmware version(s)" if preserved_versions else "")
         show = self.verbose if show_devices is None else bool(show_devices)
         if show:
             debug_dump = (
@@ -2326,6 +2431,11 @@ class PixieAuthHandler:
                 len(self.inventory.devices_by_id),
                 self.inventory.net_id,
             )
+            if source.startswith("cloud"):
+                self._log_multiline_debug(
+                    f"Inventory device summary for {source}",
+                    self.inventory.debug_lines(),
+                )
 
     def _fetch_home_object(self, homeid: Optional[str], sessiontoken: Optional[str]) -> Optional[Dict[str, Any]]:
         """Fetch Home object from cloud for metadata fallback only."""
@@ -2639,8 +2749,136 @@ class PixieAuthHandler:
 
         return None
 
+    @staticmethod
+    def _check_cloud_login_response(response: Any) -> None:
+        """Raise a typed error when the cloud reports bad credentials."""
+        if response.status_code == 403:
+            raise PixieInvalidCredentialsError("Invalid Pixie username/password")
 
-    def _fetch_login_data(self, username: str, password: str, include_inventory_seed: bool = True) -> Dict[str, Any]:
+        if response.status_code in (400, 401, 404):
+            try:
+                error_payload = response.json()
+            except Exception:
+                error_payload = {}
+            error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
+            error_text = str(error_payload.get("error") or "") if isinstance(error_payload, dict) else ""
+            if error_code == 101 or "invalid username/password" in error_text.lower():
+                raise PixieInvalidCredentialsError("Invalid Pixie username/password")
+
+    def fetch_cloud_home_list(self, username: str, password: str) -> CloudHomeList:
+        """Log in to Pixie cloud and return every Home visible to this account."""
+        import httpx
+
+        headers = {
+            "x-parse-application-id": APPLICATION_ID,
+            "x-parse-installation-id": "cli-installation",
+            "x-parse-client-key": CLIENT_KEY,
+            "x-parse-revocable-session": "1",
+        }
+        response = httpx.post(API_URL["login"], json={"username": username, "password": password}, headers=headers)
+        self._check_cloud_login_response(response)
+        response.raise_for_status()
+
+        login_data = response.json()
+        user_id = str(login_data.get("objectId") or "unknown")
+        session_token = str(login_data.get("sessionToken") or "unknown")
+        cur_home = login_data.get("curHome") if isinstance(login_data.get("curHome"), dict) else {}
+        current_home_id = str(cur_home.get("objectId")) if cur_home.get("objectId") is not None else None
+
+        home_headers = {
+            "x-parse-session-token": session_token,
+            "x-parse-application-id": APPLICATION_ID,
+            "x-parse-client-key": CLIENT_KEY,
+        }
+        homes: List[Dict[str, Any]] = []
+        skip = 0
+        limit = 100
+        while True:
+            home_response = httpx.get(
+                API_URL["home"],
+                params={"where": "{}", "skip": skip, "limit": limit},
+                headers=home_headers,
+            )
+            home_response.raise_for_status()
+            batch = home_response.json().get("results", [])
+            if not isinstance(batch, list):
+                break
+            homes.extend(home for home in batch if isinstance(home, dict))
+            if len(batch) < limit:
+                break
+            skip += limit
+
+        self._log_debug(
+            "Cloud login returned %s home(s), current_home=%s",
+            len(homes),
+            current_home_id,
+        )
+        return CloudHomeList(
+            user_id=user_id,
+            session_token=session_token,
+            current_home_id=current_home_id,
+            homes=tuple(homes),
+        )
+
+    async def async_fetch_cloud_home_list(self, username: str, password: str) -> CloudHomeList:
+        """Async wrapper for visible Pixie Home listing."""
+        return await asyncio.to_thread(self.fetch_cloud_home_list, username, password)
+
+    def _home_object_to_login_config(
+        self,
+        home_obj: Dict[str, Any],
+        *,
+        user_id: str,
+        session_token: str,
+        include_inventory_seed: bool,
+    ) -> Dict[str, Any]:
+        """Build the legacy login config shape from a selected Home object."""
+        homeid = str(home_obj.get("objectId") or "unknown")
+        home_name = str(home_obj.get("name") or "unknown")
+        meshnet = str(home_obj.get("meshNet")) if home_obj.get("meshNet") is not None else homeid
+        meshnet2 = str(home_obj.get("meshNet2")) if home_obj.get("meshNet2") is not None else "unknown"
+        netid = str(home_obj.get("netID")) if home_obj.get("netID") is not None else (self.netid_seed or "unknown")
+
+        self._cached_cloud_home_obj = dict(home_obj)
+        if include_inventory_seed:
+            try:
+                self._set_inventory_from_home_object(home_obj, str(user_id), source="cloud_seed")
+            except Exception as inv_err:
+                self._log_debug("Could not build inventory from Home payload: %s", inv_err)
+
+        return {
+            "netid": netid,
+            "meshnet": meshnet,
+            "meshnet2": meshnet2,
+            "homeid": homeid,
+            "home_name": home_name,
+            "userid": str(user_id or "unknown"),
+            "sessiontoken": str(session_token or "unknown"),
+        }
+
+    @staticmethod
+    def _select_home_object(home_list: CloudHomeList, selected_home_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Choose a Home object by id, current home, or first available home."""
+        homes = list(home_list.homes)
+        if selected_home_id:
+            for home in homes:
+                if str(home.get("objectId") or "") == str(selected_home_id):
+                    return home
+            return None
+        if home_list.current_home_id:
+            for home in homes:
+                if str(home.get("objectId") or "") == str(home_list.current_home_id):
+                    return home
+        return homes[0] if homes else None
+
+
+    def _fetch_login_data(
+        self,
+        username: str,
+        password: str,
+        include_inventory_seed: bool = True,
+        selected_home_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Fetch netID, meshNet from Pixie Plus cloud API.
         
@@ -2660,48 +2898,22 @@ class PixieAuthHandler:
         try:
             import httpx
 
-            # Call login API
-            headers = {
-                "x-parse-application-id": APPLICATION_ID,
-                "x-parse-installation-id": "cli-installation",
-                "x-parse-client-key": CLIENT_KEY,
-                "x-parse-revocable-session": "1",
-            }
-
-            body = {"username": username, "password": password}
-
-            response = httpx.post(API_URL["login"], json=body, headers=headers)
-
-            if response.status_code == 403:
-                self._log_warning("Cloud login failed: invalid credentials (403 Unauthorized)")
-                raise PixieInvalidCredentialsError("Invalid Pixie username/password")
-
-            if response.status_code in (400, 401, 404):
-                try:
-                    error_payload = response.json()
-                except Exception:
-                    error_payload = {}
-                error_code = error_payload.get("code") if isinstance(error_payload, dict) else None
-                error_text = str(error_payload.get("error") or "") if isinstance(error_payload, dict) else ""
-                if error_code == 101 or "invalid username/password" in error_text.lower():
-                    self._log_warning(
-                        "Cloud login failed: invalid credentials (%s %s)",
-                        response.status_code,
-                        error_text or "code 101",
-                    )
-                    raise PixieInvalidCredentialsError("Invalid Pixie username/password")
-
-            response.raise_for_status()
-            data = response.json()
-
-            userid = data.get('objectId', userid)
-            home_info = data.get('curHome', {})
-            homeid = home_info.get('objectId', homeid)
-            home_name = home_info.get('name', home_name)
-            sessiontoken = data.get('sessionToken', sessiontoken)
-
-            # Assume meshNet is the homeid for discovery
-            meshnet = homeid
+            home_list = self.fetch_cloud_home_list(username, password)
+            userid = home_list.user_id
+            sessiontoken = home_list.session_token
+            selected_home = self._select_home_object(home_list, selected_home_id)
+            if selected_home is not None:
+                selected_config = self._home_object_to_login_config(
+                    selected_home,
+                    user_id=userid,
+                    session_token=sessiontoken,
+                    include_inventory_seed=include_inventory_seed,
+                )
+                netid = selected_config["netid"]
+                meshnet = selected_config["meshnet"]
+                meshnet2 = selected_config["meshnet2"]
+                homeid = selected_config["homeid"]
+                home_name = selected_config["home_name"]
 
             self._log_debug(
                 "Cloud login succeeded: user=%s home=%s sessionToken=%s meshNet=%s",
@@ -2711,9 +2923,7 @@ class PixieAuthHandler:
                 meshnet,
             )
 
-            # Fallback: many Pixie accounts do not include `curHome` in the login
-            # response, leaving homeid/meshNet/netID unresolved ("unknown"). In that
-            # case, query the Home class directly and adopt the account's home.
+            # Fallback: older accounts may still leave home metadata unresolved.
             if homeid is None or str(homeid) in ("", "unknown", "None"):
                 try:
                     home_list_headers = {
@@ -4139,9 +4349,7 @@ class PixieAuthHandler:
                         parts, handshake_netid = _decrypt_initial_dual_parts(envelope_struct)
                         if parts:
                             part1, part2 = parts
-                            extracted_key = part1
-                            self.session_key_hex = extracted_key
-                            self._log_debug("Session key extracted (Java f14376j): %s", extracted_key)
+                            self._log_debug("Session key extracted (Java f14376j): %s", part1)
                             self._log_debug("Mesh validation value (data2): %s", part2)
 
                             expected_values = {str(v) for v in [self.meshnet, self.meshnet2] if v not in (None, "", "unknown")}
@@ -4151,8 +4359,13 @@ class PixieAuthHandler:
                                     part2,
                                     sorted(expected_values),
                                 )
+                                raise PixieGatewayConnectionError(
+                                    f"Gateway mesh validation mismatch: got {part2}, expected one of {sorted(expected_values)}"
+                                )
                             elif expected_values:
                                 self._log_debug("Mesh validation matched cloud/UDP values")
+                            extracted_key = part1
+                            self.session_key_hex = extracted_key
                             initial_parsed = _parse_message(raw_b64, handshake_netid or self.netid_seed)
                             initial_route, initial_match = _classify_message("in", initial_parsed)
                             _log_message("in", initial_parsed, initial_route, initial_match, byte_len=len(response_data))

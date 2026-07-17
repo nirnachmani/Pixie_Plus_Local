@@ -3,12 +3,24 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect gateway",
-        "description": "Use your Pixie account once to retrieve the parameters needed for ongoing local operation.",
+        "title": "Add Pixie home",
+        "description": "Use your Pixie account once to choose a home and retrieve the parameters needed for ongoing local operation.",
         "data": {
           "username": "Username",
           "password": "Password"
         }
+      },
+      "home": {
+        "title": "Choose Pixie home",
+        "description": "Choose which Pixie home to add to Home Assistant{finish_text}.",
+        "data": {
+          "selected_home_id": "Pixie home"
+        }
+      },
+      "inventory_fallback_notice": {
+        "title": "Pixie credentials will be saved",
+        "description": "This home will use cloud inventory because {reason}. Your Pixie username and password will be stored for this home so the integration can refresh the device list after restarts. Device control and live updates still use the local gateway connection.",
+        "data": {}
       },
       "gateway_ip": {
         "title": "Enter gateway IP",
@@ -19,7 +31,7 @@
       },
       "bluetooth": {
         "title": "Bluetooth support",
-        "description": "Enable the optional Pixie Bluetooth pathway. This requires an ESPHome Bluetooth proxy device already added to Home Assistant. If no working proxy is found, setup will continue using TCP only.",
+        "description": "Enable the optional Pixie Bluetooth pathway for {home_name}. This requires an ESPHome Bluetooth proxy device already added to Home Assistant. If no working proxy is found, setup will continue using TCP only.",
         "data": {
           "enable_bt": "Enable Bluetooth support"
         }
@@ -30,9 +42,15 @@
         "data": {},
         "menu_options": {
           "reconfigure_credentials": "Update fallback credentials",
+          "reconfigure_inventory_mode": "Try local inventory",
           "reconfigure_gateway_connection": "Gateway connection settings",
           "reconfigure_bluetooth": "Bluetooth support"
         }
+      },
+      "reconfigure_inventory_mode": {
+        "title": "Try local inventory",
+        "description": "Try switching this Pixie home back to direct local inventory over the gateway. If this succeeds, stored Pixie credentials will be removed from the entry.",
+        "data": {}
       },
       "reconfigure_bluetooth": {
         "title": "Bluetooth support",
@@ -93,6 +111,7 @@
     },
     "abort": {
       "already_configured": "This Pixie home is already configured.",
+      "setup_complete": "Pixie home setup is complete.",
       "reconfigure_successful": "Pixie credentials updated.",
       "reconfigure_failed": "The Pixie entry could not be reconfigured."
     }
@@ -109,6 +128,10 @@
     "bt_proxy_unavailable": {
       "title": "Pixie Bluetooth proxy unavailable",
       "description": "Bluetooth support was requested for {entry_title}, but the integration could not find a working ESPHome Bluetooth proxy. Error: {error}"
+    },
+    "local_inventory_fallback": {
+      "title": "Pixie local inventory unavailable",
+      "description": "{entry_title} is using cloud inventory because {reason}. Device control and live updates still use the local gateway connection. You can try local inventory again from the integration reconfigure menu."
     }
   },
   "options": {
@@ -118,8 +141,14 @@
         "description": "Choose which Pixie option to change.",
         "menu_options": {
           "transport": "Command transport",
+          "update_device_versions": "Update device versions",
           "cover_controller": "Blind mapping"
         }
+      },
+      "update_device_versions": {
+        "title": "Update device versions",
+        "description": "Scan briefly for Pixie Bluetooth advertisements and update device firmware versions when the devices report a newer value.",
+        "data": {}
       },
       "transport": {
         "title": "Command transport",

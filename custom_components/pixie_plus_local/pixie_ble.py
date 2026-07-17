@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass, field
 import logging
 import time
@@ -73,6 +74,18 @@ class _ESPHomeProxyRef:
     connections_limit: int | None = None
 
 
+@dataclass(frozen=True)
+class PixieFirmwareAdvertisement:
+    """Firmware-bearing Pixie BLE advertisement decoded from a long manufacturer block."""
+
+    mac: str
+    version: int
+    model_no: str
+    device_id: int
+    manufacturer_id: int | None = None
+    rssi: int | None = None
+
+
 @dataclass
 class PixieBluetoothRuntime:
     """Own the optional Pixie BLE runtime session.
@@ -106,6 +119,13 @@ class PixieBluetoothRuntime:
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _reconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
     _reconnect_reason: str | None = None
+
+    @property
+    def _log_prefix(self) -> str:
+        home_name = str(getattr(self.cloud_params, "home_name", "") or "").strip()
+        if home_name and home_name not in ("unknown", "None"):
+            return f"[{home_name}] "
+        return ""
 
     async def async_start(self) -> None:
         """Start the BLE runtime if enabled."""
@@ -159,7 +179,7 @@ class PixieBluetoothRuntime:
                 self.health.state = BT_STATE_UNAVAILABLE
                 self.health.last_error = str(err)
                 self.health.reconnect_count += 1
-                LOGGER.warning("Pixie BLE session reconnect requested: %s", err)
+                LOGGER.warning("%sPixie BLE session reconnect requested: %s", self._log_prefix, err)
                 await self._disconnect_client()
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=0.25)
@@ -169,7 +189,7 @@ class PixieBluetoothRuntime:
                 self.health.state = BT_STATE_UNAVAILABLE
                 self.health.last_error = str(err)
                 self.health.reconnect_count += 1
-                LOGGER.warning("Pixie BLE session stopped; retrying: %s", err)
+                LOGGER.warning("%sPixie BLE session stopped; retrying: %s", self._log_prefix, err)
                 await self._disconnect_client()
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=min(60.0, 3.0 + self.health.reconnect_count))
@@ -213,26 +233,59 @@ class PixieBluetoothRuntime:
         )
         if preferred_address and preferred_address not in (self.preferred_access_node, self.preferred_response_access_node):
             LOGGER.info(
-                "Pixie BLE gateway access-node preference active preferred=%s persisted=%s",
+                "%sPixie BLE gateway access-node preference active preferred=%s persisted=%s",
+                self._log_prefix,
                 preferred_address,
                 self.preferred_access_node,
             )
         elif preferred_address == self.preferred_response_access_node and preferred_address != self.preferred_access_node:
             LOGGER.info(
-                "Pixie BLE response-capable access-node preference active preferred=%s persisted=%s",
+                "%sPixie BLE response-capable access-node preference active preferred=%s persisted=%s",
+                self._log_prefix,
                 preferred_address,
                 self.preferred_access_node,
             )
         proxies = self.proxy_refs if self.proxy_refs is not None else _iter_esphome_bluetooth_proxies(self.hass)
+        if preferred_address:
+            cached_candidates = await _async_discover_candidates(
+                self.hass,
+                preferred_source=self.preferred_source,
+                preferred_address=preferred_address,
+                proxies=proxies,
+                active_scan=False,
+                include_discovered_service_info=False,
+            )
+            if cached_candidates:
+                try:
+                    return await self._try_connect_login_candidates(cached_candidates)
+                except Exception as err:
+                    LOGGER.debug(
+                        "%sPixie BLE cached preferred access-node path failed; falling back to active scan: %s",
+                        self._log_prefix,
+                        err,
+                    )
+            else:
+                LOGGER.debug(
+                    "%sPixie BLE preferred access-node %s was not in the HA Bluetooth cache; falling back to active scan",
+                    self._log_prefix,
+                    preferred_address,
+                )
+
         candidates = await _async_discover_candidates(
             self.hass,
             preferred_source=self.preferred_source,
             preferred_address=preferred_address,
             proxies=proxies,
+            active_scan=True,
+            include_discovered_service_info=True,
         )
         if not candidates:
             raise RuntimeError("No connectable Pixie BLE advertisement found")
 
+        return await self._try_connect_login_candidates(candidates)
+
+    async def _try_connect_login_candidates(self, candidates: list[dict[str, Any]]) -> asyncio.Queue[bytes]:
+        """Try candidates in order until one completes the Pixie login flow."""
         last_error: Exception | None = None
         for candidate in candidates:
             try:
@@ -240,7 +293,8 @@ class PixieBluetoothRuntime:
             except Exception as err:
                 last_error = err
                 LOGGER.debug(
-                    "Pixie BLE candidate failed address=%s source=%s: %s",
+                    "%sPixie BLE candidate failed address=%s source=%s: %s",
+                    self._log_prefix,
                     candidate.get("address"),
                     candidate.get("source"),
                     err,
@@ -318,7 +372,7 @@ class PixieBluetoothRuntime:
         self.health.state = BT_STATE_READY
         self.health.last_error = None
         self.health.last_update_at = time.time()
-        LOGGER.info("Pixie BLE session ready via %s source=%s", address, self.health.source)
+        LOGGER.info("%sPixie BLE session ready via %s source=%s", self._log_prefix, address, self.health.source)
         self._mark_access_node_capability(response_capable=False)
         return notify_queue
 
@@ -369,7 +423,8 @@ class PixieBluetoothRuntime:
             for index, (plain_pkt, delay) in enumerate(plain_packets, start=1):
                 encrypted = encrypt_command_packet(self._session_key, self._device_mac, plain_pkt)
                 LOGGER.debug(
-                    "Pixie BLE 1912 write %s/%s plain=%s cipher=%s delay_after=%.3fs kwargs=%s",
+                    "%sPixie BLE 1912 write %s/%s plain=%s cipher=%s delay_after=%.3fs kwargs=%s",
+                    self._log_prefix,
                     index,
                     len(plain_packets),
                     plain_pkt.hex(),
@@ -401,17 +456,17 @@ class PixieBluetoothRuntime:
         try:
             payload = decrypt_notification_packet(self._session_key, self._device_mac, raw)
         except Exception as err:
-            LOGGER.debug("Pixie BLE notification decrypt failed len=%s raw=%s err=%s", len(raw), raw.hex(), err)
+            LOGGER.debug("%sPixie BLE notification decrypt failed len=%s raw=%s err=%s", self._log_prefix, len(raw), raw.hex(), err)
             return
         self.mark_update()
         hint = _decode_ble_payload(raw, payload)
-        LOGGER.debug("Pixie BLE notification raw=%s payload=%s hint=%s", raw.hex(), payload.hex(), hint)
+        LOGGER.debug("%sPixie BLE notification raw=%s payload=%s hint=%s", self._log_prefix, raw.hex(), payload.hex(), hint)
         if hint.get("prefix") == "d36969":
             self._mark_access_node_capability(response_capable=True)
         try:
             applied = self._apply_ble_payload_hint(hint)
         except Exception:
-            LOGGER.exception("Pixie BLE notification apply failed raw=%s payload=%s hint=%s", raw.hex(), payload.hex(), hint)
+            LOGGER.exception("%sPixie BLE notification apply failed raw=%s payload=%s hint=%s", self._log_prefix, raw.hex(), payload.hex(), hint)
             return
         if applied and self.inventory is not None and self.inventory_update_callback is not None:
             self.inventory_update_callback(self.inventory)
@@ -457,28 +512,28 @@ class PixieBluetoothRuntime:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
-                LOGGER.debug("Error while stopping Pixie BLE notification", exc_info=True)
+                LOGGER.debug("%sError while stopping Pixie BLE notification", self._log_prefix, exc_info=True)
                 if notify_remove is not None:
                     try:
                         notify_remove()
                     except Exception:
-                        LOGGER.debug("Error while removing Pixie BLE notification callback", exc_info=True)
+                        LOGGER.debug("%sError while removing Pixie BLE notification callback", self._log_prefix, exc_info=True)
         elif notify_remove is not None:
             try:
                 notify_remove()
             except Exception:
-                LOGGER.debug("Error while removing Pixie BLE notification callback", exc_info=True)
+                LOGGER.debug("%sError while removing Pixie BLE notification callback", self._log_prefix, exc_info=True)
         if connection_unsub is not None:
             try:
                 connection_unsub()
             except Exception:
-                LOGGER.debug("Error while removing Pixie BLE connection callback", exc_info=True)
+                LOGGER.debug("%sError while removing Pixie BLE connection callback", self._log_prefix, exc_info=True)
         if address_int is None:
             return
         try:
             await client.bluetooth_device_disconnect(address_int, timeout=10.0)
         except Exception:
-            LOGGER.debug("Error while disconnecting Pixie BLE client", exc_info=True)
+            LOGGER.debug("%sError while disconnecting Pixie BLE client", self._log_prefix, exc_info=True)
 
     def mark_update(self) -> None:
         """Record that BLE delivered a usable runtime update."""
@@ -528,6 +583,8 @@ async def async_probe_pixie_bluetooth_proxy(
     last_error: Exception | None = None
     attempt = 0
     proxies = _iter_esphome_bluetooth_proxies(hass)
+    home_name = str(getattr(cloud_params, "home_name", "") or "").strip()
+    log_prefix = f"[{home_name}] " if home_name and home_name not in ("unknown", "None") else ""
     runtime = PixieBluetoothRuntime(
         hass=hass,
         cloud_params=cloud_params,
@@ -539,7 +596,8 @@ async def async_probe_pixie_bluetooth_proxy(
     )
     runtime.health.enabled = True
     LOGGER.info(
-        "Pixie BLE install probe starting timeout=%.1fs esphome_proxy_count=%s proxies=%s",
+        "%sPixie BLE install probe starting timeout=%.1fs esphome_proxy_count=%s proxies=%s",
+        log_prefix,
         timeout,
         len(proxies),
         [
@@ -560,7 +618,7 @@ async def async_probe_pixie_bluetooth_proxy(
             await asyncio.wait_for(runtime._connect_and_run_probe(), timeout=max(5.0, min(35.0, remaining)))
         except Exception as err:
             last_error = err
-            LOGGER.warning("Pixie BLE install probe attempt %s failed: %s", attempt, err)
+            LOGGER.warning("%sPixie BLE install probe attempt %s failed: %s", log_prefix, attempt, err)
             await runtime._disconnect_client()
             if time.monotonic() >= deadline:
                 break
@@ -569,13 +627,14 @@ async def async_probe_pixie_bluetooth_proxy(
         health = runtime.health
         await runtime._disconnect_client()
         LOGGER.info(
-            "Pixie BLE install probe succeeded source=%s access_node=%s",
+            "%sPixie BLE install probe succeeded source=%s access_node=%s",
+            log_prefix,
             health.source,
             health.access_node,
         )
         return health
     await runtime._disconnect_client()
-    LOGGER.warning("Pixie BLE install probe failed after %s attempt(s): %s", attempt, last_error)
+    LOGGER.warning("%sPixie BLE install probe failed after %s attempt(s): %s", log_prefix, attempt, last_error)
     return PixieBluetoothHealth(
         enabled=True,
         state=BT_STATE_NO_WORKING_PROXY,
@@ -591,16 +650,19 @@ async def _async_discover_candidates(
     preferred_source: str | None,
     preferred_address: str | None,
     proxies: list[_ESPHomeProxyRef] | None = None,
+    active_scan: bool = True,
+    include_discovered_service_info: bool = True,
 ) -> list[dict[str, Any]]:
     """Return currently discovered Pixie BLE candidates."""
     from homeassistant.components import bluetooth
 
-    try:
-        await bluetooth.async_request_active_scan(hass, duration=5.0)
-    except TypeError:
-        await bluetooth.async_request_active_scan(hass)
-    except Exception:
-        LOGGER.debug("Pixie BLE active scan request failed", exc_info=True)
+    if active_scan:
+        try:
+            await bluetooth.async_request_active_scan(hass, duration=5.0)
+        except TypeError:
+            await bluetooth.async_request_active_scan(hass)
+        except Exception:
+            LOGGER.debug("Pixie BLE active scan request failed", exc_info=True)
 
     candidates: list[dict[str, Any]] = []
     pixie_seen = 0
@@ -630,38 +692,40 @@ async def _async_discover_candidates(
                 rssi=getattr(scanner_device.advertisement, "rssi", -999),
             )
 
-    for service_info in bluetooth.async_discovered_service_info(hass, connectable=True) or []:
-        if not _is_pixie_service_info(service_info):
-            continue
-        pixie_seen += 1
-        source = getattr(service_info, "source", None)
-        if preferred_source and source and str(source).lower() != preferred_source.lower():
-            continue
-        proxy = _resolve_esphome_proxy(hass, source, proxies=proxies)
-        if proxy is None:
-            unresolved_sources.add(str(source))
-            LOGGER.debug(
-                "Skipping Pixie BLE candidate %s from non-ESPHome source %s",
-                getattr(service_info, "address", None),
-                source,
+    if include_discovered_service_info:
+        for service_info in bluetooth.async_discovered_service_info(hass, connectable=True) or []:
+            if not _is_pixie_service_info(service_info):
+                continue
+            pixie_seen += 1
+            source = getattr(service_info, "source", None)
+            if preferred_source and source and str(source).lower() != preferred_source.lower():
+                continue
+            proxy = _resolve_esphome_proxy(hass, source, proxies=proxies)
+            if proxy is None:
+                unresolved_sources.add(str(source))
+                LOGGER.debug(
+                    "Skipping Pixie BLE candidate %s from non-ESPHome source %s",
+                    getattr(service_info, "address", None),
+                    source,
+                )
+                continue
+            _add_candidate(
+                candidates,
+                address=service_info.address,
+                source=proxy.source,
+                proxy=proxy,
+                ble_device=service_info.device,
+                address_type=_address_type_from_ble_device(service_info.device),
+                rssi=getattr(service_info, "rssi", -999),
             )
-            continue
-        _add_candidate(
-            candidates,
-            address=service_info.address,
-            source=proxy.source,
-            proxy=proxy,
-            ble_device=service_info.device,
-            address_type=_address_type_from_ble_device(service_info.device),
-            rssi=getattr(service_info, "rssi", -999),
-        )
 
     if not candidates:
-        LOGGER.warning(
-            "Pixie BLE discovery found no usable ESPHome-proxy candidates; pixie_seen=%s unresolved_sources=%s",
-            pixie_seen,
-            sorted(unresolved_sources),
-        )
+        if active_scan or include_discovered_service_info:
+            LOGGER.warning(
+                "Pixie BLE discovery found no usable ESPHome-proxy candidates; pixie_seen=%s unresolved_sources=%s",
+                pixie_seen,
+                sorted(unresolved_sources),
+            )
         return []
     candidates.sort(key=lambda item: (
         1 if preferred_address and str(item["address"]).upper() == preferred_address.upper() else 0,
@@ -670,6 +734,120 @@ async def _async_discover_candidates(
         int(item.get("rssi") or -999),
     ), reverse=True)
     return candidates
+
+
+async def async_scan_pixie_firmware_advertisements(
+    hass: HomeAssistant,
+    *,
+    duration: float = 10.0,
+) -> list[PixieFirmwareAdvertisement]:
+    """Request a short active scan and return firmware-bearing Pixie advertisements."""
+    from homeassistant.components import bluetooth
+
+    adverts: dict[str, PixieFirmwareAdvertisement] = {}
+
+    def collect_cached_adverts() -> None:
+        for connectable in (True, False):
+            try:
+                service_infos = bluetooth.async_discovered_service_info(hass, connectable=connectable) or []
+            except TypeError:
+                if not connectable:
+                    continue
+                service_infos = bluetooth.async_discovered_service_info(hass) or []
+            for service_info in service_infos:
+                for advert in decode_pixie_firmware_advertisements(service_info):
+                    adverts[advert.mac] = advert
+
+    async def request_active_scan() -> None:
+        try:
+            await bluetooth.async_request_active_scan(hass, duration=duration)
+        except TypeError:
+            await bluetooth.async_request_active_scan(hass)
+        except Exception:
+            LOGGER.debug("Pixie BLE firmware-version active scan request failed", exc_info=True)
+
+    scan_task = asyncio.create_task(request_active_scan())
+    deadline = time.monotonic() + max(0.0, duration)
+    try:
+        while time.monotonic() < deadline:
+            collect_cached_adverts()
+            await asyncio.sleep(0.25)
+        collect_cached_adverts()
+        with suppress(TimeoutError):
+            await asyncio.wait_for(scan_task, timeout=1.0)
+    finally:
+        if not scan_task.done():
+            scan_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scan_task
+    return list(adverts.values())
+
+
+def decode_pixie_firmware_advertisements(service_info: Any) -> list[PixieFirmwareAdvertisement]:
+    """Decode firmware-bearing long Pixie manufacturer advertisements from HA service info."""
+    manufacturer_data = getattr(service_info, "manufacturer_data", None) or {}
+    rssi = getattr(service_info, "rssi", None)
+    decoded: dict[str, PixieFirmwareAdvertisement] = {}
+    if not isinstance(manufacturer_data, dict):
+        return []
+    for manufacturer_id, data in manufacturer_data.items():
+        try:
+            manufacturer_int = int(manufacturer_id)
+        except (TypeError, ValueError):
+            manufacturer_int = None
+        for advert in _decode_pixie_firmware_manufacturer_block(
+            bytes(data or b""),
+            manufacturer_id=manufacturer_int,
+            rssi=rssi,
+        ):
+            decoded[advert.mac] = advert
+    return list(decoded.values())
+
+
+def _decode_pixie_firmware_manufacturer_block(
+    data: bytes,
+    *,
+    manufacturer_id: int | None,
+    rssi: int | None,
+) -> list[PixieFirmwareAdvertisement]:
+    """Decode Pixie long manufacturer blocks.
+
+    HA and Android expose manufacturer data at different byte boundaries, so
+    this scans for the Pixie marker instead of assuming a single fixed prefix.
+    Short identity-only blocks are ignored because they do not carry firmware.
+    """
+    adverts: list[PixieFirmwareAdvertisement] = []
+    search = data
+    if manufacturer_id in (0x0211, 0x0422):
+        search = b"\x11\x02" + data
+    marker = b"\x11\x02"
+    for idx in range(0, max(0, len(search) - 9)):
+        if search[idx : idx + 2] != marker:
+            continue
+        payload = search[idx + 2 :]
+        if len(payload) < 8:
+            continue
+        mac_tail_le = payload[:4]
+        full_mac = bytes([0x00, 0x21]) + mac_tail_le[::-1]
+        if len(full_mac) != 6 or full_mac[2] != 0x4D:
+            continue
+        product_type = payload[4]
+        product_stype = payload[5]
+        packed_version = payload[6]
+        device_id = payload[7]
+        version = packed_version >> 2
+        if not (0 < version < 100):
+            continue
+        mac = ":".join(f"{byte:02X}" for byte in full_mac)
+        adverts.append(PixieFirmwareAdvertisement(
+            mac=mac,
+            version=version,
+            model_no=f"{product_type:02d}{product_stype:02d}",
+            device_id=device_id,
+            manufacturer_id=manufacturer_id,
+            rssi=rssi,
+        ))
+    return adverts
 
 
 def _add_candidate(

@@ -10,7 +10,7 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlowWithReload
+from homeassistant.config_entries import SOURCE_USER, ConfigEntry, ConfigFlow, FlowType, OptionsFlowWithReload
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
@@ -25,6 +25,7 @@ from homeassistant.helpers.selector import (
 from . import (
     CONF_GATEWAY_IP,
     CONF_GATEWAY_IP_REQUIRED,
+    CONF_INVENTORY_FALLBACK_REASON,
     CONF_HOME_ID,
     CONF_HOME_NAME,
     CONF_INVENTORY_MODE,
@@ -42,12 +43,18 @@ from . import (
     CONF_COMMAND_TRANSPORT,
     DOMAIN,
     INVENTORY_MODE_CLOUD_FALLBACK,
+    INVENTORY_MODE_LOCAL_53216,
+    INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED,
+    INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY,
     COMMAND_TRANSPORT_BT_ONLY,
     COMMAND_TRANSPORT_BT_PRIMARY,
     COMMAND_TRANSPORT_TCP_ONLY,
     COMMAND_TRANSPORT_TCP_PRIMARY,
     _async_delete_missing_credentials_issue,
     _async_delete_gateway_ip_issue,
+    _async_run_global_ble_version_scan,
+    _entry_gateway_supports_local_inventory_53216,
+    _entry_inventory_mode,
     _entry_bt_enabled,
 )
 from .pixie_ble import (
@@ -57,6 +64,7 @@ from .pixie_ble import (
     async_probe_pixie_bluetooth_proxy,
 )
 from .pixie_runtime import (
+    CloudHomeList,
     CloudParams,
     PixieAuthError,
     PixieAuthHandler,
@@ -83,8 +91,12 @@ CONF_COVER_OPEN_TILT_POSITION = "cover_open_tilt_position"
 CONF_COVER_STOP_TILT_POSITION = "cover_stop_tilt_position"
 CONF_COVER_CLOSE_TILT_POSITION = "cover_close_tilt_position"
 CONF_GATEWAY_CONNECTION_MODE = "gateway_connection_mode"
+CONF_SELECTED_HOME_ID = "selected_home_id"
+CONF_EXCLUDE_HOME_IDS = "_exclude_home_ids"
+CONF_ALLOW_FINISH_SETUP = "_allow_finish_setup"
 CONF_ENABLE_BT = "enable_bt"
 CONF_ENABLE_BT_LABEL = "Enable Bluetooth support (requires ESPHome Bluetooth proxy)"
+FINISH_SETUP_VALUE = "__finish_setup__"
 BT_INSTALL_PROBE_TIMEOUT = 75.0
 
 GATEWAY_CONNECTION_MODE_AUTO = "auto"
@@ -99,6 +111,16 @@ def _enable_bt_from_user_input(user_input: dict[str, Any]) -> bool:
 def _bluetooth_data_schema(*, default: bool) -> vol.Schema:
     """Build a Bluetooth form schema with a readable fallback field label."""
     return vol.Schema({vol.Required(CONF_ENABLE_BT_LABEL, default=default): bool})
+
+
+def _flow_home_log_prefix(data: dict[str, Any] | None, fallback: str | None = None) -> str:
+    home_name = ""
+    if isinstance(data, dict):
+        home_name = str(data.get(CONF_HOME_NAME) or "").strip()
+    home_name = home_name or str(fallback or "").strip()
+    if home_name and home_name not in ("unknown", "None"):
+        return f"[{home_name}] "
+    return ""
 
 
 async def _async_probe_bt_for_flow(
@@ -168,8 +190,10 @@ async def _async_apply_bluetooth_choice(
         preferred_access_node=preferred_access_node,
     )
     if probe is not None and probe.healthy:
+        prefix = _flow_home_log_prefix(None, cloud_params.home_name)
         LOGGER.info(
-            "Pixie Bluetooth %s accepted source=%s access_node=%s state=%s",
+            "%sPixie Bluetooth %s accepted source=%s access_node=%s state=%s",
+            prefix,
             log_label,
             probe.source,
             probe.access_node,
@@ -185,8 +209,10 @@ async def _async_apply_bluetooth_choice(
             data[CONF_BT_RESPONSE_ACCESS_NODE] = previous_response_access_node
         return None
 
+    prefix = _flow_home_log_prefix(None, cloud_params.home_name)
     LOGGER.warning(
-        "Pixie Bluetooth %s rejected probe=%s state=%s source=%s access_node=%s error=%s",
+        "%sPixie Bluetooth %s rejected probe=%s state=%s source=%s access_node=%s error=%s",
+        prefix,
         log_label,
         probe is not None,
         getattr(probe, "state", None),
@@ -220,6 +246,8 @@ class ValidatedSetup:
     inventory: Any | None
     has_cover_devices: bool
     cover_devices: dict[str, str]
+    inventory_fallback_reason: str | None = None
+    inventory_fallback_notice_shown: bool = False
 
 
 def _is_known_cloud_value(value: Any) -> bool:
@@ -228,6 +256,29 @@ def _is_known_cloud_value(value: Any) -> bool:
         return False
     normalized = str(value).strip().lower()
     return normalized not in ("", "unknown", "none")
+
+
+def _home_id(home_obj: dict[str, Any]) -> str:
+    """Return a Home object's id as a string."""
+    return str(home_obj.get("objectId") or "")
+
+
+def _home_label(home_obj: dict[str, Any]) -> str:
+    """Return a readable Home picker label."""
+    return str(home_obj.get("name") or "Unnamed home")
+
+
+def _cloud_params_from_home_obj(home_obj: dict[str, Any], user_id: str) -> CloudParams:
+    """Build CloudParams from a selected cloud Home object."""
+    home_id = _home_id(home_obj)
+    return CloudParams(
+        home_id=home_id,
+        home_name=str(home_obj.get("name") or "unknown"),
+        user_id=str(user_id or "unknown"),
+        meshnet=str(home_obj.get("meshNet") if home_obj.get("meshNet") is not None else home_id),
+        meshnet2=str(home_obj.get("meshNet2") if home_obj.get("meshNet2") is not None else "unknown"),
+        netid=str(home_obj.get("netID") if home_obj.get("netID") is not None else "unknown"),
+    )
 
 
 def _number_selector() -> NumberSelector:
@@ -401,16 +452,34 @@ def _build_entry_data_with_mode(
     password: str,
     gateway_ip_required: bool,
     gateway_ip: str | None,
+    inventory_fallback_reason: str | None = None,
 ) -> dict[str, Any]:
     data = _build_entry_data(cloud_params)
     data[CONF_INVENTORY_MODE] = inventory_mode
     data[CONF_GATEWAY_IP_REQUIRED] = gateway_ip_required
-    if gateway_ip_required and gateway_ip:
+    if gateway_ip:
         data[CONF_GATEWAY_IP] = gateway_ip
     if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
         data[CONF_PIXIE_USERNAME] = username
         data[CONF_PIXIE_PASSWORD] = password
+        if inventory_fallback_reason:
+            data[CONF_INVENTORY_FALLBACK_REASON] = inventory_fallback_reason
     return data
+
+
+def _inventory_fallback_reason_for_inventory(inventory: Any | None) -> str:
+    """Return the config-entry reason for a cloud-fallback inventory setup."""
+    gateway = getattr(inventory, "gateway", None)
+    if gateway is not None and not bool(getattr(gateway, "supports_local_inventory_53216", True)):
+        return INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY
+    return INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED
+
+
+def _inventory_fallback_reason_text(reason: str) -> str:
+    """Return a human-readable local-inventory fallback reason."""
+    if reason == INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY:
+        return "the Pixie gateway model does not support local inventory over port 53216"
+    return "direct local inventory over port 53216 was unavailable during setup"
 
 
 def _normalize_gateway_ip(value: Any) -> str:
@@ -444,6 +513,7 @@ async def _async_validate_setup_input(
     user_input: dict[str, Any],
     *,
     gateway_ip: str | None = None,
+    selected_home_id: str | None = None,
 ) -> ValidatedSetup:
     """Validate credentials, derive runtime params, and verify local bootstrap."""
     username = str(user_input[CONF_USERNAME]).strip()
@@ -456,6 +526,7 @@ async def _async_validate_setup_input(
             username,
             password,
             include_inventory_seed=True,
+            selected_home_id=selected_home_id,
         )
     except PixieAuthError as err:
         raise InvalidAuth from err
@@ -491,14 +562,22 @@ async def _async_validate_setup_input(
         if handler.runtime_session is not None:
             await asyncio.to_thread(handler.runtime_session.stop_and_join, 5.0)
 
+    inventory_fallback_reason = None
     if handler.inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+        inventory_fallback_reason = _inventory_fallback_reason_for_inventory(handler.inventory)
         LOGGER.warning(
-            "Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup"
+            "%sPixie Plus Local is using cloud-assisted inventory mode because %s",
+            _flow_home_log_prefix(None, cloud_params.home_name),
+            _inventory_fallback_reason_text(inventory_fallback_reason),
         )
 
     has_cover_devices = _has_cover_devices(handler)
     options: dict[str, Any] = {}
     cover_devices = _cover_controller_choices(handler.inventory)
+    verified_gateway_ip = None
+    if isinstance(handler.current_hub, dict):
+        verified_gateway_ip = str(handler.current_hub.get("host") or "") or None
+    verified_gateway_ip = verified_gateway_ip or gateway_ip
 
     return ValidatedSetup(
         title=_build_entry_title(handler, cloud_params),
@@ -508,12 +587,14 @@ async def _async_validate_setup_input(
             username=username,
             password=password,
             gateway_ip_required=gateway_ip is not None,
-            gateway_ip=gateway_ip,
+            gateway_ip=verified_gateway_ip,
+            inventory_fallback_reason=inventory_fallback_reason,
         ),
         options=options,
         inventory=handler.inventory,
         has_cover_devices=has_cover_devices,
         cover_devices=cover_devices,
+        inventory_fallback_reason=inventory_fallback_reason,
     )
 
 
@@ -528,6 +609,11 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         self._validated_setup: ValidatedSetup | None = None
         self._selected_cover_controller_id: str | None = None
         self._pending_user_input: dict[str, Any] | None = None
+        self._pending_home_id: str | None = None
+        self._cloud_home_list: CloudHomeList | None = None
+        self._available_homes: list[dict[str, Any]] = []
+        self._exclude_home_ids: set[str] = set()
+        self._allow_finish_setup = False
 
     async def _async_finish_validated_setup(self):
         """Continue to the remaining setup steps after validation succeeds."""
@@ -537,16 +623,52 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(self._validated_setup.data[CONF_HOME_ID])
         self._abort_if_unique_id_configured()
 
+        if (
+            self._validated_setup.data.get(CONF_INVENTORY_MODE) == INVENTORY_MODE_CLOUD_FALLBACK
+            and not self._validated_setup.inventory_fallback_notice_shown
+        ):
+            return await self.async_step_inventory_fallback_notice()
+
         if CONF_BT_ENABLED not in self._validated_setup.data:
             return await self.async_step_bluetooth()
 
         if self._validated_setup.has_cover_devices:
             return await self.async_step_cover_controller()
 
+        return await self._async_create_validated_entry()
+
+    async def _async_create_validated_entry(self):
+        """Create the validated config entry and optionally start another Home flow."""
+        if self._validated_setup is None:
+            return self.async_abort(reason="unknown")
+
+        await self.async_set_unique_id(self._validated_setup.data[CONF_HOME_ID])
+        self._abort_if_unique_id_configured()
+
+        next_flow: tuple[FlowType, str] | None = None
+        if self._pending_user_input is not None and self._remaining_homes_after_current():
+            username = str(self._pending_user_input.get(CONF_USERNAME) or "").strip()
+            password = str(self._pending_user_input.get(CONF_PASSWORD) or "")
+            exclude_home_ids = sorted(self._configured_home_ids() | {str(self._validated_setup.data[CONF_HOME_ID])})
+            result = await self.hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": SOURCE_USER},
+                data={
+                    CONF_USERNAME: username,
+                    CONF_PASSWORD: password,
+                    CONF_EXCLUDE_HOME_IDS: exclude_home_ids,
+                    CONF_ALLOW_FINISH_SETUP: True,
+                },
+            )
+            flow_id = result.get("flow_id")
+            if isinstance(flow_id, str):
+                next_flow = (FlowType.CONFIG_FLOW, flow_id)
+
         return self.async_create_entry(
             title=self._validated_setup.title,
             data=self._validated_setup.data,
             options=self._validated_setup.options,
+            next_flow=next_flow,
         )
 
     @staticmethod
@@ -555,25 +677,78 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         """Create the options flow."""
         return PixiePlusLocalOptionsFlow()
 
+    def _configured_home_ids(self) -> set[str]:
+        """Return Home ids already configured in Home Assistant."""
+        configured: set[str] = set()
+        for entry in self._async_current_entries():
+            if entry.unique_id:
+                configured.add(str(entry.unique_id))
+            if entry.data.get(CONF_HOME_ID):
+                configured.add(str(entry.data[CONF_HOME_ID]))
+        configured.update(self._exclude_home_ids)
+        return configured
+
+    def _unconfigured_homes(self, home_list: CloudHomeList) -> list[dict[str, Any]]:
+        """Return visible Homes not already configured."""
+        configured = self._configured_home_ids()
+        homes = [home for home in home_list.homes if _home_id(home) and _home_id(home) not in configured]
+        if home_list.current_home_id:
+            homes.sort(key=lambda home: 0 if _home_id(home) == home_list.current_home_id else 1)
+        return homes
+
+    def _remaining_homes_after_current(self) -> list[dict[str, Any]]:
+        """Return Homes that could still be added after the current validated setup."""
+        if self._cloud_home_list is None or self._validated_setup is None:
+            return []
+        configured = self._configured_home_ids() | {str(self._validated_setup.data[CONF_HOME_ID])}
+        return [home for home in self._cloud_home_list.homes if _home_id(home) and _home_id(home) not in configured]
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Handle the initial setup step."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
             self._pending_user_input = dict(user_input)
+            self._pending_home_id = None
+            raw_exclude_home_ids = user_input.get(CONF_EXCLUDE_HOME_IDS)
+            if isinstance(raw_exclude_home_ids, (list, tuple, set)):
+                self._exclude_home_ids = {str(home_id) for home_id in raw_exclude_home_ids if str(home_id)}
+            self._allow_finish_setup = bool(user_input.get(CONF_ALLOW_FINISH_SETUP, False))
+            handler = PixieAuthHandler()
             try:
-                self._validated_setup = await _async_validate_setup_input(user_input)
-            except GatewayIpRequired:
-                return await self.async_step_gateway_ip()
-            except InvalidAuth:
+                self._cloud_home_list = await handler.async_fetch_cloud_home_list(
+                    str(user_input[CONF_USERNAME]).strip(),
+                    str(user_input[CONF_PASSWORD]),
+                )
+                self._available_homes = self._unconfigured_homes(self._cloud_home_list)
+            except PixieAuthError:
                 errors["base"] = "invalid_auth"
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
             except Exception:
-                LOGGER.exception("Unexpected Pixie Plus Local setup failure")
-                errors["base"] = "unknown"
+                LOGGER.exception("Unexpected Pixie Plus Local cloud home lookup failure")
+                errors["base"] = "cannot_connect"
             else:
-                return await self._async_finish_validated_setup()
+                if not self._available_homes:
+                    return self.async_abort(reason="already_configured")
+                if self._allow_finish_setup or len(self._cloud_home_list.homes) > 1:
+                    return await self.async_step_home()
+
+                self._pending_home_id = _home_id(self._available_homes[0])
+                try:
+                    self._validated_setup = await _async_validate_setup_input(
+                        user_input,
+                        selected_home_id=self._pending_home_id,
+                    )
+                except GatewayIpRequired:
+                    return await self.async_step_gateway_ip()
+                except InvalidAuth:
+                    errors["base"] = "invalid_auth"
+                except CannotConnect:
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    LOGGER.exception("Unexpected Pixie Plus Local setup failure")
+                    errors["base"] = "unknown"
+                else:
+                    return await self._async_finish_validated_setup()
 
         data_schema = vol.Schema(
             {
@@ -593,6 +768,70 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
 
+    async def async_step_home(self, user_input: dict[str, Any] | None = None):
+        """Choose which Pixie Home to add."""
+        if self._pending_user_input is None or not self._available_homes:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._pending_home_id = str(user_input[CONF_SELECTED_HOME_ID])
+            if self._pending_home_id == FINISH_SETUP_VALUE:
+                return self.async_abort(reason="setup_complete")
+            try:
+                self._validated_setup = await _async_validate_setup_input(
+                    self._pending_user_input,
+                    selected_home_id=self._pending_home_id,
+                )
+            except GatewayIpRequired:
+                return await self.async_step_gateway_ip()
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                LOGGER.exception("Unexpected Pixie Plus Local setup failure for selected home")
+                errors["base"] = "unknown"
+            else:
+                return await self._async_finish_validated_setup()
+
+        choices = {_home_id(home): _home_label(home) for home in self._available_homes}
+        if self._allow_finish_setup:
+            choices[FINISH_SETUP_VALUE] = "Finish setup"
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_SELECTED_HOME_ID): vol.In(choices),
+            }
+        )
+        return self.async_show_form(
+            step_id="home",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={"finish_text": ", or finish setup" if self._allow_finish_setup else ""},
+        )
+
+    async def async_step_inventory_fallback_notice(self, user_input: dict[str, Any] | None = None):
+        """Explain why Pixie credentials must be stored for inventory fallback."""
+        if self._validated_setup is None:
+            return await self.async_step_user()
+
+        if user_input is not None:
+            self._validated_setup.inventory_fallback_notice_shown = True
+            return await self._async_finish_validated_setup()
+
+        reason = self._validated_setup.inventory_fallback_reason or INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED
+        reason_text = (
+            "this Pixie gateway does not provide local inventory"
+            if reason == INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY
+            else "local inventory over port 53216 did not work"
+        )
+        return self.async_show_form(
+            step_id="inventory_fallback_notice",
+            data_schema=vol.Schema({}),
+            description_placeholders={"reason": reason_text},
+        )
+
     async def async_step_gateway_ip(self, user_input: dict[str, Any] | None = None):
         """Collect a manual gateway IP when UDP discovery does not find a gateway."""
         if self._pending_user_input is None:
@@ -610,6 +849,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._validated_setup = await _async_validate_setup_input(
                         self._pending_user_input,
                         gateway_ip=gateway_ip,
+                        selected_home_id=self._pending_home_id,
                     )
                 except InvalidAuth:
                     errors["base"] = "invalid_auth"
@@ -638,6 +878,9 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self.async_step_user()
 
         errors: dict[str, str] = {}
+        description_placeholders = {
+            "home_name": str(self._validated_setup.data.get(CONF_HOME_NAME) or self._validated_setup.title),
+        }
 
         if user_input is not None:
             enable_bt = _enable_bt_from_user_input(user_input)
@@ -653,23 +896,99 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             if error is not None:
                 errors["base"] = error
                 data_schema = _bluetooth_data_schema(default=False)
-                return self.async_show_form(step_id="bluetooth", data_schema=data_schema, errors=errors)
+                return self.async_show_form(
+                    step_id="bluetooth",
+                    data_schema=data_schema,
+                    errors=errors,
+                    description_placeholders=description_placeholders,
+            )
 
             LOGGER.info(
-                "Pixie Bluetooth setup step completed enabled=%s state=%s",
+                "%sPixie Bluetooth setup step completed enabled=%s state=%s",
+                _flow_home_log_prefix(self._validated_setup.data),
                 self._validated_setup.data.get(CONF_BT_ENABLED),
                 self._validated_setup.data.get(CONF_BT_STATE),
             )
             return await self._async_finish_validated_setup()
 
         data_schema = _bluetooth_data_schema(default=False)
-        return self.async_show_form(step_id="bluetooth", data_schema=data_schema, errors=errors)
+        return self.async_show_form(
+            step_id="bluetooth",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders=description_placeholders,
+        )
 
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
         """Present reconfiguration actions for the config entry."""
+        entry = self._get_reconfigure_entry()
+        menu_options = ["reconfigure_credentials", "reconfigure_gateway_connection", "reconfigure_bluetooth"]
+        runtime_data = getattr(entry, "runtime_data", None)
+        pixie_runtime = getattr(runtime_data, "pixie_runtime", None) if runtime_data is not None else None
+        inventory = getattr(pixie_runtime, "inventory", None) if pixie_runtime is not None else None
+        if (
+            _entry_inventory_mode(entry) == INVENTORY_MODE_CLOUD_FALLBACK
+            and _entry_gateway_supports_local_inventory_53216(entry, inventory)
+        ):
+            menu_options.insert(1, "reconfigure_inventory_mode")
         return self.async_show_menu(
             step_id="reconfigure",
-            menu_options=["reconfigure_credentials", "reconfigure_gateway_connection", "reconfigure_bluetooth"],
+            menu_options=menu_options,
+        )
+
+    async def async_step_reconfigure_inventory_mode(self, user_input: dict[str, Any] | None = None):
+        """Try returning a cloud-fallback entry to direct local inventory."""
+        entry = self._get_reconfigure_entry()
+        runtime_data = getattr(entry, "runtime_data", None)
+        pixie_runtime = getattr(runtime_data, "pixie_runtime", None) if runtime_data is not None else None
+        inventory = getattr(pixie_runtime, "inventory", None) if pixie_runtime is not None else None
+        if not _entry_gateway_supports_local_inventory_53216(entry, inventory):
+            return await self.async_step_reconfigure()
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            handler = PixieAuthHandler()
+            try:
+                await handler.async_bootstrap_gateway(
+                    _entry_cloud_params(entry),
+                    username="",
+                    password="",
+                    gateway_ip=_entry_gateway_ip(entry),
+                    keep_control_alive=False,
+                    wait_for_shutdown=False,
+                )
+            except PixieAuthError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                LOGGER.exception("Unexpected Pixie Plus Local local-inventory reconfigure failure")
+                errors["base"] = "unknown"
+            finally:
+                if handler.runtime_session is not None:
+                    await asyncio.to_thread(handler.runtime_session.stop_and_join, 5.0)
+
+            if not errors and handler.inventory is not None:
+                verified_gateway_ip = None
+                if isinstance(handler.current_hub, dict):
+                    verified_gateway_ip = str(handler.current_hub.get("host") or "") or None
+                _async_delete_missing_credentials_issue(self.hass, entry)
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data=_build_entry_data_with_mode(
+                        _entry_cloud_params(entry),
+                        inventory_mode=INVENTORY_MODE_LOCAL_53216,
+                        username="",
+                        password="",
+                        gateway_ip_required=_entry_gateway_ip_required(entry),
+                        gateway_ip=verified_gateway_ip or _entry_gateway_ip(entry),
+                    ),
+                )
+            if not errors:
+                errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="reconfigure_inventory_mode",
+            data_schema=vol.Schema({}),
+            errors=errors,
         )
 
     async def async_step_reconfigure_bluetooth(self, user_input: dict[str, Any] | None = None):
@@ -730,6 +1049,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                     username,
                     password,
                     include_inventory_seed=True,
+                    selected_home_id=str(entry.data.get(CONF_HOME_ID) or ""),
                 )
             except PixieAuthError:
                 errors["base"] = "invalid_auth"
@@ -748,6 +1068,10 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                         password=password,
                         gateway_ip_required=_entry_gateway_ip_required(entry),
                         gateway_ip=_entry_gateway_ip(entry),
+                        inventory_fallback_reason=str(
+                            entry.data.get(CONF_INVENTORY_FALLBACK_REASON)
+                            or INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED
+                        ),
                     ),
                 )
 
@@ -801,7 +1125,13 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             if not errors:
                 data = dict(entry.data)
                 data[CONF_GATEWAY_IP_REQUIRED] = False
-                data.pop(CONF_GATEWAY_IP, None)
+                verified_gateway_ip = None
+                if isinstance(handler.current_hub, dict):
+                    verified_gateway_ip = str(handler.current_hub.get("host") or "") or None
+                if verified_gateway_ip:
+                    data[CONF_GATEWAY_IP] = verified_gateway_ip
+                else:
+                    data.pop(CONF_GATEWAY_IP, None)
                 _async_delete_gateway_ip_issue(self.hass, entry)
                 return self.async_update_reload_and_abort(entry, data=data)
 
@@ -887,11 +1217,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
 
         cover_devices = self._validated_setup.cover_devices
         if not cover_devices:
-            return self.async_create_entry(
-                title=self._validated_setup.title,
-                data=self._validated_setup.data,
-                options=self._validated_setup.options,
-            )
+            return await self._async_create_validated_entry()
 
         if len(cover_devices) == 1:
             self._selected_cover_controller_id = next(iter(cover_devices))
@@ -918,15 +1244,12 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self.async_step_cover_controller()
 
         if user_input is not None:
-            return self.async_create_entry(
-                title=self._validated_setup.title,
-                data=self._validated_setup.data,
-                options=_cover_controller_options_from_input(
-                    controller_id,
-                    user_input,
-                    self._validated_setup.options,
-                ),
+            self._validated_setup.options = _cover_controller_options_from_input(
+                controller_id,
+                user_input,
+                self._validated_setup.options,
             )
+            return await self._async_create_validated_entry()
 
         data_schema = self.add_suggested_values_to_schema(
             _cover_mapping_schema(),
@@ -957,12 +1280,19 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         """Choose which Pixie options to configure."""
         menu_options = ["cover_controller"]
         if _entry_bt_enabled(self.config_entry):
-            menu_options.insert(0, "transport")
+            menu_options = ["transport", "update_device_versions", *menu_options]
 
         return self.async_show_menu(
             step_id="init",
             menu_options=menu_options,
         )
+
+    async def async_step_update_device_versions(self, user_input: dict[str, Any] | None = None):
+        """Run a manual BLE scan to refresh device firmware versions."""
+        if not _entry_bt_enabled(self.config_entry):
+            return self.async_create_entry(title="", data=dict(self.config_entry.options))
+        await _async_run_global_ble_version_scan(self.hass, reason="manual options")
+        return self.async_create_entry(title="", data=dict(self.config_entry.options))
 
     async def async_step_transport(self, user_input: dict[str, Any] | None = None):
         """Configure command transport preference."""

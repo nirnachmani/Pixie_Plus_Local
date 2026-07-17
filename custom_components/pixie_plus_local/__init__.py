@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import partial
+import json
 import logging
+from typing import Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -13,14 +16,17 @@ from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .pixie_inventory import DeviceRecord, PixieInventory
+from .pixie_inventory import DeviceRecord, PixieInventory, online_value_is_online
 from .pixie_ble import (
     BT_STATE_NO_WORKING_PROXY,
+    PixieFirmwareAdvertisement,
     PixieBluetoothRuntime,
+    async_scan_pixie_firmware_advertisements,
 )
 from .pixie_runtime import (
     CloudParams,
@@ -46,6 +52,7 @@ CONF_MESHNET = "meshnet"
 CONF_MESHNET2 = "meshnet2"
 CONF_NETID = "netid"
 CONF_INVENTORY_MODE = "inventory_mode"
+CONF_INVENTORY_FALLBACK_REASON = "inventory_fallback_reason"
 CONF_GATEWAY_IP = "gateway_ip"
 CONF_GATEWAY_IP_REQUIRED = "gateway_ip_required"
 CONF_PIXIE_USERNAME = "pixie_username"
@@ -59,6 +66,8 @@ CONF_COMMAND_TRANSPORT = "command_transport"
 
 INVENTORY_MODE_LOCAL_53216 = "local_53216"
 INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
+INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED = "local_53216_failed"
+INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY = "unsupported_gateway"
 COMMAND_TRANSPORT_TCP_PRIMARY = "tcp_primary"
 COMMAND_TRANSPORT_BT_PRIMARY = "bt_primary"
 COMMAND_TRANSPORT_TCP_ONLY = "tcp_only"
@@ -66,37 +75,66 @@ COMMAND_TRANSPORT_BT_ONLY = "bt_only"
 ISSUE_ID_MISSING_FALLBACK_CREDENTIALS = "missing_fallback_credentials"
 ISSUE_ID_GATEWAY_IP_REQUIRED = "gateway_ip_required"
 ISSUE_ID_BT_PROXY_UNAVAILABLE = "bt_proxy_unavailable"
+ISSUE_ID_LOCAL_INVENTORY_FALLBACK = "local_inventory_fallback"
 
 COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
 TIMER_POLL_INTERVAL_SECONDS = 10.0
 INVENTORY_STORE_VERSION = 1
 BLE_COMMAND_READY_TIMEOUT = 45.0
+INVENTORY_SNAPSHOT_SAVE_DEBOUNCE_SECONDS = 1.5
+BLE_FIRMWARE_SCAN_SECONDS = 60.0
+BLE_FIRMWARE_SCAN_HOUR = 3
+BLE_FIRMWARE_SCAN_MINUTE = 0
 
 
 def _inventory_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
     return Store(hass, INVENTORY_STORE_VERSION, f"{DOMAIN}_{entry.entry_id}_inventory")
 
 
+def _home_log_prefix(home_name: str | None, fallback: str | None = None) -> str:
+    label = str(home_name or fallback or "").strip()
+    if label and label not in ("unknown", "None"):
+        return f"[{label}] "
+    return ""
+
+
+def _firmware_version_text(version: Any) -> str | None:
+    """Return the Pixie app-style firmware version text."""
+    try:
+        version_int = int(version)
+    except (TypeError, ValueError):
+        return None
+    if version_int <= 0:
+        return None
+    return f"{version_int // 10}.{version_int % 10}"
+
+
+def _entry_log_prefix(entry: ConfigEntry) -> str:
+    return _home_log_prefix(entry.data.get(CONF_HOME_NAME), entry.title)
+
+
 async def _async_load_inventory_snapshot(hass: HomeAssistant, entry: ConfigEntry) -> PixieInventory | None:
+    entry_prefix = _entry_log_prefix(entry)
     payload = await _inventory_store(hass, entry).async_load()
     if not isinstance(payload, dict):
-        LOGGER.debug("No stored Pixie inventory snapshot found for entry %s", entry.entry_id)
+        LOGGER.debug("%sNo stored Pixie inventory snapshot found for entry %s", entry_prefix, entry.entry_id)
         return None
     snapshot = payload.get("inventory")
     if not isinstance(snapshot, dict):
-        LOGGER.debug("Stored Pixie inventory snapshot is missing inventory data for entry %s", entry.entry_id)
+        LOGGER.debug("%sStored Pixie inventory snapshot is missing inventory data for entry %s", entry_prefix, entry.entry_id)
         return None
     try:
         inventory = PixieInventory.from_dict(snapshot)
         LOGGER.debug(
-            "Restored Pixie inventory snapshot for entry %s: home=%s devices=%s",
+            "%sRestored Pixie inventory snapshot for entry %s: home=%s devices=%s",
+            _home_log_prefix(inventory.home_name, entry.title),
             entry.entry_id,
             inventory.home_id,
             len(inventory.devices_by_id),
         )
         return inventory
     except Exception as err:
-        LOGGER.warning("Could not restore Pixie inventory snapshot: %s", err)
+        LOGGER.warning("%sCould not restore Pixie inventory snapshot: %s", entry_prefix, err)
         return None
 
 
@@ -105,11 +143,34 @@ async def _async_save_inventory_snapshot(hass: HomeAssistant, entry: ConfigEntry
         return
     await _inventory_store(hass, entry).async_save({"inventory": inventory.to_dict()})
     LOGGER.debug(
-        "Saved Pixie inventory snapshot for entry %s: home=%s devices=%s",
+        "%sSaved Pixie inventory snapshot for entry %s: home=%s devices=%s",
+        _home_log_prefix(inventory.home_name, entry.title),
         entry.entry_id,
         inventory.home_id,
         len(inventory.devices_by_id),
     )
+
+
+def _inventory_persistent_signature(inventory: PixieInventory | None) -> str | None:
+    """Return a stable signature for fields worth persisting to storage."""
+    if inventory is None:
+        return None
+
+    snapshot = inventory.to_dict()
+    for device in snapshot.get("devices") or []:
+        if not isinstance(device, dict):
+            continue
+        runtime = device.get("runtime")
+        if not isinstance(runtime, dict):
+            continue
+        runtime.pop("raw", None)
+        runtime.pop("last_source", None)
+        runtime.pop("last_updated_ms", None)
+        if "online" in runtime:
+            online = runtime.get("online")
+            runtime["online"] = None if online is None else ("online" if online_value_is_online(online) else "offline")
+
+    return json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _entry_inventory_mode(entry: ConfigEntry) -> str:
@@ -118,6 +179,108 @@ def _entry_inventory_mode(entry: ConfigEntry) -> str:
     if resolved_mode != mode:
         LOGGER.debug("Unknown Pixie inventory mode '%s', defaulting to %s", mode, resolved_mode)
     return resolved_mode
+
+
+def _entry_inventory_fallback_reason(entry: ConfigEntry) -> str:
+    return str(entry.data.get(CONF_INVENTORY_FALLBACK_REASON) or "")
+
+
+def _entry_gateway_supports_local_inventory_53216(entry: ConfigEntry, inventory: PixieInventory | None = None) -> bool:
+    if inventory is not None and inventory.gateway is not None:
+        return bool(inventory.gateway.supports_local_inventory_53216)
+    gateway_payload = entry.data.get("gateway")
+    if isinstance(gateway_payload, dict):
+        return bool(gateway_payload.get("supports_local_inventory_53216", True))
+    return _entry_inventory_fallback_reason(entry) != INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY
+
+
+def _loaded_pixie_runtime_entries(hass: HomeAssistant) -> list["PixiePlusConfigEntryRuntimeData"]:
+    """Return loaded Pixie runtime managers."""
+    runtime_entries: list[PixiePlusConfigEntryRuntimeData] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        runtime_data = getattr(entry, "runtime_data", None)
+        if isinstance(runtime_data, PixiePlusConfigEntryRuntimeData):
+            runtime_entries.append(runtime_data)
+    return runtime_entries
+
+
+async def _async_apply_ble_firmware_advertisements(
+    hass: HomeAssistant,
+    adverts: list[PixieFirmwareAdvertisement],
+    *,
+    reason: str,
+) -> int:
+    """Apply decoded BLE firmware advertisements to every loaded Pixie entry."""
+    if not adverts:
+        return 0
+    changed = 0
+    for runtime_data in _loaded_pixie_runtime_entries(hass):
+        changed += await runtime_data.async_apply_ble_firmware_advertisements(adverts, reason=reason)
+    return changed
+
+
+async def _async_run_global_ble_version_scan(hass: HomeAssistant, *, reason: str = "manual") -> int:
+    """Run one global BLE firmware-version scan and apply results to loaded homes."""
+    LOGGER.debug("Pixie BLE firmware-version scan starting reason=%s duration=%.1fs", reason, BLE_FIRMWARE_SCAN_SECONDS)
+    adverts = await async_scan_pixie_firmware_advertisements(hass, duration=BLE_FIRMWARE_SCAN_SECONDS)
+    changed = await _async_apply_ble_firmware_advertisements(hass, adverts, reason=f"{reason} BLE scan")
+    LOGGER.debug(
+        "Pixie BLE firmware-version scan finished reason=%s adverts=%s changed=%s",
+        reason,
+        len(adverts),
+        changed,
+    )
+    return changed
+
+
+def _async_ensure_ble_firmware_refresh_hooks(hass: HomeAssistant) -> None:
+    """Install global scheduled BLE firmware-version refresh hook once."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if domain_data.get("ble_firmware_refresh_hooks"):
+        return
+
+    unsubs: list[Callable[[], None]] = []
+
+    def _scheduled_scan(_now: Any) -> None:
+        hass.async_create_task(_async_run_global_ble_version_scan(hass, reason="scheduled"))
+
+    unsubs.append(
+        async_track_time_change(
+            hass,
+            _scheduled_scan,
+            hour=BLE_FIRMWARE_SCAN_HOUR,
+            minute=BLE_FIRMWARE_SCAN_MINUTE,
+            second=0,
+        )
+    )
+    domain_data["ble_firmware_refresh_hooks"] = unsubs
+
+
+def _async_maybe_remove_ble_firmware_refresh_hooks(hass: HomeAssistant, unloading_entry: ConfigEntry) -> None:
+    """Remove global BLE firmware hooks when the last Pixie entry unloads."""
+    if any(
+        entry.entry_id != unloading_entry.entry_id and getattr(entry, "runtime_data", None) is not None
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    ):
+        return
+    domain_data = hass.data.get(DOMAIN)
+    if not isinstance(domain_data, dict):
+        return
+    unsubs = domain_data.pop("ble_firmware_refresh_hooks", None)
+    if not isinstance(unsubs, list):
+        return
+    for unsub in unsubs:
+        try:
+            unsub()
+        except Exception:
+            LOGGER.debug("Could not remove Pixie BLE firmware refresh hook", exc_info=True)
+
+
+def _inventory_fallback_reason_text(reason: str) -> str:
+    """Return a concise reason for cloud inventory fallback."""
+    if reason == INVENTORY_FALLBACK_REASON_UNSUPPORTED_GATEWAY:
+        return "this Pixie gateway model does not support local inventory over port 53216"
+    return "local inventory over port 53216 did not work"
 
 
 def _entry_username(entry: ConfigEntry) -> str:
@@ -131,6 +294,15 @@ def _entry_password(entry: ConfigEntry) -> str:
 def _entry_gateway_ip(entry: ConfigEntry) -> str | None:
     value = str(entry.data.get(CONF_GATEWAY_IP) or "").strip()
     return value or None
+
+
+def _handler_gateway_ip(handler: PixieAuthHandler) -> str | None:
+    """Return the gateway IP verified by the current handler, if known."""
+    current_hub = getattr(handler, "current_hub", None)
+    if isinstance(current_hub, dict):
+        value = str(current_hub.get("host") or "").strip()
+        return value or None
+    return None
 
 
 def _entry_gateway_ip_required(entry: ConfigEntry) -> bool:
@@ -193,7 +365,8 @@ def _async_remember_ble_access_node(
         return
     hass.config_entries.async_update_entry(entry, data=data)
     LOGGER.info(
-        "Persisted Pixie BLE access-node hint access_node=%s source=%s response_capable=%s",
+        "%sPersisted Pixie BLE access-node hint access_node=%s source=%s response_capable=%s",
+        _entry_log_prefix(entry),
         normalized_node,
         normalized_source,
         response_capable,
@@ -210,6 +383,7 @@ async def _async_update_entry_runtime_data(
     password: str,
     gateway_ip_required: bool,
     gateway_ip: str | None,
+    inventory_fallback_reason: str | None = None,
 ) -> None:
     data = dict(entry.data)
     data.update(
@@ -224,19 +398,28 @@ async def _async_update_entry_runtime_data(
             CONF_GATEWAY_IP_REQUIRED: gateway_ip_required,
         }
     )
-    if gateway_ip_required and gateway_ip:
+    if gateway_ip:
         data[CONF_GATEWAY_IP] = gateway_ip
     else:
         data.pop(CONF_GATEWAY_IP, None)
     if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
         data[CONF_PIXIE_USERNAME] = username
         data[CONF_PIXIE_PASSWORD] = password
+        if inventory_fallback_reason:
+            data[CONF_INVENTORY_FALLBACK_REASON] = inventory_fallback_reason
+        if inventory_fallback_reason == INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED:
+            _async_create_local_inventory_fallback_issue(hass, entry)
+        else:
+            _async_delete_local_inventory_fallback_issue(hass, entry)
     else:
         data.pop(CONF_PIXIE_USERNAME, None)
         data.pop(CONF_PIXIE_PASSWORD, None)
+        data.pop(CONF_INVENTORY_FALLBACK_REASON, None)
+        _async_delete_local_inventory_fallback_issue(hass, entry)
     hass.config_entries.async_update_entry(entry, data=data)
     LOGGER.debug(
-        "Updated Pixie config entry %s for inventory mode %s%s",
+        "%sUpdated Pixie config entry %s for inventory mode %s%s",
+        _entry_log_prefix(entry),
         entry.entry_id,
         inventory_mode,
         " with stored credentials" if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK else " without stored credentials",
@@ -264,6 +447,31 @@ def _async_create_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEn
 
 def _async_delete_missing_credentials_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
     ir.async_delete_issue(hass, DOMAIN, _credentials_issue_id(entry))
+
+
+def _local_inventory_fallback_issue_id(entry: ConfigEntry) -> str:
+    return f"{ISSUE_ID_LOCAL_INVENTORY_FALLBACK}_{entry.entry_id}"
+
+
+def _async_create_local_inventory_fallback_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    reason = _entry_inventory_fallback_reason(entry)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        _local_inventory_fallback_issue_id(entry),
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_ID_LOCAL_INVENTORY_FALLBACK,
+        translation_placeholders={
+            "entry_title": entry.title or INTEGRATION_TITLE,
+            "reason": _inventory_fallback_reason_text(reason),
+        },
+    )
+
+
+def _async_delete_local_inventory_fallback_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, _local_inventory_fallback_issue_id(entry))
 
 
 def _gateway_ip_issue_id(entry: ConfigEntry) -> str:
@@ -407,8 +615,8 @@ async def async_register_device_topology(
             "model_id": record.model_no,
             "via_device": (domain, gateway_identifier),
         }
-        if record.version is not None:
-            kwargs["sw_version"] = str(record.version)
+        if version_text := _firmware_version_text(record.version):
+            kwargs["sw_version"] = version_text
         device_registry.async_get_or_create(**kwargs)
 
 
@@ -456,8 +664,8 @@ class PixiePlusCoordinatorEntity(CoordinatorEntity[PixieInventory]):
             info["translation_key"] = self.endpoint.device_translation_key
         if self.endpoint.via_device_identifier is not None:
             info["via_device"] = (self.domain, self.endpoint.via_device_identifier)
-        if record.version is not None:
-            info["sw_version"] = str(record.version)
+        if version_text := _firmware_version_text(record.version):
+            info["sw_version"] = version_text
         return info
 
 
@@ -494,7 +702,11 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
                 await self.runtime_manager.async_ensure_ble_runtime()
                 if not self.runtime_manager.is_any_runtime_healthy():
                     raise UpdateFailed(f"Pixie runtime unavailable: {err}") from err
-                LOGGER.debug("Pixie TCP runtime unavailable during refresh, continuing with BLE health: %s", err)
+                LOGGER.debug(
+                    "%sPixie TCP runtime unavailable during refresh, continuing with BLE health: %s",
+                    self.runtime_manager._log_prefix,
+                    err,
+                )
             else:
                 await self.runtime_manager.async_ensure_ble_runtime()
 
@@ -539,7 +751,7 @@ class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
                         command_timer_action="poll",
                     )
                 )
-                LOGGER.debug("Queued timer poll for device %s", device_id)
+                LOGGER.debug("%sQueued timer poll for device %s", self.runtime_manager._log_prefix, device_id)
 
         return inventory
 
@@ -556,6 +768,17 @@ class PixiePlusConfigEntryRuntimeData:
     ble_runtime: PixieBluetoothRuntime | None = None
     restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_contact_resets: dict[int, asyncio.Handle] = field(default_factory=dict)
+    last_persisted_inventory_signature: str | None = None
+    pending_inventory_snapshot: PixieInventory | None = None
+    pending_inventory_snapshot_signature: str | None = None
+    pending_inventory_snapshot_handle: asyncio.Handle | None = None
+
+    @property
+    def _log_prefix(self) -> str:
+        home_name = str(self.cloud_params.home_name or self.entry.data.get(CONF_HOME_NAME) or self.entry.title or "").strip()
+        if home_name and home_name not in ("unknown", "None"):
+            return f"[{home_name}] "
+        return ""
 
     @staticmethod
     def _describe_runtime_session(runtime_session) -> str:
@@ -574,6 +797,61 @@ class PixiePlusConfigEntryRuntimeData:
             parts.append(f"error={summary['error']}")
         return ", ".join(parts)
 
+    def _queue_inventory_snapshot_save(self, inventory: PixieInventory, *, reason: str) -> None:
+        """Queue a debounced persistent snapshot save if persistent state changed."""
+        signature = _inventory_persistent_signature(inventory)
+        if signature is None:
+            return
+        if signature == self.last_persisted_inventory_signature:
+            if self.pending_inventory_snapshot_handle is not None:
+                self.pending_inventory_snapshot_handle.cancel()
+                self.pending_inventory_snapshot_handle = None
+                self.pending_inventory_snapshot = None
+                self.pending_inventory_snapshot_signature = None
+            LOGGER.debug(
+                "%sSkipped Pixie inventory snapshot save for entry %s: only non-persistent runtime metadata changed (%s)",
+                self._log_prefix,
+                self.entry.entry_id,
+                reason,
+            )
+            return
+
+        self.pending_inventory_snapshot = inventory
+        self.pending_inventory_snapshot_signature = signature
+        if self.pending_inventory_snapshot_handle is not None and not self.pending_inventory_snapshot_handle.cancelled():
+            return
+
+        loop = self.coordinator.hass.loop
+        self.pending_inventory_snapshot_handle = loop.call_later(
+            INVENTORY_SNAPSHOT_SAVE_DEBOUNCE_SECONDS,
+            lambda: self.coordinator.hass.async_create_task(
+                self._async_flush_inventory_snapshot_save(reason=reason)
+            ),
+        )
+
+    async def _async_flush_inventory_snapshot_save(self, *, reason: str = "flush") -> None:
+        """Persist the latest pending debounced inventory snapshot."""
+        handle = self.pending_inventory_snapshot_handle
+        self.pending_inventory_snapshot_handle = None
+        if handle is not None:
+            handle.cancel()
+
+        inventory = self.pending_inventory_snapshot
+        signature = self.pending_inventory_snapshot_signature
+        self.pending_inventory_snapshot = None
+        self.pending_inventory_snapshot_signature = None
+        if inventory is None or signature is None:
+            return
+
+        await _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory)
+        self.last_persisted_inventory_signature = signature
+        LOGGER.debug(
+            "%sPersisted debounced Pixie inventory snapshot for entry %s (%s)",
+            self._log_prefix,
+            self.entry.entry_id,
+            reason,
+        )
+
     def push_inventory_update_from_thread(self, inventory: PixieInventory) -> None:
         """Push a runtime inventory update to HA from the TCP worker thread."""
         self.pixie_runtime.inventory = inventory
@@ -582,8 +860,7 @@ class PixiePlusConfigEntryRuntimeData:
             inventory,
         )
         self.coordinator.hass.loop.call_soon_threadsafe(
-            self.coordinator.hass.async_create_task,
-            _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory),
+            partial(self._queue_inventory_snapshot_save, inventory, reason="TCP runtime update")
         )
         # If a timer device needs an immediate poll (external mode change or
         # turn-on), schedule it now instead of waiting for the next coordinator
@@ -601,10 +878,76 @@ class PixiePlusConfigEntryRuntimeData:
         """Push a runtime inventory update already running in HA's event loop."""
         self.pixie_runtime.inventory = inventory
         self.coordinator.async_set_updated_data(inventory)
-        self.coordinator.hass.async_create_task(
-            _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory)
-        )
+        self._queue_inventory_snapshot_save(inventory, reason="BLE runtime update")
         self._schedule_pending_timer_polls(inventory, from_thread=False, reason="BLE update")
+
+    async def async_apply_ble_firmware_advertisements(
+        self,
+        adverts: list[PixieFirmwareAdvertisement],
+        *,
+        reason: str,
+    ) -> int:
+        """Apply BLE-advertised firmware versions to this entry's inventory by MAC."""
+        inventory = self.pixie_runtime.inventory
+        if inventory is None:
+            return 0
+        changed_records: list[DeviceRecord] = []
+        records_by_mac = {
+            PixieInventory._normalize_mac(record.mac): record
+            for record in inventory.devices_by_id.values()
+            if PixieInventory._normalize_mac(record.mac)
+        }
+        for advert in adverts:
+            normalized_advert_mac = PixieInventory._normalize_mac(advert.mac)
+            current_record = records_by_mac.get(normalized_advert_mac)
+            old_version = current_record.version if current_record is not None else None
+            changed = inventory.apply_ble_advertised_version(advert.mac, advert.version)
+            if changed is None:
+                if current_record is None:
+                    LOGGER.debug(
+                        "%sPixie BLE firmware advertisement ignored for unknown device mac=%s version=%s model=%s id=%s (%s)",
+                        self._log_prefix,
+                        advert.mac,
+                        advert.version,
+                        advert.model_no,
+                        advert.device_id,
+                        reason,
+                    )
+                    continue
+                LOGGER.debug(
+                    "%sPixie BLE firmware advertisement unchanged: %s mac=%s version=%s model=%s id=%s (%s)",
+                    self._log_prefix,
+                    current_record.name,
+                    advert.mac,
+                    advert.version,
+                    advert.model_no,
+                    advert.device_id,
+                    reason,
+                )
+                continue
+            changed_records.append(changed)
+            LOGGER.info(
+                "%sPixie BLE firmware version updated: %s mac=%s version=%s->%s source=ble_advertisement (%s)",
+                self._log_prefix,
+                changed.name,
+                changed.mac,
+                _firmware_version_text(old_version) or old_version,
+                _firmware_version_text(changed.version) or changed.version,
+                reason,
+            )
+
+        if not changed_records:
+            return 0
+
+        self.coordinator.async_set_updated_data(inventory)
+        device_registry = dr.async_get(self.coordinator.hass)
+        for record in changed_records:
+            device = device_registry.async_get_device({(DOMAIN, physical_device_identifier(record))})
+            if device is not None and (version_text := _firmware_version_text(record.version)):
+                device_registry.async_update_device(device.id, sw_version=version_text)
+        await async_register_device_topology(self.coordinator.hass, self.entry, inventory, domain=DOMAIN)
+        self._queue_inventory_snapshot_save(inventory, reason=f"BLE firmware version update: {reason}")
+        return len(changed_records)
 
     def _schedule_pending_timer_polls(self, inventory: PixieInventory, *, from_thread: bool, reason: str) -> None:
         """Schedule immediate timer polls requested by newly applied runtime state."""
@@ -624,7 +967,7 @@ class PixiePlusConfigEntryRuntimeData:
                     )
                 else:
                     self.coordinator.hass.async_create_task(command_coro)
-                LOGGER.debug("Immediate timer poll for device %s (%s)", device_id, reason)
+                LOGGER.debug("%sImmediate timer poll for device %s (%s)", self._log_prefix, device_id, reason)
 
     def is_tcp_runtime_healthy(self) -> bool:
         """Return True when the TCP runtime session is currently usable."""
@@ -659,12 +1002,13 @@ class PixiePlusConfigEntryRuntimeData:
         if runtime is None:
             return None
         if not runtime.health.healthy:
-            LOGGER.debug("Waiting up to %.1fs for Pixie BLE runtime to become command-ready", timeout)
+            LOGGER.debug("%sWaiting up to %.1fs for Pixie BLE runtime to become command-ready", self._log_prefix, timeout)
         deadline = self.coordinator.hass.loop.time() + timeout
         while self.coordinator.hass.loop.time() < deadline:
             if runtime.health.healthy:
                 LOGGER.debug(
-                    "Pixie BLE runtime became command-ready source=%s access_node=%s",
+                    "%sPixie BLE runtime became command-ready source=%s access_node=%s",
+                    self._log_prefix,
                     runtime.health.source,
                     runtime.health.access_node,
                 )
@@ -678,7 +1022,7 @@ class PixiePlusConfigEntryRuntimeData:
         """Apply the same transport-neutral optimistic update used by TCP."""
         intent = self.handler.resolve_optimistic_update_intent(command_kwargs)
         if intent is None:
-            LOGGER.debug("Optimistic update skipped: unsupported command kwargs=%s", command_kwargs)
+            LOGGER.debug("%sOptimistic update skipped: unsupported command kwargs=%s", self._log_prefix, command_kwargs)
             return False
         applied = self.handler.apply_optimistic_update_intent(intent)
         if applied:
@@ -745,13 +1089,14 @@ class PixiePlusConfigEntryRuntimeData:
 
             if runtime_session is not None:
                 LOGGER.warning(
-                    "Restarting Pixie runtime (%s): %s",
+                    "%sRestarting Pixie runtime (%s): %s",
+                    self._log_prefix,
                     reason,
                     self._describe_runtime_session(runtime_session),
                 )
                 await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
             else:
-                LOGGER.info("Starting Pixie runtime (%s)", reason)
+                LOGGER.info("%sStarting Pixie runtime (%s)", self._log_prefix, reason)
 
             restart_handler = PixieAuthHandler()
             restart_handler.inventory = self.pixie_runtime.inventory
@@ -761,22 +1106,44 @@ class PixiePlusConfigEntryRuntimeData:
             username = _entry_username(self.entry)
             password = _entry_password(self.entry)
             inventory_mode = _entry_inventory_mode(self.entry)
-            gateway_ip = _entry_gateway_ip(self.entry) if _entry_gateway_ip_required(self.entry) else None
+            gateway_ip = _entry_gateway_ip(self.entry)
 
             if _entry_gateway_ip_required(self.entry) and gateway_ip is None:
                 _async_create_gateway_ip_issue(hass, self.entry)
                 raise ConfigEntryError("Pixie gateway requires a stored manual IP address")
 
             try:
-                restarted_runtime = await restart_handler.async_bootstrap_gateway(
-                    self.cloud_params,
-                    username=username,
-                    password=password,
-                    gateway_ip=gateway_ip,
-                    keep_control_alive=True,
-                    wait_for_shutdown=False,
-                    hydrate_inventory=False,
-                )
+                try:
+                    restarted_runtime = await restart_handler.async_bootstrap_gateway(
+                        self.cloud_params,
+                        username=username,
+                        password=password,
+                        gateway_ip=gateway_ip,
+                        keep_control_alive=True,
+                        wait_for_shutdown=False,
+                        hydrate_inventory=False,
+                    )
+                except (PixieGatewayResolutionError, PixieGatewayConnectionError):
+                    if not gateway_ip or _entry_gateway_ip_required(self.entry):
+                        raise
+                    restart_session = restart_handler.runtime_session
+                    if restart_session is not None:
+                        await hass.async_add_executor_job(restart_session.stop_and_join, 5.0)
+                    restart_handler.runtime_session = None
+                    LOGGER.warning(
+                        "%sStored Pixie gateway IP %s failed during runtime restart; retrying UDP discovery",
+                        self._log_prefix,
+                        gateway_ip,
+                    )
+                    restarted_runtime = await restart_handler.async_bootstrap_gateway(
+                        self.cloud_params,
+                        username=username,
+                        password=password,
+                        gateway_ip=None,
+                        keep_control_alive=True,
+                        wait_for_shutdown=False,
+                        hydrate_inventory=False,
+                    )
             except (PixieGatewayResolutionError, PixieGatewayConnectionError):
                 restart_session = restart_handler.runtime_session
                 if restart_session is not None:
@@ -802,10 +1169,16 @@ class PixiePlusConfigEntryRuntimeData:
                 self.pixie_runtime.inventory = restarted_runtime.inventory
                 if self.ble_runtime is not None:
                     self.ble_runtime.inventory = restarted_runtime.inventory
+            verified_gateway_ip = _handler_gateway_ip(restart_handler)
+            if verified_gateway_ip and verified_gateway_ip != _entry_gateway_ip(self.entry):
+                data = dict(self.entry.data)
+                data[CONF_GATEWAY_IP] = verified_gateway_ip
+                hass.config_entries.async_update_entry(self.entry, data=data)
             _async_delete_gateway_ip_issue(hass, self.entry)
 
             LOGGER.info(
-                "Pixie runtime ready after %s: %s",
+                "%sPixie runtime ready after %s: %s",
+                self._log_prefix,
                 reason,
                 self._describe_runtime_session(self.pixie_runtime.runtime_session),
             )
@@ -814,6 +1187,7 @@ class PixiePlusConfigEntryRuntimeData:
     async def async_shutdown(self, hass: HomeAssistant) -> None:
         """Stop the long-lived gateway runtime session."""
         async with self.restart_lock:
+            await self._async_flush_inventory_snapshot_save(reason="shutdown")
             for handle in self.pending_contact_resets.values():
                 handle.cancel()
             self.pending_contact_resets.clear()
@@ -842,7 +1216,7 @@ class PixiePlusConfigEntryRuntimeData:
             except Exception as err:
                 if transport == COMMAND_TRANSPORT_BT_ONLY:
                     raise
-                LOGGER.warning("Pixie BLE command failed; falling back to TCP: %s", err)
+                LOGGER.warning("%sPixie BLE command failed; falling back to TCP: %s", self._log_prefix, err)
 
         if transport in (COMMAND_TRANSPORT_TCP_PRIMARY, COMMAND_TRANSPORT_TCP_ONLY, COMMAND_TRANSPORT_BT_PRIMARY):
             try:
@@ -852,7 +1226,7 @@ class PixiePlusConfigEntryRuntimeData:
                 if transport == COMMAND_TRANSPORT_TCP_ONLY:
                     raise
                 if transport == COMMAND_TRANSPORT_TCP_PRIMARY and self.ble_runtime is not None and self.ble_runtime.health.healthy:
-                    LOGGER.warning("Pixie TCP command failed; falling back to BLE: %s", err)
+                    LOGGER.warning("%sPixie TCP command failed; falling back to BLE: %s", self._log_prefix, err)
                     await self._async_send_ble_command(dict(kwargs), wait_for_ready=False)
                     return
                 raise
@@ -877,7 +1251,7 @@ class PixiePlusConfigEntryRuntimeData:
                 or runtime_session.connection_closed_at is not None
             )
             if runtime_unhealthy:
-                LOGGER.warning("Live Pixie runtime command failed; restarting shared runtime: %s", err)
+                LOGGER.warning("%sLive Pixie runtime command failed; restarting shared runtime: %s", self._log_prefix, err)
                 recovered_session = await self.async_ensure_runtime(
                     hass,
                     reason="command_send_recovery",
@@ -886,7 +1260,7 @@ class PixiePlusConfigEntryRuntimeData:
                 self.coordinator.async_set_updated_data(self.pixie_runtime.inventory)
                 return
 
-            LOGGER.warning("Live Pixie runtime command failed on shared runtime: %s", err)
+            LOGGER.warning("%sLive Pixie runtime command failed on shared runtime: %s", self._log_prefix, err)
             raise
 
 
@@ -928,14 +1302,21 @@ async def _async_build_runtime_data(
     username = _entry_username(entry)
     password = _entry_password(entry)
     gateway_ip_required = _entry_gateway_ip_required(entry)
-    gateway_ip = _entry_gateway_ip(entry) if gateway_ip_required else None
+    gateway_ip = _entry_gateway_ip(entry)
+    fallback_reason = _entry_inventory_fallback_reason(entry)
+
+    if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK and fallback_reason == INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED:
+        _async_create_local_inventory_fallback_issue(hass, entry)
+    else:
+        _async_delete_local_inventory_fallback_issue(hass, entry)
 
     if gateway_ip_required and gateway_ip is None:
         _async_create_gateway_ip_issue(hass, entry)
         raise ConfigEntryError("Pixie gateway requires a stored manual IP address")
 
     LOGGER.debug(
-        "Bootstrapping Pixie entry %s in %s mode%s",
+        "%sBootstrapping Pixie entry %s in %s mode%s",
+        _entry_log_prefix(entry),
         entry.entry_id,
         inventory_mode,
         " with stored inventory snapshot available" if persisted_inventory is not None else " with no stored inventory snapshot",
@@ -949,6 +1330,35 @@ async def _async_build_runtime_data(
         if runtime_session is not None:
             await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
 
+    async def _async_bootstrap_with_gateway_retry(
+        current_handler: PixieAuthHandler,
+        current_cloud_params: CloudParams,
+        **kwargs,
+    ) -> PixieRuntimeData:
+        """Try remembered IP first; in auto mode, retry UDP discovery if stale."""
+        try:
+            return await current_handler.async_bootstrap_gateway(
+                current_cloud_params,
+                gateway_ip=gateway_ip,
+                **kwargs,
+            )
+        except (PixieGatewayResolutionError, PixieGatewayConnectionError):
+            if not gateway_ip or gateway_ip_required:
+                raise
+            await _shutdown_runtime(current_handler)
+            current_handler.runtime_session = None
+            LOGGER.warning(
+                "%sStored Pixie gateway IP %s failed for entry %s; retrying UDP discovery",
+                _entry_log_prefix(entry),
+                gateway_ip,
+                entry.entry_id,
+            )
+            return await current_handler.async_bootstrap_gateway(
+                current_cloud_params,
+                gateway_ip=None,
+                **kwargs,
+            )
+
     async def _async_start_snapshot_runtime(
         snapshot_inventory: PixieInventory,
         *,
@@ -957,11 +1367,11 @@ async def _async_build_runtime_data(
         snapshot_handler = PixieAuthHandler()
         snapshot_handler.inventory = snapshot_inventory
         snapshot_handler.gateway_identity = snapshot_inventory.gateway
-        snapshot_runtime = await snapshot_handler.async_bootstrap_gateway(
+        snapshot_runtime = await _async_bootstrap_with_gateway_retry(
+            snapshot_handler,
             cloud_params,
             username="",
             password="",
-            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
             hydrate_inventory=False,
@@ -972,11 +1382,11 @@ async def _async_build_runtime_data(
 
     async def _async_start_local_inventory_runtime() -> tuple[PixieAuthHandler, PixieRuntimeData]:
         local_handler = PixieAuthHandler()
-        local_runtime = await local_handler.async_bootstrap_gateway(
+        local_runtime = await _async_bootstrap_with_gateway_retry(
+            local_handler,
             cloud_params,
             username="",
             password="",
-            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
         )
@@ -989,12 +1399,13 @@ async def _async_build_runtime_data(
             username,
             password,
             include_inventory_seed=True,
+            selected_home_id=cloud_params.home_id,
         )
-        fallback_runtime = await fallback_handler.async_bootstrap_gateway(
+        fallback_runtime = await _async_bootstrap_with_gateway_retry(
+            fallback_handler,
             refreshed_cloud_params,
             username=username,
             password=password,
-            gateway_ip=gateway_ip,
             keep_control_alive=True,
             wait_for_shutdown=False,
             hydrate_inventory=False,
@@ -1005,26 +1416,24 @@ async def _async_build_runtime_data(
         return fallback_handler, fallback_runtime, refreshed_cloud_params
 
     try:
-        LOGGER.debug("Trying direct local Pixie inventory startup for entry %s", entry.entry_id)
-        handler, pixie_runtime = await _async_start_local_inventory_runtime()
-
-        if pixie_runtime.inventory is not None:
+        if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+            if not (username and password):
+                _async_create_missing_credentials_issue(hass, entry)
+                raise ConfigEntryError("Pixie cloud-fallback inventory requires stored Pixie credentials")
+            LOGGER.debug("%sStarting Pixie entry %s directly in cloud fallback inventory mode", _entry_log_prefix(entry), entry.entry_id)
+            handler, pixie_runtime, cloud_params = await _async_start_cloud_fallback_runtime()
             _async_delete_missing_credentials_issue(hass, entry)
-            if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
-                LOGGER.info("Pixie entry %s recovered direct local inventory; switching to local_53216 mode", entry.entry_id)
-                await _async_update_entry_runtime_data(
-                    hass,
-                    entry,
-                    cloud_params,
-                    inventory_mode=INVENTORY_MODE_LOCAL_53216,
-                    username="",
-                    password="",
-                    gateway_ip_required=gateway_ip_required,
-                    gateway_ip=gateway_ip,
-                )
+        else:
+            LOGGER.debug("%sTrying direct local Pixie inventory startup for entry %s", _entry_log_prefix(entry), entry.entry_id)
+            handler, pixie_runtime = await _async_start_local_inventory_runtime()
+
+        if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+            cloud_params = _handler_cloud_params(handler, cloud_params)
+        elif pixie_runtime.inventory is not None:
+            _async_delete_missing_credentials_issue(hass, entry)
             pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
         else:
-            LOGGER.warning("Direct local Pixie inventory startup failed for entry %s", entry.entry_id)
+            LOGGER.warning("%sDirect local Pixie inventory startup failed for entry %s", _entry_log_prefix(entry), entry.entry_id)
             await _shutdown_runtime(handler)
 
             if username and password:
@@ -1033,7 +1442,8 @@ async def _async_build_runtime_data(
                     _async_delete_missing_credentials_issue(hass, entry)
                     if inventory_mode != INVENTORY_MODE_CLOUD_FALLBACK:
                         LOGGER.warning(
-                            "Pixie direct local inventory failed; switching entry %s to cloud fallback mode",
+                            "%sPixie direct local inventory failed; switching entry %s to cloud fallback mode",
+                            _entry_log_prefix(entry),
                             entry.entry_id,
                         )
                     await _async_update_entry_runtime_data(
@@ -1044,7 +1454,8 @@ async def _async_build_runtime_data(
                         username=username,
                         password=password,
                         gateway_ip_required=gateway_ip_required,
-                        gateway_ip=gateway_ip,
+                        gateway_ip=_handler_gateway_ip(handler) or gateway_ip,
+                        inventory_fallback_reason=INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED,
                     )
                     cloud_params = _handler_cloud_params(handler, cloud_params)
                 except Exception as err:
@@ -1052,7 +1463,7 @@ async def _async_build_runtime_data(
                         raise ConfigEntryNotReady(
                             f"Pixie live inventory unavailable and no stored inventory snapshot exists: {err}"
                         ) from err
-                    LOGGER.warning("Pixie live inventory failed; using stored inventory snapshot: %s", err)
+                    LOGGER.warning("%sPixie live inventory failed; using stored inventory snapshot: %s", _entry_log_prefix(entry), err)
                     handler, pixie_runtime = await _async_start_snapshot_runtime(
                         persisted_inventory,
                         runtime_mode=inventory_mode,
@@ -1064,7 +1475,8 @@ async def _async_build_runtime_data(
                         "Pixie direct local inventory failed and Pixie credentials are required for cloud fallback"
                     )
                 LOGGER.warning(
-                    "Direct local Pixie inventory failed with no stored Pixie credentials; using stored inventory snapshot"
+                    "%sDirect local Pixie inventory failed with no stored Pixie credentials; using stored inventory snapshot",
+                    _entry_log_prefix(entry),
                 )
                 _async_create_missing_credentials_issue(hass, entry)
                 handler, pixie_runtime = await _async_start_snapshot_runtime(
@@ -1073,6 +1485,27 @@ async def _async_build_runtime_data(
                 )
 
         _async_delete_gateway_ip_issue(hass, entry)
+        verified_gateway_ip = _handler_gateway_ip(handler) or gateway_ip
+        if verified_gateway_ip and verified_gateway_ip != _entry_gateway_ip(entry):
+            await _async_update_entry_runtime_data(
+                hass,
+                entry,
+                cloud_params,
+                inventory_mode=pixie_runtime.inventory_mode,
+                username=username if pixie_runtime.inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK else "",
+                password=password if pixie_runtime.inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK else "",
+                gateway_ip_required=gateway_ip_required,
+                gateway_ip=verified_gateway_ip,
+                inventory_fallback_reason=_entry_inventory_fallback_reason(entry),
+            )
+        if persisted_inventory is not None and pixie_runtime.inventory is not None:
+            preserved_versions = pixie_runtime.inventory.preserve_ble_advertised_versions_from(persisted_inventory)
+            if preserved_versions:
+                LOGGER.debug(
+                    "%sPreserved %s BLE firmware version(s) from stored inventory snapshot",
+                    _entry_log_prefix(entry),
+                    preserved_versions,
+                )
         coordinator = PixiePlusRuntimeCoordinator(hass, entry, pixie_runtime)
         await coordinator.async_config_entry_first_refresh()
         await _async_save_inventory_snapshot(hass, entry, pixie_runtime.inventory)
@@ -1105,6 +1538,7 @@ async def _async_build_runtime_data(
             preferred_response_access_node=str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "") or None,
         ),
     )
+    runtime_data.last_persisted_inventory_signature = _inventory_persistent_signature(pixie_runtime.inventory)
     coordinator.runtime_manager = runtime_data
     if runtime_data.ble_runtime is not None:
         runtime_data.ble_runtime.inventory_update_callback = runtime_data.push_inventory_update_from_loop
@@ -1146,6 +1580,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.config_entries.async_update_entry(entry, title=desired_title)
     entry.runtime_data = runtime_data
     await async_register_device_topology(hass, entry, runtime_data.pixie_runtime.inventory, domain=DOMAIN)
+    _async_ensure_ble_firmware_refresh_hooks(hass)
 
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -1165,6 +1600,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         valid_device_ids: set[str] = {gateway_device_identifier(inv)}
         for device_id in inv.devices_by_id:
             record = inv.devices_by_id[device_id]
+            if record.capabilities.is_gateway:
+                continue
             valid_device_ids.add(physical_device_identifier(record))
             for key in endpoint_keys:
                 valid_entity_ids.add(endpoint_unique_identifier(record, key))
@@ -1179,7 +1616,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ]
         for entity_id in stale_entities:
             ent_reg.async_remove(entity_id)
-            LOGGER.debug("Removed orphaned entity: %s", entity_id)
+            LOGGER.debug("%sRemoved orphaned entity: %s", _entry_log_prefix(entry), entity_id)
 
         # Remove orphaned devices
         dev_reg = dr.async_get(hass)
@@ -1195,7 +1632,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ]
         for device_id in stale_devices:
             dev_reg.async_remove_device(device_id)
-            LOGGER.debug("Removed orphaned device: %s", device_id)
+            LOGGER.debug("%sRemoved orphaned device: %s", _entry_log_prefix(entry), device_id)
 
     return True
 
@@ -1211,4 +1648,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     runtime_data: PixiePlusConfigEntryRuntimeData = entry.runtime_data
     await runtime_data.async_shutdown(hass)
+    _async_maybe_remove_ble_firmware_refresh_hooks(hass, entry)
     return True

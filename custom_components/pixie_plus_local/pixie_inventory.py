@@ -28,6 +28,8 @@ from .pixie_value_profiles import (
 
 STATE_UNSET = object()
 LOGGER = logging.getLogger(__name__)
+VERSION_SOURCE_DEVICE_LIST = "device_list"
+VERSION_SOURCE_BLE_ADVERTISEMENT = "ble_advertisement"
 
 
 def online_value_is_online(value: Any) -> bool:
@@ -134,6 +136,7 @@ class GatewayIdentity:
     model_no: str
     model_name: Optional[str]
     gateway_id: Optional[str]
+    supports_local_inventory_53216: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -141,15 +144,24 @@ class GatewayIdentity:
             "model_no": self.model_no,
             "model_name": self.model_name,
             "gateway_id": self.gateway_id,
+            "supports_local_inventory_53216": self.supports_local_inventory_53216,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayIdentity":
+        model_no = str(data.get("model_no") or "")
+        model_caps = get_model_capabilities(model_no)
         return cls(
             gateway_mac=str(data.get("gateway_mac") or ""),
-            model_no=str(data.get("model_no") or ""),
+            model_no=model_no,
             model_name=str(data.get("model_name")) if data.get("model_name") is not None else None,
             gateway_id=str(data.get("gateway_id")) if data.get("gateway_id") is not None else None,
+            supports_local_inventory_53216=bool(
+                data.get(
+                    "supports_local_inventory_53216",
+                    model_caps.get("supports_local_inventory_53216", True),
+                )
+            ),
         )
 
 
@@ -692,6 +704,7 @@ class DeviceCapabilities:
     """
 
     is_gateway: bool = False
+    supports_local_inventory_53216: bool = True
     is_light: bool = False
     is_switch: bool = False
     switch_type: str = ""
@@ -733,6 +746,7 @@ class DeviceCapabilities:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "is_gateway": self.is_gateway,
+            "supports_local_inventory_53216": self.supports_local_inventory_53216,
             "is_light": self.is_light,
             "is_switch": self.is_switch,
             "switch_type": self.switch_type,
@@ -776,6 +790,7 @@ class DeviceCapabilities:
     def from_dict(cls, data: Dict[str, Any]) -> "DeviceCapabilities":
         return cls(
             is_gateway=bool(data.get("is_gateway", False)),
+            supports_local_inventory_53216=bool(data.get("supports_local_inventory_53216", True)),
             is_light=bool(data.get("is_light", False)),
             is_switch=bool(data.get("is_switch", False)),
             switch_type=str(data.get("switch_type", "")),
@@ -827,6 +842,7 @@ class DeviceRecord:
     name: str
     mac: str
     version: Optional[int] = None
+    version_source: str = VERSION_SOURCE_DEVICE_LIST
 
     left_name: Optional[str] = None
     right_name: Optional[str] = None
@@ -846,6 +862,7 @@ class DeviceRecord:
             "name": self.name,
             "mac": self.mac,
             "version": self.version,
+            "version_source": self.version_source,
             "left_name": self.left_name,
             "right_name": self.right_name,
             "rooms": list(self.rooms),
@@ -861,6 +878,10 @@ class DeviceRecord:
         model_caps = get_model_capabilities(model_no)
         if not capabilities.is_gateway:
             capabilities.is_gateway = bool(model_caps.get("is_gateway", False))
+        if capabilities.is_gateway:
+            capabilities.supports_local_inventory_53216 = bool(
+                model_caps.get("supports_local_inventory_53216", capabilities.supports_local_inventory_53216)
+            )
         if capabilities.is_switch and not capabilities.switch_type:
             capabilities.switch_type = str(model_caps.get("switch_type", "switch"))
         if capabilities.supports_contact_sensor and not capabilities.contact_sensor_type:
@@ -880,7 +901,8 @@ class DeviceRecord:
             model_no=model_no,
             name=str(data.get("name") or ""),
             mac=str(data.get("mac") or ""),
-            version=data.get("version"),
+            version=_normalize_optional_int(data.get("version")),
+            version_source=str(data.get("version_source") or VERSION_SOURCE_DEVICE_LIST),
             left_name=data.get("left_name"),
             right_name=data.get("right_name"),
             rooms=list(data.get("rooms") or []),
@@ -905,6 +927,13 @@ class PixieInventory:
     devices_by_id: Dict[int, DeviceRecord] = field(default_factory=dict)
     state_store: DeviceStateStore = field(default_factory=DeviceStateStore)
 
+    @property
+    def supports_local_inventory_53216(self) -> bool:
+        """Return whether this Home's gateway supports local 53216 inventory."""
+        if self.gateway is None:
+            return True
+        return bool(self.gateway.supports_local_inventory_53216)
+
     @staticmethod
     def _model_no(device_obj: Dict[str, Any]) -> str:
         return f"{int(device_obj.get('type', 0)):02d}{int(device_obj.get('stype', 0)):02d}"
@@ -918,6 +947,7 @@ class PixieInventory:
         model_caps = get_model_capabilities(model_no)
 
         cap.is_gateway = model_caps["is_gateway"]
+        cap.supports_local_inventory_53216 = model_caps["supports_local_inventory_53216"]
         cap.is_light = model_caps["is_light"]
         cap.is_switch = model_caps["is_switch"]
         cap.switch_type = model_caps["switch_type"]
@@ -974,6 +1004,7 @@ class PixieInventory:
                 model_no=model_no,
                 model_name=hardware_list.get(model_no),
                 gateway_id=parse_gateway_id(device_obj.get("bridgeName")),
+                supports_local_inventory_53216=bool(model_caps.get("supports_local_inventory_53216", True)),
             )
 
         return None
@@ -1009,7 +1040,8 @@ class PixieInventory:
                 model_no=cls._model_no(d),
                 name=str(d.get("name") or d.get("bridgeName") or d.get("mac") or f"device_{dev_id}"),
                 mac=str(d.get("mac", "")),
-                version=d.get("version"),
+                version=_normalize_optional_int(d.get("version")),
+                version_source=VERSION_SOURCE_DEVICE_LIST,
                 left_name=d.get("left_name"),
                 right_name=d.get("right_name"),
                 rooms=list(d.get("rooms") or []),
@@ -1067,6 +1099,60 @@ class PixieInventory:
             inv.devices_by_id[rec.id] = rec
 
         return inv
+
+    @staticmethod
+    def _normalize_mac(mac: Any) -> str:
+        raw = str(mac or "").replace(":", "").replace("-", "").strip().upper()
+        if len(raw) != 12:
+            return ""
+        try:
+            int(raw, 16)
+        except ValueError:
+            return ""
+        return raw
+
+    def preserve_ble_advertised_versions_from(self, previous: "PixieInventory | None") -> int:
+        """Carry BLE-corrected firmware versions forward by MAC after inventory rebuild."""
+        if previous is None:
+            return 0
+        previous_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in previous.devices_by_id.values()
+            if self._normalize_mac(record.mac)
+            and record.version_source == VERSION_SOURCE_BLE_ADVERTISEMENT
+            and record.version is not None
+        }
+        preserved = 0
+        for record in self.devices_by_id.values():
+            previous_record = previous_by_mac.get(self._normalize_mac(record.mac))
+            if previous_record is None:
+                continue
+            if record.version != previous_record.version or record.version_source != VERSION_SOURCE_BLE_ADVERTISEMENT:
+                record.version = previous_record.version
+                record.version_source = VERSION_SOURCE_BLE_ADVERTISEMENT
+                preserved += 1
+        return preserved
+
+    def apply_ble_advertised_version(self, mac: str, version: int) -> DeviceRecord | None:
+        """Apply a BLE-advertised firmware version by MAC, returning the changed record."""
+        normalized_mac = self._normalize_mac(mac)
+        if not normalized_mac:
+            return None
+        try:
+            version_int = int(version)
+        except (TypeError, ValueError):
+            return None
+        if version_int <= 0:
+            return None
+        for record in self.devices_by_id.values():
+            if self._normalize_mac(record.mac) != normalized_mac:
+                continue
+            if record.version == version_int:
+                return None
+            record.version = version_int
+            record.version_source = VERSION_SOURCE_BLE_ADVERTISEMENT
+            return record
+        return None
 
     def apply_gwdata_bulk(self, records: List[Dict[str, Any]], source: str, *, full_snapshot: bool = False) -> int:
         """Apply GwData bulk records to runtime state for all known devices."""
