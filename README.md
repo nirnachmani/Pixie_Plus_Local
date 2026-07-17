@@ -11,6 +11,7 @@ Unlike the older Pixie Plus integration, this one controls the gateway locally o
 - Local push-style state updates from the live gateway session and Bluetooth
 - Lights, dimmers, switches, smart plugs, RGB strip control, blinds, timer, sensors and gate control
 - Blind button mapping is now done through the UI
+- Supports multiple Homes/Gateways
 
 The integration intentionally does not implement Pixie Plus groups, scenes, schedules, or timers. Home Assistant already covers those use cases more cleanly.
 
