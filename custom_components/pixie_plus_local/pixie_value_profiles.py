@@ -34,6 +34,7 @@ EFFECT_COMMAND_ENCODINGS = {
 # Human-readable model names (optional but useful for logs/debug).
 hardware_list = {
     "0102": "Gateway G3 - SGW3BTAM",
+    "0111": "Gateway - SGW/BT",
     "2213": "Smart Switch G3 - SWL600BTAM",
     "2211": "Smart Switch - Unknown Model",
     "2313": "Smart dimmer G3 - SDD300BTAM",
@@ -69,6 +70,7 @@ hardware_list = {
 MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "0102": {
         "is_gateway": True,
+        "supports_local_inventory_53216": True,
         "is_light": False,
         "is_switch": False,
         "supports_onoff": False,
@@ -79,6 +81,19 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_usb_subentity": False,
         "supports_cover": False,
     },
+    "0111": {
+        "is_gateway": True,
+        "supports_local_inventory_53216": False,
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": False,
+    },    
     "0107": {
         "is_light": False,
         "is_switch": True,
@@ -484,6 +499,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     supports_contact_sensor = bool(caps.get("supports_contact_sensor", False))
     return {
         "is_gateway": bool(caps.get("is_gateway", False)),
+        "supports_local_inventory_53216": bool(caps.get("supports_local_inventory_53216", True)),
         "is_light": bool(caps.get("is_light", False)),
         "is_switch": is_switch,
         "switch_type": str(caps.get("switch_type", "switch" if is_switch else "")),

@@ -11,6 +11,7 @@ Unlike the older Pixie Plus integration, this one controls the gateway locally o
 - Local push-style state updates from the live gateway session and Bluetooth
 - Lights, dimmers, switches, smart plugs, RGB strip control, blinds, timer, sensors and gate control
 - Blind button mapping is now done through the UI
+- Supports multiple Homes/Gateways
 
 The integration intentionally does not implement Pixie Plus groups, scenes, schedules, or timers. Home Assistant already covers those use cases more cleanly.
 
@@ -85,6 +86,13 @@ Entity ID should remain the same as with the old integration but check that this
 - Once enabled, the user can select if commands will be sent via TCP or BT through the integration's configuration (cogwheel icon) -> Command transport. There are 4 options: TCP primary, BT fallback; BT Primary, TCP fallback: TCP only; BT only. Because the ESPHome bluetooth proxy requires LAN access, BT modes still depend on the LAN. Updates from devices will arrive from both TCP and BT, and will race.
 - BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via reconfigure (under ⋮ after clicking on the integration ) -> Bluetooth support.
 - The added benefit of BT is currently minimal, but I am hoping to add the ability to add and remove devices straight from HA, which requires BT 
+
+## Multiple Homes/Gateways
+
+- Each Home/Gateway is added as a Hub under the integration. 
+- On initial setup the integration will ask which Home to add and will give an opportunity to add other/all Homes.
+- Homes can be added later by using the "Add hub" in the integration page or deleted (click on the ⋮ of the relevant home -> Delete)
+- The integration will attempt to find the gateway that is linked to the home and will prompt for an IP address if it can't find it.
 
 ## Blind Configuration
 
