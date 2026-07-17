@@ -86,6 +86,13 @@ Entity ID should remain the same as with the old integration but check that this
 - BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via reconfigure (under ⋮ after clicking on the integration ) -> Bluetooth support.
 - The added benefit of BT is currently minimal, but I am hoping to add the ability to add and remove devices straight from HA, which requires BT 
 
+## Multiple Homes/Gateways
+
+- Each Home/Gateway is added as a Hub under the integration. 
+- On initial setup the integration will ask which Home to add and will give an opportunity to add other/all Homes.
+- Homes can be added later by using the "Add hub" in the integration page or deleted (click on the ⋮ of the relevant home -> Delete)
+- The integration will attempt to find the gateway that is linked to the home and will prompt for an IP address if it can't find it.
+
 ## Blind Configuration
 
 Blind controllers require one extra configuration step because the Pixie system exposes blind commands as button positions in the app's control panel.
