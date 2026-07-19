@@ -140,10 +140,16 @@
         "title": "Pixie options",
         "description": "Choose which Pixie option to change.",
         "menu_options": {
-          "transport": "Command transport",
+          "transport": "Bluetooth settings",
+          "clear_bluetooth_access_node": "Clear Bluetooth access-node preference",
           "update_device_versions": "Update device versions",
           "cover_controller": "Blind mapping"
         }
+      },
+      "clear_bluetooth_access_node": {
+        "title": "Clear Bluetooth access-node preference",
+        "description": "Clear learned Pixie Bluetooth access-node hints. Bluetooth remains enabled and the next BLE session will scan again.",
+        "data": {}
       },
       "update_device_versions": {
         "title": "Update device versions",
@@ -151,10 +157,11 @@
         "data": {}
       },
       "transport": {
-        "title": "Command transport",
-        "description": "Choose which local pathway should be tried first when sending commands.",
+        "title": "Bluetooth settings",
+        "description": "Choose Bluetooth command behavior and access-node preference.",
         "data": {
-          "command_transport": "Command transport"
+          "command_transport": "Command transport",
+          "bt_access_node_preference": "Bluetooth access node"
         }
       },
       "cover_controller": {
