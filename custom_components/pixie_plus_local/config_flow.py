@@ -36,10 +36,11 @@ from . import (
     CONF_PIXIE_USERNAME,
     CONF_USER_ID,
     CONF_BT_ACCESS_NODE,
+    CONF_BT_BETTER_CANDIDATE_SEEN,
     CONF_BT_ENABLED,
-    CONF_BT_RESPONSE_ACCESS_NODE,
     CONF_BT_SOURCE,
     CONF_BT_STATE,
+    CONF_BT_ACCESS_NODE_PREFERENCE,
     CONF_COMMAND_TRANSPORT,
     DOMAIN,
     INVENTORY_MODE_CLOUD_FALLBACK,
@@ -50,6 +51,8 @@ from . import (
     COMMAND_TRANSPORT_BT_PRIMARY,
     COMMAND_TRANSPORT_TCP_ONLY,
     COMMAND_TRANSPORT_TCP_PRIMARY,
+    BT_ACCESS_NODE_AUTO,
+    BT_ACCESS_NODE_PREFER_GATEWAY,
     _async_delete_missing_credentials_issue,
     _async_delete_gateway_ip_issue,
     _async_run_global_ble_version_scan,
@@ -165,22 +168,25 @@ async def _async_apply_bluetooth_choice(
     log_label: str,
     preferred_source: str | None = None,
     preferred_access_node: str | None = None,
-    previous_response_access_node: str | None = None,
 ) -> str | None:
     """Apply the BT enable choice to entry data; return an error key if probing fails."""
     data[CONF_BT_ENABLED] = False
     data[CONF_BT_STATE] = BT_STATE_DISABLED
     data.pop(CONF_BT_SOURCE, None)
     data.pop(CONF_BT_ACCESS_NODE, None)
-    data.pop(CONF_BT_RESPONSE_ACCESS_NODE, None)
+    data.pop("bt_response_access_node", None)
+    data.pop("bt_access_nodes", None)
+    data.pop(CONF_BT_BETTER_CANDIDATE_SEEN, None)
 
     if not enable_bt:
         if options is not None:
             options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_TCP_PRIMARY
+            options.pop(CONF_BT_ACCESS_NODE_PREFERENCE, None)
         return None
 
     if options is not None:
         options.setdefault(CONF_COMMAND_TRANSPORT, COMMAND_TRANSPORT_TCP_PRIMARY)
+        options.setdefault(CONF_BT_ACCESS_NODE_PREFERENCE, BT_ACCESS_NODE_AUTO)
 
     probe = await _async_probe_bt_for_flow(
         hass,
@@ -205,8 +211,6 @@ async def _async_apply_bluetooth_choice(
             data[CONF_BT_SOURCE] = probe.source
         if probe.access_node:
             data[CONF_BT_ACCESS_NODE] = probe.access_node
-        if previous_response_access_node:
-            data[CONF_BT_RESPONSE_ACCESS_NODE] = previous_response_access_node
         return None
 
     prefix = _flow_home_log_prefix(None, cloud_params.home_name)
@@ -998,7 +1002,6 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             enable_bt = _enable_bt_from_user_input(user_input)
-            previous_response_access_node = str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "") or None
             data = dict(entry.data)
             options = dict(entry.options)
             runtime_data = getattr(entry, "runtime_data", None)
@@ -1012,12 +1015,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 inventory=getattr(pixie_runtime, "inventory", None),
                 log_label="reconfigure",
                 preferred_source=str(entry.data.get(CONF_BT_SOURCE) or "") or None,
-                preferred_access_node=(
-                    str(entry.data.get(CONF_BT_RESPONSE_ACCESS_NODE) or "")
-                    or str(entry.data.get(CONF_BT_ACCESS_NODE) or "")
-                    or None
-                ),
-                previous_response_access_node=previous_response_access_node,
+                preferred_access_node=str(entry.data.get(CONF_BT_ACCESS_NODE) or "") or None,
             )
             if error is not None:
                 errors["base"] = error
@@ -1280,12 +1278,32 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         """Choose which Pixie options to configure."""
         menu_options = ["cover_controller"]
         if _entry_bt_enabled(self.config_entry):
-            menu_options = ["transport", "update_device_versions", *menu_options]
+            menu_options = [
+                "transport",
+                "clear_bluetooth_access_node",
+                "update_device_versions",
+                *menu_options,
+            ]
 
         return self.async_show_menu(
             step_id="init",
             menu_options=menu_options,
         )
+
+    async def async_step_clear_bluetooth_access_node(self, user_input: dict[str, Any] | None = None):
+        """Clear learned BLE access-node hints without disabling Bluetooth."""
+        if _entry_bt_enabled(self.config_entry):
+            data = dict(self.config_entry.data)
+            for key in (
+                CONF_BT_SOURCE,
+                CONF_BT_ACCESS_NODE,
+                "bt_response_access_node",
+                "bt_access_nodes",
+                CONF_BT_BETTER_CANDIDATE_SEEN,
+            ):
+                data.pop(key, None)
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+        return self.async_create_entry(title="", data=dict(self.config_entry.options))
 
     async def async_step_update_device_versions(self, user_input: dict[str, Any] | None = None):
         """Run a manual BLE scan to refresh device firmware versions."""
@@ -1299,14 +1317,21 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         if not _entry_bt_enabled(self.config_entry):
             options = dict(self.config_entry.options)
             options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_TCP_PRIMARY
+            options.pop(CONF_BT_ACCESS_NODE_PREFERENCE, None)
             return self.async_create_entry(title="", data=options)
 
         if user_input is not None:
             options = dict(self.config_entry.options)
             options[CONF_COMMAND_TRANSPORT] = str(user_input[CONF_COMMAND_TRANSPORT])
+            options[CONF_BT_ACCESS_NODE_PREFERENCE] = str(user_input[CONF_BT_ACCESS_NODE_PREFERENCE])
             return self.async_create_entry(title="", data=options)
 
         current = str(self.config_entry.options.get(CONF_COMMAND_TRANSPORT) or COMMAND_TRANSPORT_TCP_PRIMARY)
+        current_access_node_preference = str(
+            self.config_entry.options.get(CONF_BT_ACCESS_NODE_PREFERENCE) or BT_ACCESS_NODE_AUTO
+        )
+        if current_access_node_preference not in (BT_ACCESS_NODE_AUTO, BT_ACCESS_NODE_PREFER_GATEWAY):
+            current_access_node_preference = BT_ACCESS_NODE_AUTO
         data_schema = vol.Schema(
             {
                 vol.Required(CONF_COMMAND_TRANSPORT, default=current): vol.In(
@@ -1315,6 +1340,12 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
                         COMMAND_TRANSPORT_BT_PRIMARY: "BT primary, TCP fallback",
                         COMMAND_TRANSPORT_TCP_ONLY: "TCP only",
                         COMMAND_TRANSPORT_BT_ONLY: "BT only",
+                    }
+                ),
+                vol.Required(CONF_BT_ACCESS_NODE_PREFERENCE, default=current_access_node_preference): vol.In(
+                    {
+                        BT_ACCESS_NODE_AUTO: "Auto / best BLE node",
+                        BT_ACCESS_NODE_PREFER_GATEWAY: "Prefer gateway, fallback to auto",
                     }
                 ),
             }
