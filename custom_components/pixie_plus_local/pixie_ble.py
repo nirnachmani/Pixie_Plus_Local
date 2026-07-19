@@ -13,7 +13,11 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 from .pixie_inventory import PixieInventory
-from .pixie_runtime import CloudParams
+from .pixie_runtime import (
+    CloudParams,
+    is_timer_poll_reply_route_packet,
+    patch_timer_poll_reply_route,
+)
 from .pixie_ble_crypto import (
     build_login_packet,
     decrypt_notification_packet,
@@ -28,8 +32,10 @@ PIXIE_CHAR_1911_SUFFIX = "1911"
 PIXIE_CHAR_1912_SUFFIX = "1912"
 PIXIE_CHAR_1914_SUFFIX = "1914"
 PIXIE_DEFAULT_NAME = "Smart Light"
-BLE_PASSIVE_STALE_SECONDS = 300.0
 BLE_NOTIFY_WAIT_SECONDS = 5.0
+BLE_BETTER_RSSI_DELTA_DBM = 10
+BT_ACCESS_NODE_AUTO = "auto"
+BT_ACCESS_NODE_PREFER_GATEWAY = "prefer_gateway"
 
 
 BT_STATE_DISABLED = "disabled"
@@ -39,7 +45,7 @@ BT_STATE_UNAVAILABLE = "unavailable"
 
 
 class _PixieBleReconnectRequested(RuntimeError):
-    """Internal signal used to restart a stale BLE session without long backoff."""
+    """Internal signal used to restart a BLE session without long backoff."""
 
 
 @dataclass
@@ -100,10 +106,12 @@ class PixieBluetoothRuntime:
     enabled: bool
     command_builder: Any | None = None
     inventory_update_callback: Callable[[PixieInventory], None] | None = None
-    access_node_update_callback: Callable[[str | None, str | None, bool], None] | None = None
+    access_node_update_callback: Callable[..., None] | None = None
+    health_update_callback: Callable[[], None] | None = None
     preferred_source: str | None = None
     preferred_access_node: str | None = None
-    preferred_response_access_node: str | None = None
+    access_node_preference: str = BT_ACCESS_NODE_AUTO
+    better_candidate_seen: bool = False
     proxy_refs: list[_ESPHomeProxyRef] | None = None
     health: PixieBluetoothHealth = field(default_factory=PixieBluetoothHealth)
     _task: asyncio.Task[None] | None = None
@@ -119,6 +127,10 @@ class PixieBluetoothRuntime:
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _reconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
     _reconnect_reason: str | None = None
+    _active_candidate_rssi: int | None = None
+    _active_proxy_entry_id: str | None = None
+    _active_proxy_title: str | None = None
+    _post_connect_scan_task: asyncio.Task[None] | None = None
 
     @property
     def _log_prefix(self) -> str:
@@ -127,16 +139,29 @@ class PixieBluetoothRuntime:
             return f"[{home_name}] "
         return ""
 
+    def _notify_health_update(self) -> None:
+        """Notify the integration layer that BLE connection health changed."""
+        if self.health_update_callback is None:
+            return
+        try:
+            self.health_update_callback()
+        except Exception:
+            LOGGER.debug("%sPixie BLE health update callback failed", self._log_prefix, exc_info=True)
+
     async def async_start(self) -> None:
         """Start the BLE runtime if enabled."""
         self.health.enabled = self.enabled
-        self.health.source = self.preferred_source
-        self.health.access_node = self.preferred_access_node
         if not self.enabled:
             self.health.state = BT_STATE_DISABLED
+            self._notify_health_update()
             return
         if self._task is not None and not self._task.done():
             return
+        self.health.source = self.preferred_source
+        self.health.access_node = self.preferred_access_node
+        self.health.state = BT_STATE_UNAVAILABLE
+        self.health.last_error = None
+        self._notify_health_update()
         self._stop_event.clear()
         if hasattr(self.hass, "async_create_background_task"):
             try:
@@ -156,6 +181,11 @@ class PixieBluetoothRuntime:
     async def async_shutdown(self) -> None:
         """Stop the BLE runtime task."""
         self._stop_event.set()
+        if self._post_connect_scan_task is not None:
+            self._post_connect_scan_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._post_connect_scan_task
+            self._post_connect_scan_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -167,6 +197,7 @@ class PixieBluetoothRuntime:
         await self._disconnect_client()
         self.health.state = BT_STATE_DISABLED
         self.health.last_error = None
+        self._notify_health_update()
 
     async def _run_session(self) -> None:
         """Run a recoverable Pixie BLE session loop."""
@@ -179,22 +210,39 @@ class PixieBluetoothRuntime:
                 self.health.state = BT_STATE_UNAVAILABLE
                 self.health.last_error = str(err)
                 self.health.reconnect_count += 1
+                self._notify_health_update()
                 LOGGER.warning("%sPixie BLE session reconnect requested: %s", self._log_prefix, err)
                 await self._disconnect_client()
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=0.25)
-                except TimeoutError:
-                    continue
+                await self._wait_before_retry(0.25)
+                continue
             except Exception as err:
                 self.health.state = BT_STATE_UNAVAILABLE
                 self.health.last_error = str(err)
                 self.health.reconnect_count += 1
+                self._notify_health_update()
                 LOGGER.warning("%sPixie BLE session stopped; retrying: %s", self._log_prefix, err)
                 await self._disconnect_client()
-                try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=min(60.0, 3.0 + self.health.reconnect_count))
-                except TimeoutError:
-                    continue
+                await self._wait_before_retry(min(60.0, 3.0 + self.health.reconnect_count))
+                continue
+
+    async def _wait_before_retry(self, timeout: float) -> None:
+        """Wait for retry delay, stop, or an explicit reconnect request."""
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+        try:
+            await asyncio.wait(
+                {stop_task, reconnect_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if reconnect_task.done() and reconnect_task.result():
+                self._reconnect_event.clear()
+        finally:
+            for task in (stop_task, reconnect_task):
+                if not task.done():
+                    task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(stop_task, reconnect_task)
 
     async def _connect_and_run_once(self) -> None:
         """Connect, login, enable notifications, and wait until disconnected."""
@@ -207,18 +255,34 @@ class PixieBluetoothRuntime:
                 self._reconnect_event.clear()
                 self._reconnect_reason = None
                 raise _PixieBleReconnectRequested(reason)
+            notify_task = asyncio.create_task(notify_queue.get())
+            reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+            pending: set[asyncio.Task[Any]] = set()
             try:
-                raw = await asyncio.wait_for(notify_queue.get(), timeout=BLE_NOTIFY_WAIT_SECONDS)
-            except TimeoutError:
-                if self.is_notification_stale():
-                    age = self.notification_age()
-                    raise _PixieBleReconnectRequested(
-                        f"BLE notification stream stale for {age:.1f}s"
-                        if age is not None
-                        else "BLE notification stream stale"
-                    )
+                done, pending = await asyncio.wait(
+                    {notify_task, reconnect_task},
+                    timeout=BLE_NOTIFY_WAIT_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                for task in (notify_task, reconnect_task):
+                    task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.gather(notify_task, reconnect_task)
+                raise
+            finally:
+                for task in pending:
+                    task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.gather(*pending)
+            if reconnect_task in done and reconnect_task.result():
+                reason = self._reconnect_reason or "BLE reconnect requested"
+                self._reconnect_event.clear()
+                self._reconnect_reason = None
+                raise _PixieBleReconnectRequested(reason)
+            if notify_task not in done:
                 continue
-            self._handle_notification(raw)
+            self._handle_notification(notify_task.result())
 
     async def _connect_and_run_probe(self) -> None:
         """Connect far enough to prove this HA ESPHome proxy path works."""
@@ -226,22 +290,30 @@ class PixieBluetoothRuntime:
 
     async def _connect_login_enable(self) -> asyncio.Queue[bytes]:
         """Connect, login, enable 1911 notifications, and return the notify queue."""
-        preferred_address = (
-            self._preferred_access_node_from_inventory()
-            or self.preferred_response_access_node
-            or self.preferred_access_node
-        )
-        if preferred_address and preferred_address not in (self.preferred_access_node, self.preferred_response_access_node):
+        gateway_address = self._preferred_access_node_from_inventory()
+        prefer_gateway = self.access_node_preference == BT_ACCESS_NODE_PREFER_GATEWAY and gateway_address
+        preferred_address: str | None = None
+        preferred_reason = "none"
+        scan_fallback_address: str | None = None
+        if prefer_gateway:
+            preferred_address = gateway_address
+            preferred_reason = "gateway preference"
+        elif not self.better_candidate_seen:
+            if self.preferred_access_node:
+                preferred_address = self.preferred_access_node
+                preferred_reason = "persisted strongest node"
+        else:
+            scan_fallback_address = self.preferred_access_node
             LOGGER.info(
-                "%sPixie BLE gateway access-node preference active preferred=%s persisted=%s",
+                "%sPixie BLE previous scan found a better candidate; scanning before selecting access node",
                 self._log_prefix,
-                preferred_address,
-                self.preferred_access_node,
             )
-        elif preferred_address == self.preferred_response_access_node and preferred_address != self.preferred_access_node:
+
+        if preferred_address:
             LOGGER.info(
-                "%sPixie BLE response-capable access-node preference active preferred=%s persisted=%s",
+                "%sPixie BLE access-node preference active reason=%s preferred=%s persisted=%s",
                 self._log_prefix,
+                preferred_reason,
                 preferred_address,
                 self.preferred_access_node,
             )
@@ -257,7 +329,10 @@ class PixieBluetoothRuntime:
             )
             if cached_candidates:
                 try:
-                    return await self._try_connect_login_candidates(cached_candidates)
+                    return await self._try_connect_login_candidates(
+                        self._rank_candidates(cached_candidates),
+                        gateway_address=gateway_address,
+                    )
                 except Exception as err:
                     LOGGER.debug(
                         "%sPixie BLE cached preferred access-node path failed; falling back to active scan: %s",
@@ -274,22 +349,72 @@ class PixieBluetoothRuntime:
         candidates = await _async_discover_candidates(
             self.hass,
             preferred_source=self.preferred_source,
-            preferred_address=preferred_address,
+            preferred_address=None,
             proxies=proxies,
             active_scan=True,
             include_discovered_service_info=True,
         )
         if not candidates:
+            if scan_fallback_address:
+                LOGGER.debug(
+                    "%sPixie BLE scan found no candidates; trying previous persisted node %s",
+                    self._log_prefix,
+                    scan_fallback_address,
+                )
+                fallback_candidates = await _async_discover_candidates(
+                    self.hass,
+                    preferred_source=self.preferred_source,
+                    preferred_address=scan_fallback_address,
+                    proxies=proxies,
+                    active_scan=False,
+                    include_discovered_service_info=False,
+                )
+                if fallback_candidates:
+                    return await self._try_connect_login_candidates(
+                        self._rank_candidates(fallback_candidates),
+                        gateway_address=gateway_address,
+                    )
             raise RuntimeError("No connectable Pixie BLE advertisement found")
 
-        return await self._try_connect_login_candidates(candidates)
+        try:
+            return await self._try_connect_login_candidates(
+                self._rank_candidates(candidates),
+                gateway_address=gateway_address,
+            )
+        except Exception:
+            if not scan_fallback_address:
+                raise
+            LOGGER.debug(
+                "%sPixie BLE scanned candidates failed; trying previous persisted node %s",
+                self._log_prefix,
+                scan_fallback_address,
+            )
+            fallback_candidates = await _async_discover_candidates(
+                self.hass,
+                preferred_source=self.preferred_source,
+                preferred_address=scan_fallback_address,
+                proxies=proxies,
+                active_scan=False,
+                include_discovered_service_info=False,
+            )
+            if not fallback_candidates:
+                raise
+            return await self._try_connect_login_candidates(
+                self._rank_candidates(fallback_candidates),
+                gateway_address=gateway_address,
+            )
 
-    async def _try_connect_login_candidates(self, candidates: list[dict[str, Any]]) -> asyncio.Queue[bytes]:
+    async def _try_connect_login_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        gateway_address: str | None,
+    ) -> asyncio.Queue[bytes]:
         """Try candidates in order until one completes the Pixie login flow."""
         last_error: Exception | None = None
         for candidate in candidates:
             try:
-                return await self._connect_login_enable_candidate(candidate)
+                return await self._connect_login_enable_candidate(candidate, gateway_address=gateway_address)
             except Exception as err:
                 last_error = err
                 LOGGER.debug(
@@ -302,6 +427,111 @@ class PixieBluetoothRuntime:
                 await self._disconnect_client()
         raise RuntimeError(f"No Pixie BLE candidate completed login/notify flow: {last_error}")
 
+    def _known_inventory_macs(self) -> set[str]:
+        """Return BLE MACs that belong to this Pixie home inventory."""
+        if self.inventory is None:
+            return set()
+        macs: set[str] = set()
+        for rec in self.inventory.devices_by_id.values():
+            normalized = _normalize_mac(str(getattr(rec, "mac", "") or ""))
+            if normalized:
+                macs.add(normalized)
+        gateway = self.inventory.gateway
+        gateway_mac = _normalize_mac(str(getattr(gateway, "gateway_mac", "") or "")) if gateway is not None else ""
+        if gateway_mac:
+            macs.add(gateway_mac)
+        return macs
+
+    def _access_node_reply_route_node_id(self) -> int | None:
+        """Return the connected access node's Pixie device id for reply routing."""
+        if self.inventory is None:
+            return None
+        access_node = _normalize_mac(str(self.health.access_node or ""))
+        if not access_node:
+            return None
+        for dev_id, rec in self.inventory.devices_by_id.items():
+            if _normalize_mac(str(getattr(rec, "mac", "") or "")) == access_node:
+                return int(dev_id)
+        gateway = self.inventory.gateway
+        gateway_mac = _normalize_mac(str(getattr(gateway, "gateway_mac", "") or "")) if gateway is not None else ""
+        if gateway_mac and gateway_mac == access_node:
+            for dev_id, rec in self.inventory.devices_by_id.items():
+                if getattr(getattr(rec, "capabilities", None), "is_gateway", False):
+                    return int(dev_id)
+        return None
+
+    def _filter_home_candidates(self, candidates: list[dict[str, Any]], *, context: str) -> list[dict[str, Any]]:
+        """Keep only candidates that are known members of this Pixie home."""
+        known_macs = self._known_inventory_macs()
+        if not known_macs:
+            return candidates
+        kept: list[dict[str, Any]] = []
+        ignored: list[dict[str, Any]] = []
+        for candidate in candidates:
+            address = str(candidate.get("address") or "").upper()
+            if _normalize_mac(address) in known_macs:
+                kept.append(candidate)
+            else:
+                ignored.append(candidate)
+        if ignored:
+            LOGGER.debug(
+                "%sPixie BLE ignored %s non-inventory access-node candidate(s) during %s: %s",
+                self._log_prefix,
+                len(ignored),
+                context,
+                [
+                    {
+                        "address": item.get("address"),
+                        "source": item.get("source"),
+                        "rssi": item.get("rssi"),
+                    }
+                    for item in ignored
+                ],
+            )
+        if not kept and candidates:
+            LOGGER.debug(
+                "%sPixie BLE no access-node candidates matched this home inventory during %s",
+                self._log_prefix,
+                context,
+            )
+        return kept
+
+    def _rank_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rank candidates by gateway preference, RSSI, and practical tie-breakers."""
+        candidates = self._filter_home_candidates(candidates, context="connection ranking")
+        gateway_address = self._preferred_access_node_from_inventory()
+        prefer_gateway = self.access_node_preference == BT_ACCESS_NODE_PREFER_GATEWAY and gateway_address
+
+        def score(candidate: dict[str, Any]) -> tuple[int, int, int, int]:
+            address = str(candidate.get("address") or "").upper()
+            source = str(candidate.get("source") or "").upper()
+            rssi = int(candidate.get("rssi") or -999)
+            gateway_bonus = 10000 if prefer_gateway and address == gateway_address else 0
+            source_score = 10 if self.preferred_source and source == str(self.preferred_source).upper() else 0
+            return (
+                gateway_bonus,
+                rssi,
+                source_score,
+                int(getattr(candidate.get("proxy"), "connections_free", 0) or 0),
+            )
+
+        ranked = sorted(candidates, key=score, reverse=True)
+        LOGGER.debug(
+            "%sPixie BLE candidate ranking preference=%s candidates=%s",
+            self._log_prefix,
+            self.access_node_preference,
+            [
+                {
+                    "address": item.get("address"),
+                    "source": item.get("source"),
+                    "rssi": item.get("rssi"),
+                    "gateway": str(item.get("address") or "").upper() == str(gateway_address or "").upper(),
+                }
+                for item in ranked
+            ],
+        )
+        return ranked
+
     def _preferred_access_node_from_inventory(self) -> str | None:
         """Return the gateway BLE MAC from inventory, if available."""
         gateway = self.inventory.gateway if self.inventory is not None else None
@@ -313,7 +543,12 @@ class PixieBluetoothRuntime:
             return None
         return ":".join(normalized[i : i + 2] for i in range(0, 12, 2)).upper()
 
-    async def _connect_login_enable_candidate(self, candidate: dict[str, Any]) -> asyncio.Queue[bytes]:
+    async def _connect_login_enable_candidate(
+        self,
+        candidate: dict[str, Any],
+        *,
+        gateway_address: str | None,
+    ) -> asyncio.Queue[bytes]:
         """Connect/login/enable one candidate and return its notification queue."""
         proxy: _ESPHomeProxyRef = candidate["proxy"]
         address = str(candidate["address"]).upper()
@@ -321,6 +556,9 @@ class PixieBluetoothRuntime:
         address_type = int(candidate.get("address_type", 0))
         self.health.source = proxy.source
         self.health.access_node = address
+        self._active_proxy_entry_id = proxy.entry_id
+        self._active_proxy_title = proxy.title
+        self._active_candidate_rssi = int(candidate.get("rssi") or -999)
         self._device_mac = _mac_bytes(address)
         self._ble_address_int = address_int
 
@@ -372,15 +610,94 @@ class PixieBluetoothRuntime:
         self.health.state = BT_STATE_READY
         self.health.last_error = None
         self.health.last_update_at = time.time()
-        LOGGER.info("%sPixie BLE session ready via %s source=%s", self._log_prefix, address, self.health.source)
-        self._mark_access_node_capability(response_capable=False)
+        self._notify_health_update()
+        LOGGER.info(
+            "%sPixie BLE session ready via %s source=%s rssi=%s",
+            self._log_prefix,
+            address,
+            self.health.source,
+            self._active_candidate_rssi,
+        )
+        self._remember_access_node(better_candidate_seen=False)
+        if not (self.access_node_preference == BT_ACCESS_NODE_PREFER_GATEWAY and gateway_address and address == gateway_address):
+            self._schedule_post_connect_comparison_scan()
         return notify_queue
 
-    def _mark_access_node_capability(self, *, response_capable: bool) -> None:
-        """Publish newly learned access-node capability to the integration layer."""
+    def _remember_access_node(
+        self,
+        *,
+        better_candidate_seen: bool | None = None,
+    ) -> None:
+        """Publish learned access-node selection hints to the integration layer."""
         if self.access_node_update_callback is None:
             return
-        self.access_node_update_callback(self.health.source, self.health.access_node, response_capable)
+        self.access_node_update_callback(
+            self.health.source,
+            self.health.access_node,
+            proxy_entry_id=self._active_proxy_entry_id,
+            proxy_title=self._active_proxy_title,
+            rssi=self._active_candidate_rssi,
+            better_candidate_seen=better_candidate_seen,
+        )
+
+    def _schedule_post_connect_comparison_scan(self) -> None:
+        """Schedule a short scan to decide whether the next session should rescan."""
+        if self._post_connect_scan_task is not None and not self._post_connect_scan_task.done():
+            return
+        if self._active_candidate_rssi is None or self._active_candidate_rssi <= -999:
+            return
+        self._post_connect_scan_task = asyncio.create_task(self._async_post_connect_comparison_scan())
+
+    async def _async_post_connect_comparison_scan(self) -> None:
+        """Look for a much stronger node, but leave the current session stable."""
+        await asyncio.sleep(1.0)
+        if self._stop_event.is_set() or self.health.state != BT_STATE_READY:
+            return
+        proxies = self.proxy_refs if self.proxy_refs is not None else _iter_esphome_bluetooth_proxies(self.hass)
+        candidates = await _async_discover_candidates(
+            self.hass,
+            preferred_source=self.preferred_source,
+            preferred_address=None,
+            proxies=proxies,
+            active_scan=True,
+            include_discovered_service_info=True,
+        )
+        candidates = self._filter_home_candidates(candidates, context="post-connect comparison")
+        current_address = str(self.health.access_node or "").upper()
+        current_rssi = int(self._active_candidate_rssi or -999)
+        best: dict[str, Any] | None = None
+        for candidate in self._rank_candidates(candidates):
+            address = str(candidate.get("address") or "").upper()
+            if not address or address == current_address:
+                continue
+            best = candidate
+            break
+        if best is None:
+            LOGGER.debug("%sPixie BLE post-connect scan found no alternate candidate", self._log_prefix)
+            return
+        best_rssi = int(best.get("rssi") or -999)
+        delta = best_rssi - current_rssi
+        if delta >= BLE_BETTER_RSSI_DELTA_DBM:
+            LOGGER.info(
+                "%sPixie BLE stronger candidate seen for next reconnect current=%s rssi=%s better=%s rssi=%s delta=%s",
+                self._log_prefix,
+                current_address,
+                current_rssi,
+                best.get("address"),
+                best_rssi,
+                delta,
+            )
+            self._remember_access_node(better_candidate_seen=True)
+        else:
+            LOGGER.debug(
+                "%sPixie BLE post-connect scan kept current node current=%s rssi=%s best=%s rssi=%s delta=%s",
+                self._log_prefix,
+                current_address,
+                current_rssi,
+                best.get("address"),
+                best_rssi,
+                delta,
+            )
 
     async def _native_connect(
         self,
@@ -394,6 +711,13 @@ class PixieBluetoothRuntime:
 
         def _connection_state(connected: bool, mtu: int, error: int) -> None:
             events.append((connected, mtu, error))
+            if self.health.state != BT_STATE_READY or self._stop_event.is_set():
+                return
+            if connected and error == 0:
+                return
+            self._request_reconnect(
+                f"BLE connection state changed connected={connected} mtu={mtu} error={error}"
+            )
 
         self._connection_unsub = await client.bluetooth_device_connect(
             address_int,
@@ -409,13 +733,6 @@ class PixieBluetoothRuntime:
 
     async def async_send_command(self, command_kwargs: dict[str, Any]) -> None:
         """Send a command via BLE 1912."""
-        if self.is_notification_stale():
-            age = self.notification_age()
-            raise RuntimeError(
-                f"Pixie BLE notification stream is stale for {age:.1f}s"
-                if age is not None
-                else "Pixie BLE notification stream is stale"
-            )
         if self._client is None or self._session_key is None or self._device_mac is None or self._char_1912 is None:
             raise RuntimeError("Pixie BLE session is not ready")
         plain_packets = self._build_plain_1912_packets(command_kwargs)
@@ -432,7 +749,13 @@ class PixieBluetoothRuntime:
                     delay,
                     _redact_command_kwargs(command_kwargs),
                 )
-                await self._client.bluetooth_gatt_write(self._ble_address_int, self._char_1912, encrypted, response=False)
+                try:
+                    await self._client.bluetooth_gatt_write(self._ble_address_int, self._char_1912, encrypted, response=False)
+                except Exception as err:
+                    reason = f"BLE command write failed: {err}"
+                    self._request_reconnect(reason)
+                    await self._disconnect_client()
+                    raise RuntimeError(reason) from err
                 if delay:
                     await asyncio.sleep(delay)
 
@@ -447,7 +770,37 @@ class PixieBluetoothRuntime:
         plan = build_core_command_plan(command_kwargs)
         if not plan.packets:
             raise RuntimeError(f"Unsupported BLE command kwargs: {sorted(command_kwargs)}")
-        return [(bytes.fromhex(packet.command_hex), packet.delay_after) for packet in plan.packets]
+        reply_route_id = self._access_node_reply_route_node_id()
+        packets: list[tuple[bytes, float]] = []
+        for packet in plan.packets:
+            command_hex, old_route, new_route = patch_timer_poll_reply_route(
+                packet.command_hex,
+                reply_route_id,
+            )
+            if old_route is not None:
+                LOGGER.debug(
+                    "%sTimer poll reply route resolved transport=ble device=%s reply_node=%s old=%s new=%s access_node=%s",
+                    self._log_prefix,
+                    plan.device_id,
+                    reply_route_id,
+                    old_route,
+                    new_route,
+                    self.health.access_node,
+                )
+            else:
+                try:
+                    is_timer_poll = is_timer_poll_reply_route_packet(bytes.fromhex(packet.command_hex))
+                except ValueError:
+                    is_timer_poll = False
+                if is_timer_poll:
+                    LOGGER.debug(
+                        "%sTimer poll reply route not patched transport=ble device=%s reason=no_access_node_route_id access_node=%s",
+                        self._log_prefix,
+                        plan.device_id,
+                        self.health.access_node,
+                    )
+            packets.append((bytes.fromhex(command_hex), packet.delay_after))
+        return packets
 
     def _handle_notification(self, raw: bytes) -> None:
         """Decrypt and classify a raw 1911 notification."""
@@ -461,8 +814,6 @@ class PixieBluetoothRuntime:
         self.mark_update()
         hint = _decode_ble_payload(raw, payload)
         LOGGER.debug("%sPixie BLE notification raw=%s payload=%s hint=%s", self._log_prefix, raw.hex(), payload.hex(), hint)
-        if hint.get("prefix") == "d36969":
-            self._mark_access_node_capability(response_capable=True)
         try:
             applied = self._apply_ble_payload_hint(hint)
         except Exception:
@@ -530,6 +881,12 @@ class PixieBluetoothRuntime:
                 LOGGER.debug("%sError while removing Pixie BLE connection callback", self._log_prefix, exc_info=True)
         if address_int is None:
             return
+        if not _esphome_client_api_connected(client):
+            LOGGER.debug(
+                "%sSkipping Pixie BLE device disconnect because ESPHome API is not connected",
+                self._log_prefix,
+            )
+            return
         try:
             await client.bluetooth_device_disconnect(address_int, timeout=10.0)
         except Exception:
@@ -540,27 +897,33 @@ class PixieBluetoothRuntime:
         self.health.last_update_at = time.time()
         self.health.last_error = None
         self.health.state = BT_STATE_READY
+        self._notify_health_update()
 
-    def notification_age(self) -> float | None:
-        """Return seconds since the last direct BLE notification/liveness mark."""
-        last = self.health.last_update_at or self.health.last_connected_at
-        if last is None:
-            return None
-        return max(0.0, time.time() - last)
-
-    def is_notification_stale(self, stale_seconds: float = BLE_PASSIVE_STALE_SECONDS) -> bool:
-        """Return True when the direct BLE notification stream has gone quiet."""
-        if not self.enabled or self.health.state != BT_STATE_READY:
-            return False
-        age = self.notification_age()
-        return age is not None and age > stale_seconds
-
-    async def async_request_reconnect(self, reason: str) -> None:
-        """Ask the runtime loop to reconnect the current BLE session."""
+    def _request_reconnect(self, reason: str) -> None:
+        """Ask the runtime loop to reconnect without depending on notification traffic."""
+        if self._stop_event.is_set():
+            return
         self._reconnect_reason = reason
         self._reconnect_event.set()
         self.health.state = BT_STATE_UNAVAILABLE
         self.health.last_error = reason
+        self._notify_health_update()
+
+    def mark_proxy_unavailable(self, reason: str) -> None:
+        """Mark the upstream ESPHome proxy unavailable and request a reconnect."""
+        self._request_reconnect(reason)
+
+    def request_reconnect(self, reason: str) -> None:
+        """Request a BLE reconnect from the HA event loop."""
+        self._request_reconnect(reason)
+
+    def esphome_api_connected(self) -> bool:
+        """Return whether the selected ESPHome API client is known connected."""
+        return _esphome_client_api_connected(self._client)
+
+    async def async_request_reconnect(self, reason: str) -> None:
+        """Ask the runtime loop to reconnect the current BLE session."""
+        self._request_reconnect(reason)
         await self._disconnect_client()
 
 
@@ -847,6 +1210,7 @@ def _decode_pixie_firmware_manufacturer_block(
             manufacturer_id=manufacturer_id,
             rssi=rssi,
         ))
+
     return adverts
 
 
@@ -900,6 +1264,16 @@ def _resolve_esphome_proxy(
         )
         return proxies[0]
     return None
+
+
+def _esphome_client_api_connected(client: Any | None) -> bool:
+    """Return whether an ESPHome API client currently has an authenticated connection."""
+    if client is None:
+        return False
+    connection = getattr(client, "_connection", None)
+    if connection is None:
+        return False
+    return bool(getattr(connection, "is_connected", False))
 
 
 def _iter_esphome_bluetooth_proxies(hass: HomeAssistant) -> list[_ESPHomeProxyRef]:

@@ -160,6 +160,48 @@ class PixieCoreCommandPlan:
     result: Dict[str, Any] = field(default_factory=dict)
 
 
+def is_timer_poll_reply_route_packet(command: bytes) -> bool:
+    """Return True for the timer f96b69 poll that carries a reply route id."""
+    return (
+        len(command) == 17
+        and command[7:10] == b"\xf9\x6b\x69"
+        and command[10:15] == b"\x05\x00\x00\x00\x00"
+    )
+
+
+def patch_timer_poll_reply_route(
+    command_hex: str,
+    reply_node_id: Optional[int],
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Patch the timer poll reply route field when the packet shape matches.
+
+    Returns (command_hex, old_route_hex, new_route_hex).  The route values are
+    None when the packet is not the timer poll shape, or when no route id is
+    available.
+    """
+    try:
+        command = bytes.fromhex(command_hex)
+    except ValueError:
+        return command_hex, None, None
+    if not is_timer_poll_reply_route_packet(command):
+        return command_hex, None, None
+    if reply_node_id is None:
+        return command_hex, None, None
+    try:
+        route_id = int(reply_node_id)
+    except (TypeError, ValueError):
+        return command_hex, None, None
+    if not (0 <= route_id <= 0xFFFF):
+        return command_hex, None, None
+    old_route = command[15:17].hex()
+    route_bytes = route_id.to_bytes(2, byteorder="little", signed=False)
+    new_route = route_bytes.hex()
+    if old_route == new_route:
+        return command_hex, old_route, new_route
+    patched = command[:15] + route_bytes + command[17:]
+    return patched.hex(), old_route, new_route
+
+
 @dataclass
 class PixieRuntimeSession:
     """Owns the long-lived 41578 control thread and its readiness state."""
@@ -186,9 +228,15 @@ class PixieRuntimeSession:
     active_command_id: Optional[int] = None
     active_command_started_at: Optional[float] = None
     last_command_sent_at: Optional[float] = None
+    health_update_callback: Optional[Callable[[], None]] = field(default=None, repr=False)
 
     def _update_health_state(self, **kwargs: Any) -> None:
         self.ready_state.update(kwargs)
+        if self.health_update_callback is not None:
+            try:
+                self.health_update_callback()
+            except Exception:
+                LOGGER.debug("Pixie runtime health update callback failed", exc_info=True)
 
     def start(self) -> None:
         if self.thread is not None:
@@ -311,12 +359,7 @@ class PixieRuntimeSession:
         if self.consecutive_heartbeat_failures < max_heartbeat_failures:
             return False
 
-        ts_now = time.time() if now is None else float(now)
-        last_activity = self.last_inbound_at or self.last_heartbeat_reply_at or self.primed_at
-        if last_activity is None:
-            return False
-
-        return (ts_now - last_activity) >= idle_timeout
+        return True
 
     def reserve_command_slot(self) -> tuple[int, int]:
         """Reserve a command slot and report how many commands are already ahead."""
@@ -620,6 +663,22 @@ class PixieAuthHandler:
 
     def _log_debug(self, message: str, *args: Any) -> None:
         LOGGER.debug(self._log_message(message), *args)
+
+    def _gateway_reply_route_node_id(self) -> Optional[int]:
+        """Return the current home gateway's Pixie device id for reply routing."""
+        inventory = self.inventory
+        if inventory is None:
+            return None
+        gateway = inventory.gateway
+        gateway_mac = PixieInventory._normalize_mac(getattr(gateway, "gateway_mac", None)) if gateway is not None else ""
+        if gateway_mac:
+            for dev_id, rec in inventory.devices_by_id.items():
+                if PixieInventory._normalize_mac(getattr(rec, "mac", None)) == gateway_mac:
+                    return int(dev_id)
+        for dev_id, rec in inventory.devices_by_id.items():
+            if getattr(getattr(rec, "capabilities", None), "is_gateway", False):
+                return int(dev_id)
+        return None
 
     def _log_info(self, message: str, *args: Any) -> None:
         LOGGER.info(self._log_message(message), *args)
@@ -4134,6 +4193,7 @@ class PixieAuthHandler:
             }
             plan = self.build_core_command_plan(command_kwargs)
 
+            tcp_reply_route_id = self._gateway_reply_route_node_id()
             for packet in plan.packets:
                 if packet.log_message:
                     if packet.log_args:
@@ -4143,15 +4203,33 @@ class PixieAuthHandler:
                     else:
                         self._log_debug(packet.log_message)
 
+                command_hex, old_route, new_route = patch_timer_poll_reply_route(
+                    packet.command_hex,
+                    tcp_reply_route_id,
+                )
+                if old_route is not None:
+                    self._log_debug(
+                        "Timer poll reply route resolved transport=tcp device=%s reply_node=%s old=%s new=%s",
+                        plan.device_id,
+                        tcp_reply_route_id,
+                        old_route,
+                        new_route,
+                    )
+                elif is_timer_poll_reply_route_packet(bytes.fromhex(packet.command_hex)):
+                    self._log_debug(
+                        "Timer poll reply route not patched transport=tcp device=%s reason=no_gateway_route_id",
+                        plan.device_id,
+                    )
+
                 command_debug = self._build_local_bledata_command_debug(
                     key=extracted_key,
-                    command_hex=packet.command_hex,
+                    command_hex=command_hex,
                     from_email=sender_identity,
                     repeat=packet.tcp_repeat,
                 )
                 command_b64 = command_debug["base64"]
                 if self.verbose:
-                    self._log_debug("Core command hex: %s", packet.command_hex)
+                    self._log_debug("Core command hex: %s", command_hex)
                     self._print_local_command_debug(command_debug)
 
                 command_parsed = _parse_message(command_b64, extracted_key)
