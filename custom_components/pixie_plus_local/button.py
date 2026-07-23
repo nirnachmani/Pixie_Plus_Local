@@ -15,14 +15,14 @@ from . import (
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 
 
 def _iter_timer_button_endpoints(inventory) -> list[PixieEndpoint]:
     """Return restart button endpoints for timer-capable devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -45,7 +45,7 @@ def _iter_timer_button_endpoints(inventory) -> list[PixieEndpoint]:
 
 def _iter_sensor_refresh_endpoints(inventory) -> list[PixieEndpoint]:
     """Return refresh button endpoints for sensor devices with configurable params."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]

@@ -46,6 +46,10 @@ hardware_list = {
     "0208": "Smart Socket Outlet - SP023/BTAM",
     "1002": "Dual Relay Control - PC206DR/R/BTAM",
     "1102": "Blind & Signal Control - PC206BS/R/BTAM",
+    "1202": "Gate & Door Control - PC206GD/R/BTAM (Swing Gate)",
+    "1203": "Gate & Door Control - PC206GD/R/BTAM (Sliding Gate)",
+    "1217": "Gate & Door Control - PC206GD/R/BTAM (Roller Door, 2 doors)",
+    "1201": "Gate & Door Control - PC206GD/R/BTAM (Roller Door, 1 door)",
     "2212": "Smart Switch G2 - SWL350BT",
     "2312": "Smart Dimmer G2 - SDD350BT",
     "2311": "Smart Dimmer G2 - SDD350BT",
@@ -56,8 +60,7 @@ hardware_list = {
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",    
     "2113": "Smart Timer Switch - STS600BTAM",
     "2552": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
-    "2452": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
-    "1217": "Gate & Door Control - PC206GD/R/BTAM",
+    "2452": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",    
     "2704": "Strip Kit RGB - FLBP24V2RGB/BTAM",
     "2450": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (single colour mode)",
     "2550": "Smart RGBTW LED strip controller - LT8915RTW/BTAM (tunable white mode)",
@@ -115,6 +118,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_color": False,
         "supports_effects": False,
         "supports_multi_channel": True,
+        "supports_power_metering": True,
         "supports_usb_subentity": False,
         "supports_cover": False,
     },
@@ -393,6 +397,48 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_gate": True,
         "gate_doors": 2,
     },
+    "1201": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": True,
+        "cover_type": "door",
+        "supports_gate": True,
+        "gate_doors": 1,
+    },
+    "1202": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": True,
+        "cover_type": "door",
+        "supports_gate": True,
+        "gate_doors": 1,
+    },
+    "1203": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": False,
+        "supports_dimming": False,
+        "supports_color": False,
+        "supports_effects": False,
+        "supports_multi_channel": False,
+        "supports_usb_subentity": False,
+        "supports_cover": True,
+        "cover_type": "door",
+        "supports_gate": True,
+        "gate_doors": 1,
+    },
     "2704": {
         "is_light": True,
         "is_switch": False,
@@ -519,6 +565,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "effect_command_encoding": effect_command_encoding,
         "effect_names": effect_names,
         "supports_multi_channel": bool(caps.get("supports_multi_channel", False)),
+        "supports_power_metering": bool(caps.get("supports_power_metering", False)),
         "supports_usb_subentity": bool(caps.get("supports_usb_subentity", False)),
         "supports_cover": bool(caps.get("supports_cover", False)),
         "cover_type": str(caps.get("cover_type", "")),
@@ -726,7 +773,14 @@ def _quantize_gate_percent_to_bucket(position_percent: int) -> int:
     return max(0, min(100, int(round(bounded / 10.0)) * 10))
 
 
-def decode_gate_state_byte(door_index: int, value_byte: int) -> Dict[str, Any]:
+def gate_endpoint_count_for_capabilities(capabilities: Any) -> int:
+    """Return how many HA gate entities should be exposed for capabilities."""
+    if not _cap(capabilities, "supports_gate", False):
+        return 0
+    return max(1, int(_cap(capabilities, "gate_doors", 0) or 1))
+
+
+def decode_gate_state_byte(door_index: int, value_byte: int, capabilities: Any = None) -> Dict[str, Any]:
     """Decode one gate door state byte using only medium/high-confidence mappings.
 
     Unknown or low-confidence bytes remain undecoded so callers can preserve the
@@ -749,17 +803,8 @@ def decode_gate_state_byte(door_index: int, value_byte: int) -> Dict[str, Any]:
         "sensor_closed": None,
     }
 
-    terminal_closed = 0x06 if door_index == 0 else 0x0E
-    terminal_open = 0xA0 if door_index == 0 else 0xA8
-    closed_aliases = {terminal_closed}
-    open_aliases = {terminal_open}
-    if door_index == 0:
-        # Door 1 has also been observed reporting 0x0e as its closed terminal
-        # byte after a normal close cycle. Treat it as a proven closed alias.
-        closed_aliases.add(0x0E)
-        # Door 1 occasionally reports the door-2 open terminal byte at the end
-        # of an opening run. Treat it as a proven open-side alias.
-        open_aliases.add(0xA8)
+    closed_aliases = {0x06, 0x0E}
+    open_aliases = {0xA0, 0xA8}
 
     if value_byte in closed_aliases:
         result.update(
@@ -801,6 +846,59 @@ def decode_gate_state_byte(door_index: int, value_byte: int) -> Dict[str, Any]:
 
     bucket = (value_byte >> 4) & 0x0F
     low = value_byte & 0x0F
+    if value_byte == 0xE6:
+        result.update(
+            known=True,
+            state=GATE_STATE_FAULT,
+            fault=True,
+            fault_code="open_sensor_still_closed",
+            sensor_closed=True,
+        )
+        return result
+
+    if value_byte == 0xD2:
+        result.update(
+            known=True,
+            state=GATE_STATE_FAULT,
+            fault=True,
+            fault_code="close_sensor_still_open",
+            sensor_closed=False,
+        )
+        return result
+
+    if low == 0x03 and 0x01 <= bucket <= 0x09:
+        result.update(
+            known=True,
+            state=GATE_STATE_OPENING,
+            position_percent=_gate_bucket_to_percent(bucket),
+            moving=True,
+            direction=GATE_STATE_OPENING,
+            next_action="stop",
+            sensor_closed=False,
+        )
+        return result
+
+    if low == 0x01 and 0x01 <= bucket <= 0x09:
+        result.update(
+            known=True,
+            state=GATE_STATE_CLOSING,
+            position_percent=_gate_bucket_to_percent(bucket),
+            moving=True,
+            direction=GATE_STATE_CLOSING,
+            next_action="stop",
+            sensor_closed=False,
+        )
+        return result
+
+    if low in {0x00, 0x02} and 0x01 <= bucket <= 0x09:
+        result.update(
+            known=True,
+            state=GATE_STATE_PAUSED,
+            position_percent=_gate_bucket_to_percent(bucket),
+            next_action="close",
+            sensor_closed=False,
+        )
+        return result
 
     if low == 0x0B and 0x01 <= bucket <= 0x09:
         result.update(
@@ -839,9 +937,15 @@ def decode_gate_state_byte(door_index: int, value_byte: int) -> Dict[str, Any]:
     return result
 
 
-def decode_gate_command_reply(door_index: int, state_byte: int, position_raw: int, runtime_ms: int) -> Dict[str, Any]:
+def decode_gate_command_reply(
+    door_index: int,
+    state_byte: int,
+    position_raw: int,
+    runtime_ms: int,
+    capabilities: Any = None,
+) -> Dict[str, Any]:
     """Decode the richer d36969 gate reply into the canonical gate model."""
-    result = decode_gate_state_byte(door_index, state_byte)
+    result = decode_gate_state_byte(door_index, state_byte, capabilities)
     result.update(
         door_index=int(door_index),
         value_byte=int(state_byte) & 0xFF,
@@ -850,7 +954,7 @@ def decode_gate_command_reply(door_index: int, state_byte: int, position_raw: in
         source_kind="gate_command_reply",
     )
 
-    if state_byte == 0x0F:
+    if state_byte in {0x07, 0x0F}:
         result.update(
             known=True,
             state=GATE_STATE_OPENING,
@@ -859,7 +963,7 @@ def decode_gate_command_reply(door_index: int, state_byte: int, position_raw: in
             next_action="stop",
             sensor_closed=True,
         )
-    elif state_byte == 0xA9:
+    elif state_byte in {0xA1, 0xA9}:
         result.update(
             known=True,
             state=GATE_STATE_CLOSING,
@@ -904,7 +1008,7 @@ def gate_can_run_action(decoded_state: Optional[Dict[str, Any]], action: str) ->
     if state in {GATE_STATE_OPENING, GATE_STATE_CLOSING}:
         return False
     if state == GATE_STATE_PAUSED:
-        return normalized == "close"
+        return normalized in {"open", "close"}
 
     return False
 
@@ -1008,11 +1112,14 @@ def sync_gate_motion_plan(
     ):
         return None
 
+    current_position_raw = _gate_percent_to_position_raw(position_percent)
+    if is_stale_gate_motion_progress_update(existing_plan, decoded_state, updated_ms):
+        return existing_plan
+
     total_distance = abs(target_position_raw - start_position_raw)
     if total_distance == 0:
         return None
 
-    current_position_raw = _gate_percent_to_position_raw(position_percent)
     remaining_distance = abs(target_position_raw - current_position_raw)
     if remaining_distance == 0:
         return None
@@ -1033,6 +1140,46 @@ def sync_gate_motion_plan(
         "start_position_raw": current_position_raw,
         "target_position_raw": target_position_raw,
     }
+
+
+def is_stale_gate_motion_progress_update(
+    existing_plan: Optional[Dict[str, Any]],
+    decoded_state: Optional[Dict[str, Any]],
+    updated_ms: int,
+    *,
+    max_backwards_percent: int = 10,
+) -> bool:
+    """Return whether a coarse moving update only pulls interpolation backwards."""
+    if not isinstance(existing_plan, dict) or not isinstance(decoded_state, dict):
+        return False
+    if not decoded_state.get("known"):
+        return False
+
+    state = decoded_state.get("state")
+    if state not in {GATE_STATE_OPENING, GATE_STATE_CLOSING}:
+        return False
+    if existing_plan.get("state") != state:
+        return False
+
+    position_percent = decoded_state.get("position_percent")
+    if not isinstance(position_percent, int):
+        return False
+
+    current_estimate_raw = estimate_gate_motion_position_raw(existing_plan, updated_ms)
+    if not isinstance(current_estimate_raw, int):
+        return False
+
+    estimate_percent = _quantize_gate_percent_to_bucket(_gate_position_raw_to_percent(current_estimate_raw))
+    incoming_percent = _quantize_gate_percent_to_bucket(position_percent)
+    stale_backwards_percent = max(0, int(max_backwards_percent))
+    if stale_backwards_percent <= 0:
+        return False
+
+    if state == GATE_STATE_OPENING:
+        backwards_delta = estimate_percent - incoming_percent
+    else:
+        backwards_delta = incoming_percent - estimate_percent
+    return 0 < backwards_delta <= stale_backwards_percent
 
 
 def estimate_gate_motion_position_raw(plan: Optional[Dict[str, Any]], now_ms: int) -> Optional[int]:

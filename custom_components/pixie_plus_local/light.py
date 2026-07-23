@@ -24,7 +24,7 @@ from . import (
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 
@@ -71,7 +71,7 @@ def _kelvin_to_raw_cct(kelvin: int, min_kelvin: int, max_kelvin: int, raw_min: i
 
 def _iter_light_endpoints(inventory) -> list[PixieEndpoint]:
     """Return light endpoints from inventory."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]

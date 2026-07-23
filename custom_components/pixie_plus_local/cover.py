@@ -18,7 +18,7 @@ from . import (
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 from .config_flow import get_cover_mapping_for_controller
@@ -29,13 +29,14 @@ from .pixie_value_profiles import (
     GATE_STATE_OPENING,
     GATE_STATE_PAUSED,
     estimate_gate_motion_position_percent,
+    gate_endpoint_count_for_capabilities,
     gate_can_run_action,
 )
 
 
 def _iter_cover_endpoints(inventory) -> list[PixieEndpoint]:
     """Return blind cover endpoints (excludes gate devices)."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -58,14 +59,14 @@ def _iter_cover_endpoints(inventory) -> list[PixieEndpoint]:
 
 def _iter_gate_endpoints(inventory) -> list[PixieEndpoint]:
     """Return gate door cover endpoints."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     door_names = {0: "Door 1", 1: "Door 2"}
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
         if not record.capabilities.supports_gate:
             continue
-        for door in range(record.capabilities.gate_doors):
+        for door in range(gate_endpoint_count_for_capabilities(record.capabilities)):
             endpoints.append(
                 PixieEndpoint(
                     device_id=record.id,

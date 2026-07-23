@@ -5,9 +5,15 @@ from __future__ import annotations
 from datetime import timedelta
 import logging
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
+from homeassistant.const import (
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
@@ -21,6 +27,7 @@ from . import (
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
     gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 from .pixie_ble import BT_STATE_DISABLED, BT_STATE_NO_WORKING_PROXY
@@ -72,7 +79,7 @@ def _bluetooth_connection_state(runtime_data: PixiePlusConfigEntryRuntimeData) -
 
 def _iter_timer_sensor_endpoints(inventory) -> list[PixieEndpoint]:
     """Return timer remaining sensor endpoints for timer-capable devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -93,6 +100,42 @@ def _iter_timer_sensor_endpoints(inventory) -> list[PixieEndpoint]:
     return endpoints
 
 
+def _iter_power_meter_sensor_endpoints(inventory) -> list[PixieEndpoint]:
+    """Return power-meter sensor endpoints for metering-capable devices."""
+    gateway_identifier = parent_device_identifier(inventory)
+    endpoints: list[PixieEndpoint] = []
+    sensor_suffixes = {
+        "power": "power",
+        "energy": "energy",
+        "current": "current",
+        "voltage": "voltage",
+    }
+    for device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[device_id]
+        if not record.capabilities.supports_power_metering:
+            continue
+        side_names = {
+            "left": str(record.left_name or "Left").strip() or "Left",
+            "right": str(record.right_name or "Right").strip() or "Right",
+        }
+        for side, side_name in side_names.items():
+            for suffix_key, suffix_name in sensor_suffixes.items():
+                endpoint_key = f"{side}_{suffix_key}"
+                endpoints.append(
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key=endpoint_key,
+                        command_target="power_meter",
+                        entity_unique_id=endpoint_unique_identifier(record, endpoint_key),
+                        device_identifier=physical_device_identifier(record),
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name=f"{side_name} {suffix_name}",
+                    )
+                )
+    return endpoints
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -104,22 +147,28 @@ async def async_setup_entry(
     if inventory is None:
         return
 
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     gateway = inventory.gateway
-    LOGGER.debug(
-        "%sAdding Pixie gateway connection sensors gateway_identifier=%s gateway_name=%s gateway_model=%s",
-        runtime_data._log_prefix,
-        gateway_identifier,
-        gateway.model_name if gateway else None,
-        gateway.model_no if gateway else None,
-    )
-    entities: list[SensorEntity] = [
-        PixieGatewayConnectionSensorEntity(runtime_data, "lan", "LAN", _lan_connection_state),
-        PixieGatewayConnectionSensorEntity(runtime_data, "bluetooth", "Bluetooth", _bluetooth_connection_state),
-    ]
+    entities: list[SensorEntity] = []
+    if gateway_identifier is not None:
+        LOGGER.debug(
+            "%sAdding Pixie gateway connection sensors gateway_identifier=%s gateway_name=%s gateway_model=%s",
+            runtime_data._log_prefix,
+            gateway_identifier,
+            gateway.model_name if gateway else None,
+            gateway.model_no if gateway else None,
+        )
+        entities.extend([
+            PixieGatewayConnectionSensorEntity(runtime_data, "lan", "LAN", _lan_connection_state),
+            PixieGatewayConnectionSensorEntity(runtime_data, "bluetooth", "Bluetooth", _bluetooth_connection_state),
+        ])
     entities.extend(
         PixiePlusTimerRemainingSensorEntity(runtime_data, endpoint)
         for endpoint in _iter_timer_sensor_endpoints(inventory)
+    )
+    entities.extend(
+        PixiePlusPowerMeterSensorEntity(runtime_data, endpoint)
+        for endpoint in _iter_power_meter_sensor_endpoints(inventory)
     )
     async_add_entities(entities)
 
@@ -286,3 +335,35 @@ class PixiePlusTimerRemainingSensorEntity(PixiePlusCoordinatorEntity, SensorEnti
     def _tick(self, _now=None) -> None:
         """Refresh the entity state from the estimation formula."""
         self.async_write_ha_state()
+
+
+class PixiePlusPowerMeterSensorEntity(PixiePlusCoordinatorEntity, SensorEntity):
+    """Sensor for one 0208 power-meter value."""
+
+    _SENSOR_DESCRIPTIONS = {
+        "left_power": (SensorDeviceClass.POWER, UnitOfPower.WATT, SensorStateClass.MEASUREMENT, 1, "left_power_w"),
+        "right_power": (SensorDeviceClass.POWER, UnitOfPower.WATT, SensorStateClass.MEASUREMENT, 1, "right_power_w"),
+        "left_energy": (SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING, 3, "left_energy_kwh"),
+        "right_energy": (SensorDeviceClass.ENERGY, UnitOfEnergy.KILO_WATT_HOUR, SensorStateClass.TOTAL_INCREASING, 3, "right_energy_kwh"),
+        "left_current": (SensorDeviceClass.CURRENT, UnitOfElectricCurrent.AMPERE, SensorStateClass.MEASUREMENT, 3, "left_current_a"),
+        "right_current": (SensorDeviceClass.CURRENT, UnitOfElectricCurrent.AMPERE, SensorStateClass.MEASUREMENT, 3, "right_current_a"),
+        "left_voltage": (SensorDeviceClass.VOLTAGE, UnitOfElectricPotential.VOLT, SensorStateClass.MEASUREMENT, 1, "voltage_v"),
+        "right_voltage": (SensorDeviceClass.VOLTAGE, UnitOfElectricPotential.VOLT, SensorStateClass.MEASUREMENT, 1, "voltage_v"),
+    }
+
+    def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
+        super().__init__(runtime_data, endpoint, domain=DOMAIN)
+        device_class, unit, state_class, precision, _attr_name = self._SENSOR_DESCRIPTIONS[endpoint.endpoint_key]
+        self._attr_device_class = device_class
+        self._attr_native_unit_of_measurement = unit
+        self._attr_state_class = state_class
+        self._attr_suggested_display_precision = precision
+        self._runtime_attr_name = _attr_name
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the latest runtime metering value."""
+        value = getattr(self.record.runtime, self._runtime_attr_name, None)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None

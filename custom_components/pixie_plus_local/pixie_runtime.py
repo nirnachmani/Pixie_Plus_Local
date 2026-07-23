@@ -54,6 +54,7 @@ from .pixie_value_profiles import (
     decode_gate_command_reply,
     decode_gate_state_byte,
     decode_value_byte_for_capabilities,
+    is_stale_gate_motion_progress_update,
     sync_gate_motion_plan,
     gate_can_run_action,
     get_supported_sensor_mode_values_for_capabilities,
@@ -160,46 +161,67 @@ class PixieCoreCommandPlan:
     result: Dict[str, Any] = field(default_factory=dict)
 
 
-def is_timer_poll_reply_route_packet(command: bytes) -> bool:
-    """Return True for the timer f96b69 poll that carries a reply route id."""
-    return (
+def _command_reply_route_slice(command: bytes) -> Optional[Tuple[int, int, str]]:
+    """Return the reply-route byte slice for commands that expect d36969 replies."""
+    if (
         len(command) == 17
         and command[7:10] == b"\xf9\x6b\x69"
         and command[10:15] == b"\x05\x00\x00\x00\x00"
-    )
+    ):
+        return 15, 17, "timer_poll"
+    if (
+        len(command) == 13
+        and command[7:10] == b"\xff\x6b\x69"
+        and command[10] in (0x02, 0x03)
+    ):
+        return 11, 13, "power_meter_poll"
+    return None
 
 
-def patch_timer_poll_reply_route(
+def is_command_reply_route_packet(command: bytes) -> bool:
+    """Return True for commands that carry a reply route id."""
+    return _command_reply_route_slice(command) is not None
+
+
+def command_reply_route_kind(command: bytes) -> Optional[str]:
+    """Return the routeable command kind, when known."""
+    route = _command_reply_route_slice(command)
+    return route[2] if route is not None else None
+
+
+def patch_command_reply_route(
     command_hex: str,
     reply_node_id: Optional[int],
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """Patch the timer poll reply route field when the packet shape matches.
+) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """Patch the reply route field when the packet shape matches.
 
-    Returns (command_hex, old_route_hex, new_route_hex).  The route values are
-    None when the packet is not the timer poll shape, or when no route id is
-    available.
+    Returns (command_hex, old_route_hex, new_route_hex, kind). The route values
+    are None when the packet is not a known routeable shape, or when no route id
+    is available.
     """
     try:
         command = bytes.fromhex(command_hex)
     except ValueError:
-        return command_hex, None, None
-    if not is_timer_poll_reply_route_packet(command):
-        return command_hex, None, None
+        return command_hex, None, None, None
+    route = _command_reply_route_slice(command)
+    if route is None:
+        return command_hex, None, None, None
+    start, end, kind = route
     if reply_node_id is None:
-        return command_hex, None, None
+        return command_hex, None, None, kind
     try:
         route_id = int(reply_node_id)
     except (TypeError, ValueError):
-        return command_hex, None, None
+        return command_hex, None, None, kind
     if not (0 <= route_id <= 0xFFFF):
-        return command_hex, None, None
-    old_route = command[15:17].hex()
+        return command_hex, None, None, kind
+    old_route = command[start:end].hex()
     route_bytes = route_id.to_bytes(2, byteorder="little", signed=False)
     new_route = route_bytes.hex()
     if old_route == new_route:
-        return command_hex, old_route, new_route
-    patched = command[:15] + route_bytes + command[17:]
-    return patched.hex(), old_route, new_route
+        return command_hex, old_route, new_route, kind
+    patched = command[:start] + route_bytes + command[end:]
+    return patched.hex(), old_route, new_route, kind
 
 
 @dataclass
@@ -765,7 +787,14 @@ class PixieAuthHandler:
             "pct": value,
         }
 
-    def _apply_bulk_ble_records_to_inventory(self, records: List[Dict[str, Any]], source: str, *, full_snapshot: bool) -> int:
+    def _apply_bulk_ble_records_to_inventory(
+        self,
+        records: List[Dict[str, Any]],
+        source: str,
+        *,
+        full_snapshot: bool,
+        notify_inventory: bool = True,
+    ) -> int:
         """Apply bulk bleData records to inventory runtime using minimal state fields.
 
         Only presence, brightness (scalar models), bitmask state via runtime.r,
@@ -774,7 +803,7 @@ class PixieAuthHandler:
         if not self.inventory or not records:
             return 0
         applied = self.inventory.apply_gwdata_bulk(records, source, full_snapshot=full_snapshot)
-        if applied > 0:
+        if applied > 0 and notify_inventory:
             self._notify_inventory_updated()
         return applied
 
@@ -868,10 +897,51 @@ class PixieAuthHandler:
             flag_byte = raw[d3_pos + 3]
             dev_id = int.from_bytes(raw[3:5], byteorder="little")
             data_start = d3_pos + 4
+            rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
+            if rec and rec.capabilities.supports_power_metering and flag_byte == 0xbf and len(raw) >= data_start + 9:
+                subtype = int(raw[data_start])
+                payload = raw[data_start + 1 : data_start + 9]
+                decoded["kind"] = "power_meter_status"
+                decoded["device_id"] = dev_id
+                decoded["meter_subtype"] = subtype
+                record: Dict[str, Any] = {
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "meter_subtype": subtype,
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                }
+                if subtype == 0x02:
+                    left_current_ma = int.from_bytes(payload[0:2], byteorder="little")
+                    right_current_ma = int.from_bytes(payload[2:4], byteorder="little")
+                    voltage_cv = int.from_bytes(payload[4:8], byteorder="little")
+                    voltage_v = voltage_cv / 100.0
+                    record.update({
+                        "left_current_a": left_current_ma / 1000.0,
+                        "right_current_a": right_current_ma / 1000.0,
+                        "voltage_v": voltage_v,
+                        "left_power_w": (left_current_ma * voltage_cv) / 100000.0,
+                        "right_power_w": (right_current_ma * voltage_cv) / 100000.0,
+                    })
+                elif subtype == 0x03:
+                    record.update({
+                        "left_energy_kwh": int.from_bytes(payload[0:4], byteorder="little") / 1000.0,
+                        "right_energy_kwh": int.from_bytes(payload[4:8], byteorder="little") / 1000.0,
+                    })
+                else:
+                    decoded["kind"] = "d36969"
+                    decoded["flag"] = flag_byte
+                    decoded["data_hex"] = raw[data_start:].hex()
+                    return decoded
+                decoded["records"] = [record]
+                return decoded
             if flag_byte != 0xb9:
                 return None
 
-            rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
             if rec and rec.capabilities.supports_timer:
                 decoded["kind"] = "timer_status"
                 decoded["device_id"] = dev_id
@@ -927,7 +997,13 @@ class PixieAuthHandler:
                     state_byte = int(raw[data_start + 3])
                     position_raw = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
                     runtime_ms = int.from_bytes(raw[data_start + 6 : data_start + 9], byteorder="little")
-                    decoded_state = decode_gate_command_reply(door_index, state_byte, position_raw, runtime_ms)
+                    decoded_state = decode_gate_command_reply(
+                        door_index,
+                        state_byte,
+                        position_raw,
+                        runtime_ms,
+                        rec.capabilities,
+                    )
                 except Exception:
                     door_index = None
                     state_byte = None
@@ -991,7 +1067,11 @@ class PixieAuthHandler:
                 if not dc_records:
                     decoded["kind"] = "mesh_status"
                     return decoded
-                decoded["kind"] = "single" if len(dc_records) == 1 else "bulk"
+                decoded["kind"] = "single" if len(dc_records) == 1 else "record_container"
+                decoded["records"] = dc_records
+                return decoded
+            if dc_records:
+                decoded["kind"] = "single" if len(dc_records) == 1 else "record_container"
                 decoded["records"] = dc_records
                 return decoded
 
@@ -1037,6 +1117,7 @@ class PixieAuthHandler:
         bulk_source: str = "hub_gwdata",
         full_snapshot: bool = False,
         queue_bulk: bool = False,
+        notify_inventory: bool = True,
     ) -> int:
         """Decode and apply one core Pixie bleData payload to inventory."""
         decoded = self.decode_bledata_hex(ble_hex)
@@ -1053,7 +1134,12 @@ class PixieAuthHandler:
             if queue_bulk:
                 self._queue_bulk_ble_records(records, source=bulk_source, full_snapshot=full_snapshot)
             if self.inventory:
-                applied = self._apply_bulk_ble_records_to_inventory(records, source=bulk_source, full_snapshot=full_snapshot)
+                applied = self._apply_bulk_ble_records_to_inventory(
+                    records,
+                    source=bulk_source,
+                    full_snapshot=full_snapshot,
+                    notify_inventory=notify_inventory,
+                )
                 self._log_debug("Inventory bulk update: applied=%s", applied)
                 return applied
             return 0
@@ -1103,7 +1189,51 @@ class PixieAuthHandler:
                     last_timer_poll_at=now,
                 )
                 self._log_debug("Timer status update: dev_id=%s total=%s remaining=%s", dev_id, timer_total, timer_remaining)
-                self._notify_inventory_updated()
+                if notify_inventory:
+                    self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "power_meter_status":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                now = time.time()
+                update_kwargs = {
+                    key: first[key]
+                    for key in (
+                        "left_power_w",
+                        "right_power_w",
+                        "left_energy_kwh",
+                        "right_energy_kwh",
+                        "left_current_a",
+                        "right_current_a",
+                        "voltage_v",
+                    )
+                    if key in first
+                }
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    last_power_meter_poll_at=now,
+                    **update_kwargs,
+                )
+                self._log_debug(
+                    "Power meter update: dev_id=%s subtype=0x%02x left_w=%s right_w=%s left_kwh=%s right_kwh=%s left_a=%s right_a=%s voltage=%s",
+                    dev_id,
+                    int(first.get("meter_subtype") or 0),
+                    first.get("left_power_w"),
+                    first.get("right_power_w"),
+                    first.get("left_energy_kwh"),
+                    first.get("right_energy_kwh"),
+                    first.get("left_current_a"),
+                    first.get("right_current_a"),
+                    first.get("voltage_v"),
+                )
+                if notify_inventory:
+                    self._notify_inventory_updated()
                 return 1
             return 0
 
@@ -1126,7 +1256,8 @@ class PixieAuthHandler:
                     decoded.get("brightness_threshold"),
                     decoded.get("motion_sensitivity"),
                 )
-                self._notify_inventory_updated()
+                if notify_inventory:
+                    self._notify_inventory_updated()
                 return 1
             return 0
 
@@ -1201,7 +1332,8 @@ class PixieAuthHandler:
                 updated_ms=updated_ms,
                 **update_kwargs,
             )
-            self._notify_inventory_updated()
+            if notify_inventory:
+                self._notify_inventory_updated()
             return 1
 
         if kind == "d36969":
@@ -1396,27 +1528,59 @@ class PixieAuthHandler:
                                 update_kwargs["rgb"] = rgb_update
                 elif mode == "gate":
                     if isinstance(value_byte, int):
-                        update_kwargs["door1_state"] = value_byte
-                        door1_decoded = decode_gate_state_byte(0, value_byte)
+                        door1_decoded = decode_gate_state_byte(0, value_byte, rec.capabilities)
                         if door1_decoded.get("known"):
-                            update_kwargs["door1_decoded"] = door1_decoded
                             now_ms = int(time.time() * 1000)
+                            stale_progress = is_stale_gate_motion_progress_update(
+                                rec.runtime.door1_motion_plan,
+                                door1_decoded,
+                                now_ms,
+                            )
+                            if stale_progress:
+                                self._log_debug(
+                                    "Gate compact progress ignored as stale: dev_id=%s door=1 raw=0x%02x state=%s pos=%s",
+                                    dev_id,
+                                    value_byte,
+                                    door1_decoded.get("state"),
+                                    door1_decoded.get("position_percent"),
+                                )
+                            else:
+                                update_kwargs["door1_state"] = value_byte
+                                update_kwargs["door1_decoded"] = door1_decoded
                             motion_plan = sync_gate_motion_plan(rec.runtime.door1_motion_plan, door1_decoded, now_ms)
                             if motion_plan is None:
                                 learned_duration_ms = rec.runtime.door1_open_duration_ms if door1_decoded.get("state") == "opening" else rec.runtime.door1_close_duration_ms
                                 motion_plan = build_gate_motion_plan_from_learned_duration(door1_decoded, now_ms, learned_duration_ms)
                             update_kwargs["door1_motion_plan"] = motion_plan
+                        else:
+                            update_kwargs["door1_state"] = value_byte
                     if isinstance(tail, int) and rec.capabilities.gate_doors >= 2:
-                        update_kwargs["door2_state"] = tail
-                        door2_decoded = decode_gate_state_byte(1, tail)
+                        door2_decoded = decode_gate_state_byte(1, tail, rec.capabilities)
                         if door2_decoded.get("known"):
-                            update_kwargs["door2_decoded"] = door2_decoded
                             now_ms = int(time.time() * 1000)
+                            stale_progress = is_stale_gate_motion_progress_update(
+                                rec.runtime.door2_motion_plan,
+                                door2_decoded,
+                                now_ms,
+                            )
+                            if stale_progress:
+                                self._log_debug(
+                                    "Gate compact progress ignored as stale: dev_id=%s door=2 raw=0x%02x state=%s pos=%s",
+                                    dev_id,
+                                    tail,
+                                    door2_decoded.get("state"),
+                                    door2_decoded.get("position_percent"),
+                                )
+                            else:
+                                update_kwargs["door2_state"] = tail
+                                update_kwargs["door2_decoded"] = door2_decoded
                             motion_plan = sync_gate_motion_plan(rec.runtime.door2_motion_plan, door2_decoded, now_ms)
                             if motion_plan is None:
                                 learned_duration_ms = rec.runtime.door2_open_duration_ms if door2_decoded.get("state") == "opening" else rec.runtime.door2_close_duration_ms
                                 motion_plan = build_gate_motion_plan_from_learned_duration(door2_decoded, now_ms, learned_duration_ms)
                             update_kwargs["door2_motion_plan"] = motion_plan
+                        else:
+                            update_kwargs["door2_state"] = tail
                 elif mode == "raw":
                     if rec.capabilities.supports_onoff and not rec.capabilities.supports_dimming and not rec.capabilities.supports_multi_channel and not rec.capabilities.supports_usb_subentity and not rec.capabilities.supports_cover:
                         update_kwargs["br"] = 100 if value_byte > 0 else 0
@@ -1430,10 +1594,12 @@ class PixieAuthHandler:
             }
             updated_runtime = self.inventory.apply_device_update(dev_id, source=source, **update_kwargs)
             if mode == "gate":
-                for door_index, raw_state, decoded_state in (
+                gate_debug_states = [
                     (0, value_byte if isinstance(value_byte, int) else None, update_kwargs.get("door1_decoded")),
-                    (1, tail if isinstance(tail, int) else None, update_kwargs.get("door2_decoded")),
-                ):
+                ]
+                if rec.capabilities.gate_doors >= 2:
+                    gate_debug_states.append((1, tail if isinstance(tail, int) else None, update_kwargs.get("door2_decoded")))
+                for door_index, raw_state, decoded_state in gate_debug_states:
                     if isinstance(raw_state, int) and (not isinstance(decoded_state, dict)):
                         previous = prev_gate_decoded.get(door_index)
                         self._log_debug(
@@ -1459,7 +1625,8 @@ class PixieAuthHandler:
                     updated_runtime.timer_remaining_seconds,
                 )
 
-            self._notify_inventory_updated()
+            if notify_inventory:
+                self._notify_inventory_updated()
 
             summary_parts = []
             if isinstance(record_online_value, int):
@@ -1575,6 +1742,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map: Optional[Dict[str, int]],
         command_timer_action: Optional[str] = None,
         command_timer_duration: Optional[int] = None,
+        command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
@@ -1601,6 +1769,7 @@ class PixieAuthHandler:
                 "command_cover_tilt_action_map": command_cover_tilt_action_map,
                 "command_timer_action": command_timer_action,
                 "command_timer_duration": command_timer_duration,
+                "command_power_meter_action": command_power_meter_action,
                 "command_sensor_param": command_sensor_param,
                 "command_sensor_param_value": command_sensor_param_value,
                 "command_gate_door": command_gate_door,
@@ -1823,6 +1992,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
         command_timer_action: Optional[str] = None,
         command_timer_duration: Optional[int] = None,
+        command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
@@ -1856,6 +2026,7 @@ class PixieAuthHandler:
             command_cover_tilt_action_map=command_cover_tilt_action_map,
             command_timer_action=command_timer_action,
             command_timer_duration=command_timer_duration,
+            command_power_meter_action=command_power_meter_action,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
             command_gate_door=command_gate_door,
@@ -1957,6 +2128,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
         command_timer_action: Optional[str] = None,
         command_timer_duration: Optional[int] = None,
+        command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
@@ -2056,6 +2228,7 @@ class PixieAuthHandler:
                         command_cover_tilt_action_map=command_cover_tilt_action_map,
                         command_timer_action=command_timer_action,
                         command_timer_duration=command_timer_duration,
+                        command_power_meter_action=command_power_meter_action,
                         command_sensor_param=command_sensor_param,
                         command_sensor_param_value=command_sensor_param_value,
                         command_gate_door=command_gate_door,
@@ -2098,6 +2271,7 @@ class PixieAuthHandler:
             command_cover_tilt_action_map=command_cover_tilt_action_map,
             command_timer_action=command_timer_action,
             command_timer_duration=command_timer_duration,
+            command_power_meter_action=command_power_meter_action,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
             command_gate_door=command_gate_door,
@@ -3135,6 +3309,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map = command_kwargs.get("command_cover_tilt_action_map")
         command_timer_action = command_kwargs.get("command_timer_action")
         command_timer_duration = command_kwargs.get("command_timer_duration")
+        command_power_meter_action = command_kwargs.get("command_power_meter_action")
         command_sensor_param = command_kwargs.get("command_sensor_param")
         command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
         command_target = command_kwargs.get("command_target")
@@ -3161,6 +3336,8 @@ class PixieAuthHandler:
             )
         if command_timer_action == "poll" and rec.capabilities.supports_timer:
             return PixieOptimisticUpdateIntent(device_id=device_id, target="timer_poll_stamp")
+        if command_power_meter_action == "poll" and rec.capabilities.supports_power_metering:
+            return PixieOptimisticUpdateIntent(device_id=device_id, target="power_meter_poll_stamp")
 
         if command_mode is not None:
             mode_value = int(command_mode)
@@ -3273,6 +3450,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map = command_kwargs.get("command_cover_tilt_action_map")
         command_timer_action = command_kwargs.get("command_timer_action")
         command_timer_duration = command_kwargs.get("command_timer_duration")
+        command_power_meter_action = command_kwargs.get("command_power_meter_action")
         command_sensor_param = command_kwargs.get("command_sensor_param")
         command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
         command_gate_door = command_kwargs.get("command_gate_door")
@@ -3330,6 +3508,31 @@ class PixieAuthHandler:
                 delay_after=delay_after,
                 log_message=log_message,
                 log_args=log_args,
+            )
+
+        if command_power_meter_action == "poll":
+            if not rec.capabilities.supports_power_metering:
+                raise PixieAuthError(f"Model {rec.model_no} does not support power metering")
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="power_meter_poll",
+                packets=(
+                    _packet(
+                        self._build_power_meter_poll_command_hex(device_id, 0x02),
+                        tcp_repeat=1,
+                        delay_after=0.2,
+                        log_message="Sending power meter live poll command: device_id=%s opcode=ff6b69 subtype=0x02",
+                        log_args=(device_id,),
+                    ),
+                    _packet(
+                        self._build_power_meter_poll_command_hex(device_id, 0x03),
+                        tcp_repeat=1,
+                        log_message="Sending power meter energy poll command: device_id=%s opcode=ff6b69 subtype=0x03",
+                        log_args=(device_id,),
+                    ),
+                ),
+                optimistic_intent=optimistic_intent,
+                result={"target": "power_meter_poll", "device_id": device_id},
             )
 
         if is_cover_cmd and rec.capabilities.supports_gate:
@@ -3767,6 +3970,9 @@ class PixieAuthHandler:
         elif target == "timer_poll_stamp":
             import time as _time
             update_kwargs["last_timer_poll_requested_at"] = _time.time()
+        elif target == "power_meter_poll_stamp":
+            import time as _time
+            update_kwargs["last_power_meter_poll_at"] = _time.time()
         elif target == "mode":
             mode_value = int(value)
             update_kwargs["mode"] = mode_value
@@ -3921,6 +4127,7 @@ class PixieAuthHandler:
         command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
         command_timer_action: Optional[str] = None,
         command_timer_duration: Optional[int] = None,
+        command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
@@ -4140,6 +4347,7 @@ class PixieAuthHandler:
             command_cover_tilt_action_map: Optional[Dict[str, int]] = None,
             command_timer_action: Optional[str] = None,
             command_timer_duration: Optional[int] = None,
+            command_power_meter_action: Optional[str] = None,
             command_sensor_param: Optional[str] = None,
             command_sensor_param_value: Optional[int] = None,
             command_gate_door: Optional[int] = None,
@@ -4187,6 +4395,7 @@ class PixieAuthHandler:
                 "command_cover_tilt_action_map": command_cover_tilt_action_map,
                 "command_timer_action": command_timer_action,
                 "command_timer_duration": command_timer_duration,
+                "command_power_meter_action": command_power_meter_action,
                 "command_sensor_param": command_sensor_param,
                 "command_sensor_param_value": command_sensor_param_value,
                 "command_gate_door": command_gate_door,
@@ -4203,21 +4412,23 @@ class PixieAuthHandler:
                     else:
                         self._log_debug(packet.log_message)
 
-                command_hex, old_route, new_route = patch_timer_poll_reply_route(
+                command_hex, old_route, new_route, route_kind = patch_command_reply_route(
                     packet.command_hex,
                     tcp_reply_route_id,
                 )
                 if old_route is not None:
                     self._log_debug(
-                        "Timer poll reply route resolved transport=tcp device=%s reply_node=%s old=%s new=%s",
+                        "Command reply route resolved transport=tcp kind=%s device=%s reply_node=%s old=%s new=%s",
+                        route_kind,
                         plan.device_id,
                         tcp_reply_route_id,
                         old_route,
                         new_route,
                     )
-                elif is_timer_poll_reply_route_packet(bytes.fromhex(packet.command_hex)):
+                elif is_command_reply_route_packet(bytes.fromhex(packet.command_hex)):
                     self._log_debug(
-                        "Timer poll reply route not patched transport=tcp device=%s reason=no_gateway_route_id",
+                        "Command reply route not patched transport=tcp kind=%s device=%s reason=no_gateway_route_id",
+                        route_kind,
                         plan.device_id,
                     )
 
@@ -4503,6 +4714,7 @@ class PixieAuthHandler:
                         command_mode,
                         command_cover_action,
                         command_timer_action,
+                        command_power_meter_action,
                         command_sensor_param,
                     )
                 )
@@ -4522,6 +4734,7 @@ class PixieAuthHandler:
                             command_cover_tilt_action_map=command_cover_tilt_action_map,
                             command_timer_action=command_timer_action,
                             command_timer_duration=command_timer_duration,
+                            command_power_meter_action=command_power_meter_action,
                             command_sensor_param=command_sensor_param,
                             command_sensor_param_value=command_sensor_param_value,
                             command_gate_door=command_gate_door,
@@ -5077,6 +5290,19 @@ class PixieAuthHandler:
         return self._build_shifted_prefix_command_hex(
             device_id,
             opcode=b"\xf9\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_power_meter_poll_command_hex(self, device_id: int, subtype: int) -> str:
+        """Build ff6b69 power-meter poll command for live values or energy totals."""
+        if subtype not in (0x02, 0x03):
+            raise PixieAuthError(f"Unsupported power meter poll subtype: {subtype}")
+        payload = bytes([subtype]) + b"\x77\x00"
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xff\x6b\x69",
             payload=payload,
             counter_attr="_timer_command_counter",
             minimum_counter=0x01,

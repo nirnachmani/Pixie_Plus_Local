@@ -15,13 +15,13 @@ from . import (
     PixiePlusCoordinatorEntity,
     child_device_identifier,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 
 def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
     """Return switch endpoints from inventory."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
