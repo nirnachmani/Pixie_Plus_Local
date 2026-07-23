@@ -95,7 +95,7 @@ Entity ID should remain the same as with the old integration but check that this
 
 ## Configuration menu (cogwheel icon on each integration instance)
 
-# Bluetooth settings (only shows if BT is enabled for this home)
+### Bluetooth settings (only shows if BT is enabled for this home)
 
 - Command transport (only shows if there is a gateway and BT is enabled for this home):
    - TCP primary, BT fallback - commands sent via TCP but if TCP is down, the integration will use BT
@@ -111,11 +111,11 @@ Entity ID should remain the same as with the old integration but check that this
 
 - Clear Bluetooth access-node preference - the integration saves a preferred node to connect to and stores it. This stored node can be cleared by selecting this option.   
 
-# Update device versions (only shows if BT is enabled for this home)
+### Update device versions (only shows if BT is enabled for this home)
 
 Some devices can show the wrong firmware version (as reported by the gateway). If BT is enabled this scan BT adverts for the correct firmware version for all the devices   
 
-# Blind mapping
+### Blind mapping
 
 Blind controllers require one extra configuration step because the Pixie system exposes blind commands as button positions in the app's control panel.
 
