@@ -23,6 +23,8 @@ from homeassistant.helpers.selector import (
 )
 
 from . import (
+    CONF_BLE_MEMBERSHIP,
+    CONF_BLE_INVENTORY,
     CONF_GATEWAY_IP,
     CONF_GATEWAY_IP_REQUIRED,
     CONF_INVENTORY_FALLBACK_REASON,
@@ -33,6 +35,7 @@ from . import (
     CONF_MESHNET2,
     CONF_NETID,
     CONF_PIXIE_PASSWORD,
+    CONF_PIXIE_PIN,
     CONF_PIXIE_USERNAME,
     CONF_USER_ID,
     CONF_BT_ACCESS_NODE,
@@ -43,6 +46,7 @@ from . import (
     CONF_BT_ACCESS_NODE_PREFERENCE,
     CONF_COMMAND_TRANSPORT,
     DOMAIN,
+    INVENTORY_MODE_BLE_ADVERTISEMENT,
     INVENTORY_MODE_CLOUD_FALLBACK,
     INVENTORY_MODE_LOCAL_53216,
     INVENTORY_FALLBACK_REASON_LOCAL_53216_FAILED,
@@ -64,8 +68,11 @@ from .pixie_ble import (
     BT_STATE_DISABLED,
     BT_STATE_NO_WORKING_PROXY,
     BT_STATE_READY,
+    async_probe_ble_only_mesh_login,
     async_probe_pixie_bluetooth_proxy,
+    hash_mesh_id_to_broadcast,
 )
+from .pixie_inventory import PixieInventory
 from .pixie_runtime import (
     CloudHomeList,
     CloudParams,
@@ -99,7 +106,12 @@ CONF_EXCLUDE_HOME_IDS = "_exclude_home_ids"
 CONF_ALLOW_FINISH_SETUP = "_allow_finish_setup"
 CONF_ENABLE_BT = "enable_bt"
 CONF_ENABLE_BT_LABEL = "Enable Bluetooth support (requires ESPHome Bluetooth proxy)"
+CONF_CLEAR_BLUETOOTH_ACCESS_NODE = "clear_bluetooth_access_node"
+CONF_SETUP_PATH = "setup_path"
+CONF_SETUP_PATH_GATEWAY = "gateway"
+CONF_SETUP_PATH_BLE_ONLY = "ble_only"
 FINISH_SETUP_VALUE = "__finish_setup__"
+BLE_ONLY_SETUP_VALUE = "__ble_only__"
 BT_INSTALL_PROBE_TIMEOUT = 75.0
 
 GATEWAY_CONNECTION_MODE_AUTO = "auto"
@@ -133,20 +145,34 @@ async def _async_probe_bt_for_flow(
     *,
     preferred_source: str | None = None,
     preferred_access_node: str | None = None,
+    login_seed: str | None = None,
+    membership: str | None = None,
+    send_runtime_sync_on_connect: bool = False,
+    timeout: float | None = None,
 ):
     """Run a blocking Pixie BLE capability probe for config flows."""
+    probe_timeout = BT_INSTALL_PROBE_TIMEOUT if timeout is None else timeout
     return await async_probe_pixie_bluetooth_proxy(
         hass,
         cloud_params,
         inventory,
         preferred_source=preferred_source,
         preferred_access_node=preferred_access_node,
-        timeout=BT_INSTALL_PROBE_TIMEOUT,
+        login_seed=login_seed,
+        membership=membership,
+        send_runtime_sync_on_connect=send_runtime_sync_on_connect,
+        timeout=probe_timeout,
     )
 
 
 def _cloud_params_from_entry_data(data: dict[str, Any], title: str = INTEGRATION_TITLE) -> CloudParams:
     """Build cloud params from already validated config-entry data."""
+    if data.get(CONF_INVENTORY_MODE) == INVENTORY_MODE_BLE_ADVERTISEMENT:
+        return _ble_only_cloud_params(
+            home_name=str(data.get(CONF_HOME_NAME) or title),
+            membership=str(data.get(CONF_BLE_MEMBERSHIP) or ""),
+            pin=str(data.get(CONF_PIXIE_PIN) or ""),
+        )
     return CloudParams(
         home_id=str(data[CONF_HOME_ID]),
         home_name=str(data.get(CONF_HOME_NAME) or title),
@@ -168,6 +194,9 @@ async def _async_apply_bluetooth_choice(
     log_label: str,
     preferred_source: str | None = None,
     preferred_access_node: str | None = None,
+    login_seed: str | None = None,
+    membership: str | None = None,
+    send_runtime_sync_on_connect: bool = False,
 ) -> str | None:
     """Apply the BT enable choice to entry data; return an error key if probing fails."""
     data[CONF_BT_ENABLED] = False
@@ -194,6 +223,9 @@ async def _async_apply_bluetooth_choice(
         inventory,
         preferred_source=preferred_source,
         preferred_access_node=preferred_access_node,
+        login_seed=login_seed,
+        membership=membership,
+        send_runtime_sync_on_connect=send_runtime_sync_on_connect,
     )
     if probe is not None and probe.healthy:
         prefix = _flow_home_log_prefix(None, cloud_params.home_name)
@@ -448,6 +480,85 @@ def _build_entry_data(cloud_params: CloudParams) -> dict[str, Any]:
     }
 
 
+def _ble_only_cloud_params(*, home_name: str, membership: str, pin: str) -> CloudParams:
+    """Build the minimal runtime label/context used by BLE-only Pixie entries."""
+    normalized_membership = str(membership).strip().lower()
+    return CloudParams(
+        home_id=f"pixie_ble:{normalized_membership}",
+        home_name=home_name,
+        user_id="ble_only",
+        meshnet=normalized_membership,
+        meshnet2=normalized_membership,
+        netid=pin,
+    )
+
+
+def _build_ble_only_entry_data(*, home_name: str, pin: str, membership: str) -> dict[str, Any]:
+    """Build config-entry data for a no-gateway Pixie BLE-only home."""
+    cloud_params = _ble_only_cloud_params(home_name=home_name, membership=membership, pin=pin)
+    data = _build_entry_data(cloud_params)
+    data[CONF_INVENTORY_MODE] = INVENTORY_MODE_BLE_ADVERTISEMENT
+    data[CONF_PIXIE_PIN] = pin
+    data[CONF_BLE_MEMBERSHIP] = str(membership).strip().lower()
+    data[CONF_BT_ENABLED] = True
+    data[CONF_BT_STATE] = BT_STATE_READY
+    return data
+
+
+async def _async_validate_ble_only_setup(
+    hass: Any,
+    *,
+    home_name: str,
+    pin: str,
+    membership: str,
+) -> ValidatedSetup:
+    """Validate that a no-gateway Pixie BLE-only home can be reached."""
+    inventory = PixieInventory.from_ble_advertisements([], home_name=home_name, membership=membership)
+    cloud_params = _ble_only_cloud_params(home_name=home_name, membership=membership, pin=pin)
+    data = _build_ble_only_entry_data(
+        home_name=home_name,
+        pin=pin,
+        membership=membership,
+    )
+    data[CONF_BLE_INVENTORY] = inventory.to_dict()
+    options = {
+        CONF_COMMAND_TRANSPORT: COMMAND_TRANSPORT_BT_ONLY,
+        CONF_BT_ACCESS_NODE_PREFERENCE: BT_ACCESS_NODE_AUTO,
+    }
+    try:
+        health = await async_probe_ble_only_mesh_login(
+            hass,
+            cloud_params,
+            home_name=home_name,
+            pin=pin,
+            membership=membership,
+            inventory=inventory,
+        )
+    except Exception as err:
+        data[CONF_BT_STATE] = BT_STATE_NO_WORKING_PROXY
+        raise CannotConnect(str(err) or "No working ESPHome Bluetooth proxy was found") from err
+
+    LOGGER.info(
+        "[%s] Pixie BLE-only setup login probe succeeded access_node=%s source=%s",
+        home_name,
+        health.access_node,
+        health.source,
+    )
+    data[CONF_BLE_INVENTORY] = inventory.to_dict()
+    if health.source:
+        data[CONF_BT_SOURCE] = health.source
+    if health.access_node:
+        data[CONF_BT_ACCESS_NODE] = health.access_node
+    return ValidatedSetup(
+        title=home_name,
+        data=data,
+        options=options,
+        inventory=inventory,
+        has_cover_devices=any(device.capabilities.cover_type == "blind" for device in inventory.devices_by_id.values()),
+        cover_devices=_cover_controller_choices(inventory),
+    )
+
+
 def _build_entry_data_with_mode(
     cloud_params: CloudParams,
     *,
@@ -503,6 +614,12 @@ def _entry_gateway_ip(entry: ConfigEntry) -> str | None:
 
 
 def _entry_cloud_params(entry: ConfigEntry) -> CloudParams:
+    if _entry_inventory_mode(entry) == INVENTORY_MODE_BLE_ADVERTISEMENT:
+        return _ble_only_cloud_params(
+            home_name=str(entry.data.get(CONF_HOME_NAME) or entry.title or INTEGRATION_TITLE),
+            membership=str(entry.data.get(CONF_BLE_MEMBERSHIP) or ""),
+            pin=str(entry.data.get(CONF_PIXIE_PIN) or ""),
+        )
     return CloudParams(
         home_id=str(entry.data[CONF_HOME_ID]),
         home_name=str(entry.data.get(CONF_HOME_NAME) or entry.title or INTEGRATION_TITLE),
@@ -650,7 +767,10 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
 
         next_flow: tuple[FlowType, str] | None = None
-        if self._pending_user_input is not None and self._remaining_homes_after_current():
+        if (
+            self._pending_user_input is not None
+            and self._validated_setup.data.get(CONF_INVENTORY_MODE) != INVENTORY_MODE_BLE_ADVERTISEMENT
+        ):
             username = str(self._pending_user_input.get(CONF_USERNAME) or "").strip()
             password = str(self._pending_user_input.get(CONF_PASSWORD) or "")
             exclude_home_ids = sorted(self._configured_home_ids() | {str(self._validated_setup.data[CONF_HOME_ID])})
@@ -708,7 +828,26 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         return [home for home in self._cloud_home_list.homes if _home_id(home) and _home_id(home) not in configured]
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
-        """Handle the initial setup step."""
+        """Choose the Pixie setup path."""
+        if user_input is not None and CONF_USERNAME in user_input and CONF_PASSWORD in user_input:
+            return await self.async_step_gateway(user_input)
+        if user_input is not None:
+            setup_path = str(user_input.get(CONF_SETUP_PATH) or CONF_SETUP_PATH_GATEWAY)
+            if setup_path == CONF_SETUP_PATH_BLE_ONLY:
+                return await self.async_step_ble_only()
+            return await self.async_step_gateway()
+
+        choices = {
+            CONF_SETUP_PATH_GATEWAY: "Pixie Plus with gateway",
+            CONF_SETUP_PATH_BLE_ONLY: "Pixie without gateway - requires an ESPHome Bluetooth proxy",
+        }
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({vol.Required(CONF_SETUP_PATH): vol.In(choices)}),
+        )
+
+    async def async_step_gateway(self, user_input: dict[str, Any] | None = None):
+        """Handle Pixie Plus gateway credential setup."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -732,6 +871,8 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             else:
                 if not self._available_homes:
+                    if self._allow_finish_setup:
+                        return await self.async_step_home()
                     return self.async_abort(reason="already_configured")
                 if self._allow_finish_setup or len(self._cloud_home_list.homes) > 1:
                     return await self.async_step_home()
@@ -770,12 +911,56 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 ),
             }
         )
-        return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
+        return self.async_show_form(step_id="gateway", data_schema=data_schema, errors=errors)
+
+    async def async_step_ble_only(self, user_input: dict[str, Any] | None = None):
+        """Collect no-gateway Pixie BLE-only setup details."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            home_name = str(user_input.get(CONF_HOME_NAME) or "").strip()
+            pin = str(user_input.get(CONF_PIXIE_PIN) or "").strip()
+            if not home_name:
+                errors[CONF_HOME_NAME] = "required"
+            if not pin:
+                errors[CONF_PIXIE_PIN] = "required"
+            if not errors:
+                try:
+                    membership = hash_mesh_id_to_broadcast(pin)
+                    LOGGER.info(
+                        "[%s] Pixie BLE-only setup connecting to mesh for login validation",
+                        home_name,
+                    )
+                    self._validated_setup = await _async_validate_ble_only_setup(
+                        self.hass,
+                        home_name=home_name,
+                        pin=pin,
+                        membership=membership,
+                    )
+                    LOGGER.info(
+                        "[%s] Pixie BLE-only setup accepted mesh login; inventory will be built at startup",
+                        home_name,
+                    )
+                    return await self._async_finish_validated_setup()
+                except CannotConnect:
+                    errors["base"] = "ble_only_cannot_connect"
+                except Exception:
+                    LOGGER.exception("Unexpected Pixie BLE-only setup failure")
+                    errors["base"] = "unknown"
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_HOME_NAME): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                vol.Required(CONF_PIXIE_PIN): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+            }
+        )
+        return self.async_show_form(step_id="ble_only", data_schema=data_schema, errors=errors)
 
     async def async_step_home(self, user_input: dict[str, Any] | None = None):
         """Choose which Pixie Home to add."""
         if self._pending_user_input is None or not self._available_homes:
-            return await self.async_step_user()
+            if not self._allow_finish_setup:
+                return await self.async_step_user()
 
         errors: dict[str, str] = {}
 
@@ -783,6 +968,8 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             self._pending_home_id = str(user_input[CONF_SELECTED_HOME_ID])
             if self._pending_home_id == FINISH_SETUP_VALUE:
                 return self.async_abort(reason="setup_complete")
+            if self._pending_home_id == BLE_ONLY_SETUP_VALUE:
+                return await self.async_step_ble_only()
             try:
                 self._validated_setup = await _async_validate_setup_input(
                     self._pending_user_input,
@@ -801,6 +988,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self._async_finish_validated_setup()
 
         choices = {_home_id(home): _home_label(home) for home in self._available_homes}
+        choices[BLE_ONLY_SETUP_VALUE] = "Add Pixie without gateway - requires an ESPHome Bluetooth proxy"
         if self._allow_finish_setup:
             choices[FINISH_SETUP_VALUE] = "Finish setup"
         data_schema = vol.Schema(
@@ -926,6 +1114,11 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
         """Present reconfiguration actions for the config entry."""
         entry = self._get_reconfigure_entry()
+        if _entry_inventory_mode(entry) == INVENTORY_MODE_BLE_ADVERTISEMENT:
+            return self.async_show_menu(
+                step_id="reconfigure",
+                menu_options=["reconfigure_bluetooth"],
+            )
         menu_options = ["reconfigure_credentials", "reconfigure_gateway_connection", "reconfigure_bluetooth"]
         runtime_data = getattr(entry, "runtime_data", None)
         pixie_runtime = getattr(runtime_data, "pixie_runtime", None) if runtime_data is not None else None
@@ -999,9 +1192,10 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         """Enable or disable the optional Bluetooth runtime path."""
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
+        ble_only = _entry_inventory_mode(entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
 
         if user_input is not None:
-            enable_bt = _enable_bt_from_user_input(user_input)
+            enable_bt = True if ble_only else _enable_bt_from_user_input(user_input)
             data = dict(entry.data)
             options = dict(entry.options)
             runtime_data = getattr(entry, "runtime_data", None)
@@ -1016,6 +1210,9 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 log_label="reconfigure",
                 preferred_source=str(entry.data.get(CONF_BT_SOURCE) or "") or None,
                 preferred_access_node=str(entry.data.get(CONF_BT_ACCESS_NODE) or "") or None,
+                login_seed=str(entry.data.get(CONF_PIXIE_PIN) or "") if ble_only else None,
+                membership=str(entry.data.get(CONF_BLE_MEMBERSHIP) or "") if ble_only else None,
+                send_runtime_sync_on_connect=ble_only,
             )
             if error is not None:
                 errors["base"] = error
@@ -1030,13 +1227,15 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
                 self.hass.config_entries.async_update_entry(entry, options=options)
             return self.async_update_reload_and_abort(entry, data=data)
 
-        data_schema = _bluetooth_data_schema(default=bool(entry.data.get(CONF_BT_ENABLED)))
+        data_schema = vol.Schema({}) if ble_only else _bluetooth_data_schema(default=bool(entry.data.get(CONF_BT_ENABLED)))
         return self.async_show_form(step_id="reconfigure_bluetooth", data_schema=data_schema, errors=errors)
 
     async def async_step_reconfigure_credentials(self, user_input: dict[str, Any] | None = None):
         """Store Pixie credentials so the entry can use cloud fallback when local inventory fails."""
         errors: dict[str, str] = {}
         entry = self._get_reconfigure_entry()
+        if _entry_inventory_mode(entry) == INVENTORY_MODE_BLE_ADVERTISEMENT:
+            return await self.async_step_reconfigure()
 
         if user_input is not None:
             username = str(user_input[CONF_USERNAME]).strip()
@@ -1094,6 +1293,8 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure_gateway_connection(self, user_input: dict[str, Any] | None = None):
         """Switch between UDP discovery and a stored manual gateway IP."""
         entry = self._get_reconfigure_entry()
+        if _entry_inventory_mode(entry) == INVENTORY_MODE_BLE_ADVERTISEMENT:
+            return await self.async_step_reconfigure()
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -1274,13 +1475,37 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         inventory = runtime_data.pixie_runtime.inventory if runtime_data is not None else None
         return _cover_controller_choices(inventory)
 
+    def _clear_bluetooth_access_node_hints(self) -> None:
+        """Clear learned BLE access-node hints without disabling Bluetooth."""
+        if not _entry_bt_enabled(self.config_entry):
+            return
+        data = dict(self.config_entry.data)
+        changed = False
+        for key in (
+            CONF_BT_SOURCE,
+            CONF_BT_ACCESS_NODE,
+            "bt_response_access_node",
+            "bt_access_nodes",
+            CONF_BT_BETTER_CANDIDATE_SEEN,
+        ):
+            if key in data:
+                data.pop(key, None)
+                changed = True
+        if changed:
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         """Choose which Pixie options to configure."""
         menu_options = ["cover_controller"]
-        if _entry_bt_enabled(self.config_entry):
+        ble_only = _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
+        if ble_only:
             menu_options = [
                 "transport",
-                "clear_bluetooth_access_node",
+                *menu_options,
+            ]
+        elif _entry_bt_enabled(self.config_entry):
+            menu_options = [
+                "transport",
                 "update_device_versions",
                 *menu_options,
             ]
@@ -1290,30 +1515,47 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
             menu_options=menu_options,
         )
 
-    async def async_step_clear_bluetooth_access_node(self, user_input: dict[str, Any] | None = None):
-        """Clear learned BLE access-node hints without disabling Bluetooth."""
-        if _entry_bt_enabled(self.config_entry):
-            data = dict(self.config_entry.data)
-            for key in (
-                CONF_BT_SOURCE,
-                CONF_BT_ACCESS_NODE,
-                "bt_response_access_node",
-                "bt_access_nodes",
-                CONF_BT_BETTER_CANDIDATE_SEEN,
-            ):
-                data.pop(key, None)
-            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
-        return self.async_create_entry(title="", data=dict(self.config_entry.options))
-
     async def async_step_update_device_versions(self, user_input: dict[str, Any] | None = None):
         """Run a manual BLE scan to refresh device firmware versions."""
-        if not _entry_bt_enabled(self.config_entry):
+        if (
+            not _entry_bt_enabled(self.config_entry)
+            or _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
+        ):
             return self.async_create_entry(title="", data=dict(self.config_entry.options))
         await _async_run_global_ble_version_scan(self.hass, reason="manual options")
         return self.async_create_entry(title="", data=dict(self.config_entry.options))
 
     async def async_step_transport(self, user_input: dict[str, Any] | None = None):
         """Configure command transport preference."""
+        ble_only = _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
+        if ble_only:
+            if user_input is not None:
+                options = dict(self.config_entry.options)
+                options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_BT_ONLY
+                options[CONF_BT_ACCESS_NODE_PREFERENCE] = str(user_input[CONF_BT_ACCESS_NODE_PREFERENCE])
+                if user_input.get(CONF_CLEAR_BLUETOOTH_ACCESS_NODE):
+                    self._clear_bluetooth_access_node_hints()
+                return self.async_create_entry(title="", data=options)
+            current_access_node_preference = str(
+                self.config_entry.options.get(CONF_BT_ACCESS_NODE_PREFERENCE) or BT_ACCESS_NODE_AUTO
+            )
+            if current_access_node_preference not in (BT_ACCESS_NODE_AUTO, BT_ACCESS_NODE_PREFER_GATEWAY):
+                current_access_node_preference = BT_ACCESS_NODE_AUTO
+            return self.async_show_form(
+                step_id="transport",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required(CONF_BT_ACCESS_NODE_PREFERENCE, default=current_access_node_preference): vol.In(
+                            {
+                                BT_ACCESS_NODE_AUTO: "Auto / best BLE node",
+                                BT_ACCESS_NODE_PREFER_GATEWAY: "Prefer gateway, fallback to auto",
+                            }
+                        ),
+                        vol.Optional(CONF_CLEAR_BLUETOOTH_ACCESS_NODE, default=False): bool,
+                    }
+                ),
+            )
+
         if not _entry_bt_enabled(self.config_entry):
             options = dict(self.config_entry.options)
             options[CONF_COMMAND_TRANSPORT] = COMMAND_TRANSPORT_TCP_PRIMARY
@@ -1324,6 +1566,8 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
             options = dict(self.config_entry.options)
             options[CONF_COMMAND_TRANSPORT] = str(user_input[CONF_COMMAND_TRANSPORT])
             options[CONF_BT_ACCESS_NODE_PREFERENCE] = str(user_input[CONF_BT_ACCESS_NODE_PREFERENCE])
+            if user_input.get(CONF_CLEAR_BLUETOOTH_ACCESS_NODE):
+                self._clear_bluetooth_access_node_hints()
             return self.async_create_entry(title="", data=options)
 
         current = str(self.config_entry.options.get(CONF_COMMAND_TRANSPORT) or COMMAND_TRANSPORT_TCP_PRIMARY)
@@ -1348,6 +1592,7 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
                         BT_ACCESS_NODE_PREFER_GATEWAY: "Prefer gateway, fallback to auto",
                     }
                 ),
+                vol.Optional(CONF_CLEAR_BLUETOOTH_ACCESS_NODE, default=False): bool,
             }
         )
         return self.async_show_form(step_id="transport", data_schema=data_schema)

@@ -191,6 +191,14 @@ class RuntimeState:
     last_timer_poll_requested_at: Optional[float] = None
     timer_needs_poll: bool = False
     local_timer_restart_at: Optional[float] = None
+    left_power_w: Optional[float] = None
+    right_power_w: Optional[float] = None
+    left_energy_kwh: Optional[float] = None
+    right_energy_kwh: Optional[float] = None
+    left_current_a: Optional[float] = None
+    right_current_a: Optional[float] = None
+    voltage_v: Optional[float] = None
+    last_power_meter_poll_at: Optional[float] = None
     hold_time_seconds: Optional[int] = None
     brightness_threshold: Optional[int] = None
     motion_sensitivity: Optional[int] = None
@@ -335,6 +343,14 @@ class DeviceStateStore:
         last_timer_poll_at: Any = STATE_UNSET,
         last_timer_poll_requested_at: Any = STATE_UNSET,
         timer_needs_poll: Any = STATE_UNSET,
+        left_power_w: Any = STATE_UNSET,
+        right_power_w: Any = STATE_UNSET,
+        left_energy_kwh: Any = STATE_UNSET,
+        right_energy_kwh: Any = STATE_UNSET,
+        left_current_a: Any = STATE_UNSET,
+        right_current_a: Any = STATE_UNSET,
+        voltage_v: Any = STATE_UNSET,
+        last_power_meter_poll_at: Any = STATE_UNSET,
         hold_time_seconds: Any = STATE_UNSET,
         brightness_threshold: Any = STATE_UNSET,
         motion_sensitivity: Any = STATE_UNSET,
@@ -401,6 +417,22 @@ class DeviceStateStore:
             runtime.last_timer_poll_requested_at = last_timer_poll_requested_at
         if timer_needs_poll is not STATE_UNSET:
             runtime.timer_needs_poll = bool(timer_needs_poll)
+        if left_power_w is not STATE_UNSET:
+            runtime.left_power_w = None if left_power_w is None else float(left_power_w)
+        if right_power_w is not STATE_UNSET:
+            runtime.right_power_w = None if right_power_w is None else float(right_power_w)
+        if left_energy_kwh is not STATE_UNSET:
+            runtime.left_energy_kwh = None if left_energy_kwh is None else float(left_energy_kwh)
+        if right_energy_kwh is not STATE_UNSET:
+            runtime.right_energy_kwh = None if right_energy_kwh is None else float(right_energy_kwh)
+        if left_current_a is not STATE_UNSET:
+            runtime.left_current_a = None if left_current_a is None else float(left_current_a)
+        if right_current_a is not STATE_UNSET:
+            runtime.right_current_a = None if right_current_a is None else float(right_current_a)
+        if voltage_v is not STATE_UNSET:
+            runtime.voltage_v = None if voltage_v is None else float(voltage_v)
+        if last_power_meter_poll_at is not STATE_UNSET:
+            runtime.last_power_meter_poll_at = last_power_meter_poll_at
         if hold_time_seconds is not STATE_UNSET:
             runtime.hold_time_seconds = _normalize_optional_int(hold_time_seconds)
         if brightness_threshold is not STATE_UNSET:
@@ -539,10 +571,10 @@ class DeviceStateStore:
                             update_contact_active = decoded_contact.get("contact_active")
                         update_contact_momentary = bool(decoded_contact.get("pulse_event"))
                 elif inv_rec.capabilities.supports_gate:
-                    # Gate repurposes br=door1_state, rssi=door2_state
+                    # Gate repurposes br=door1_state. Two-door models also use rssi_raw as door2_state.
                     update_door1 = _normalize_optional_int(br_obj.get("raw"))
                     if isinstance(update_door1, int):
-                        update_door1_decoded = decode_gate_state_byte(0, update_door1)
+                        update_door1_decoded = decode_gate_state_byte(0, update_door1, inv_rec.capabilities)
                         if not update_door1_decoded.get("known"):
                             LOGGER.debug(
                                 "Gate unknown GwData byte: dev_id=%s door=1 raw=0x%02x source=%s",
@@ -551,10 +583,10 @@ class DeviceStateStore:
                                 source,
                             )
                     rssi_raw = rec_data.get("rssi_raw")
-                    if rssi_raw is not None:
+                    if inv_rec.capabilities.gate_doors >= 2 and rssi_raw is not None:
                         update_door2 = _normalize_optional_int(rssi_raw)
                         if isinstance(update_door2, int):
-                            update_door2_decoded = decode_gate_state_byte(1, update_door2)
+                            update_door2_decoded = decode_gate_state_byte(1, update_door2, inv_rec.capabilities)
                             if not update_door2_decoded.get("known"):
                                 LOGGER.debug(
                                     "Gate unknown GwData byte: dev_id=%s door=2 raw=0x%02x source=%s",
@@ -724,6 +756,7 @@ class DeviceCapabilities:
     effect_command_encoding: str = ""
     effect_names: List[str] = field(default_factory=list)
     supports_multi_channel: bool = False
+    supports_power_metering: bool = False
     supports_usb_subentity: bool = False
     supports_cover: bool = False
     cover_type: str = ""
@@ -766,6 +799,7 @@ class DeviceCapabilities:
             "effect_command_encoding": self.effect_command_encoding,
             "effect_names": list(self.effect_names),
             "supports_multi_channel": self.supports_multi_channel,
+            "supports_power_metering": self.supports_power_metering,
             "supports_usb_subentity": self.supports_usb_subentity,
             "supports_cover": self.supports_cover,
             "cover_type": self.cover_type,
@@ -810,6 +844,7 @@ class DeviceCapabilities:
             effect_command_encoding=str(data.get("effect_command_encoding", "")),
             effect_names=list(data.get("effect_names") or []),
             supports_multi_channel=bool(data.get("supports_multi_channel", False)),
+            supports_power_metering=bool(data.get("supports_power_metering", False)),
             supports_usb_subentity=bool(data.get("supports_usb_subentity", False)),
             supports_cover=bool(data.get("supports_cover", False)),
             cover_type=str(data.get("cover_type", "")),
@@ -884,6 +919,8 @@ class DeviceRecord:
             )
         if capabilities.is_switch and not capabilities.switch_type:
             capabilities.switch_type = str(model_caps.get("switch_type", "switch"))
+        if model_caps.get("supports_power_metering", False):
+            capabilities.supports_power_metering = True
         if capabilities.supports_contact_sensor and not capabilities.contact_sensor_type:
             capabilities.contact_sensor_type = str(model_caps.get("contact_sensor_type", "standard_contact"))
         if capabilities.supports_cover and not capabilities.cover_type:
@@ -967,6 +1004,7 @@ class PixieInventory:
         cap.effect_command_encoding = model_caps["effect_command_encoding"]
         cap.effect_names = model_caps["effect_names"]
         cap.supports_multi_channel = model_caps["supports_multi_channel"]
+        cap.supports_power_metering = bool(model_caps["supports_power_metering"])
         cap.supports_usb_subentity = model_caps["supports_usb_subentity"]
         cap.supports_cover = model_caps["supports_cover"]
         cap.cover_type = model_caps["cover_type"]
@@ -1101,6 +1139,106 @@ class PixieInventory:
         return inv
 
     @staticmethod
+    def _default_ble_name(model_no: str, device_id: int, capabilities: DeviceCapabilities) -> str:
+        """Return a Pixie-app-like default name for a BLE-only discovered device."""
+        if capabilities.supports_gate:
+            label = "Gate"
+        elif capabilities.supports_timer:
+            label = "Timer"
+        elif capabilities.supports_contact_sensor or capabilities.supports_motion_sensor or capabilities.supports_sensor:
+            label = "Sensor"
+        elif capabilities.supports_color:
+            label = "RGB Strip"
+        elif capabilities.supports_color_temp:
+            label = "Light"
+        elif capabilities.switch_type == "outlet":
+            label = "Outlet"
+        elif capabilities.is_switch:
+            label = "Switch"
+        elif capabilities.is_light:
+            label = "Light"
+        else:
+            label = hardware_list.get(model_no, "Device")
+        return f"{label} {int(device_id)}"
+
+    @classmethod
+    def from_ble_advertisements(
+        cls,
+        adverts: List[Any],
+        *,
+        home_name: str,
+        membership: str,
+    ) -> "PixieInventory":
+        """Build a no-gateway Pixie inventory from matching long BLE advertisements."""
+        now_ms = int(datetime.now().timestamp() * 1000)
+        normalized_membership = str(membership or "").strip().lower()
+        inv = cls(
+            home_id=f"pixie_ble:{normalized_membership}",
+            home_name=home_name,
+            user_id="ble_only",
+            net_id=None,
+            mesh_net=normalized_membership,
+            mesh_net2=normalized_membership,
+            generated_at=datetime.now(),
+            gateway=None,
+        )
+
+        for advert in adverts:
+            if str(getattr(advert, "membership", "") or "").strip().lower() != normalized_membership:
+                continue
+            try:
+                dev_id = int(getattr(advert, "device_id"))
+                dtype = int(getattr(advert, "product_type"))
+                dstype = int(getattr(advert, "product_stype"))
+            except (TypeError, ValueError):
+                continue
+            if dev_id <= 0:
+                continue
+            model_no = f"{dtype:02d}{dstype:02d}"
+            device_obj = {
+                "id": dev_id,
+                "type": dtype,
+                "stype": dstype,
+                "mac": str(getattr(advert, "mac", "") or ""),
+            }
+            cap = cls._infer_capabilities(device_obj, {})
+            rec = DeviceRecord(
+                id=dev_id,
+                type=dtype,
+                stype=dstype,
+                model_no=model_no,
+                name=cls._default_ble_name(model_no, dev_id, cap),
+                mac=str(getattr(advert, "mac", "") or ""),
+                version=_normalize_optional_int(getattr(advert, "version", None)),
+                version_source=VERSION_SOURCE_BLE_ADVERTISEMENT,
+            )
+            rec.capabilities = cap
+            runtime_state = RuntimeState(
+                online=None,
+                presence="offline",
+                raw={
+                    "ble_advertisement": {
+                        "membership": normalized_membership,
+                        "rssi": getattr(advert, "rssi", None),
+                        "byte10": getattr(advert, "byte10", None),
+                    }
+                },
+                last_source="ble_advertisement",
+                last_updated_ms=now_ms,
+            )
+            runtime_state.is_on = derive_is_on_from_state(
+                rec.capabilities,
+                runtime_state.br,
+                runtime_state.r,
+                runtime_state.mode,
+                runtime_state.relay,
+            )
+            rec.runtime = inv.state_store.bind(rec.id, runtime_state)
+            inv.devices_by_id[rec.id] = rec
+
+        return inv
+
+    @staticmethod
     def _normalize_mac(mac: Any) -> str:
         raw = str(mac or "").replace(":", "").replace("-", "").strip().upper()
         if len(raw) != 12:
@@ -1152,6 +1290,78 @@ class PixieInventory:
             record.version = version_int
             record.version_source = VERSION_SOURCE_BLE_ADVERTISEMENT
             return record
+        return None
+
+    def merge_ble_advertisement_inventory(self, scanned: "PixieInventory") -> Dict[str, int]:
+        """Merge a BLE-only advertisement scan without deleting missing devices."""
+        added = 0
+        updated = 0
+        existing_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in self.devices_by_id.values()
+            if self._normalize_mac(record.mac)
+        }
+
+        for dev_id, scanned_record in scanned.devices_by_id.items():
+            current = self.devices_by_id.get(dev_id)
+            scanned_mac = self._normalize_mac(scanned_record.mac)
+            if current is None and scanned_mac:
+                current = existing_by_mac.get(scanned_mac)
+                if current is not None and current.id != dev_id:
+                    self.devices_by_id.pop(current.id, None)
+                    self.state_store.states_by_id.pop(current.id, None)
+                    current.id = dev_id
+                    current.runtime = self.state_store.bind(dev_id, current.runtime)
+                    self.devices_by_id[dev_id] = current
+            if current is None:
+                scanned_record.runtime = self.state_store.bind(scanned_record.id, scanned_record.runtime)
+                self.devices_by_id[dev_id] = scanned_record
+                if scanned_mac:
+                    existing_by_mac[scanned_mac] = scanned_record
+                added += 1
+                continue
+
+            changed = False
+            for attr in ("type", "stype", "model_no", "mac", "version", "version_source"):
+                new_value = getattr(scanned_record, attr)
+                if getattr(current, attr) != new_value:
+                    setattr(current, attr, new_value)
+                    changed = True
+
+            if current.capabilities.to_dict() != scanned_record.capabilities.to_dict():
+                current.capabilities = scanned_record.capabilities
+                changed = True
+
+            current.runtime.raw["ble_advertisement"] = dict(
+                scanned_record.runtime.raw.get("ble_advertisement") or {}
+            )
+            current.runtime.last_source = "ble_advertisement"
+            current.runtime.last_updated_ms = scanned_record.runtime.last_updated_ms
+
+            if changed:
+                updated += 1
+            if scanned_mac:
+                existing_by_mac[scanned_mac] = current
+
+        self.generated_at = datetime.now()
+        return {
+            "added": added,
+            "updated": updated,
+            "retained_missing": max(0, len(self.devices_by_id) - len(scanned.devices_by_id) - added),
+        }
+
+    def remove_device_by_ha_identifier(self, identifier: str) -> DeviceRecord | None:
+        """Remove one physical device record by an HA device identifier."""
+        normalized_identifier = str(identifier or "")
+        for record in list(self.devices_by_id.values()):
+            physical_identifier = f"device:{record.mac}" if record.mac else f"device:id:{record.id}"
+            if (
+                normalized_identifier == physical_identifier
+                or normalized_identifier.startswith(f"{physical_identifier}:")
+            ):
+                self.devices_by_id.pop(record.id, None)
+                self.state_store.states_by_id.pop(record.id, None)
+                return record
         return None
 
     def apply_gwdata_bulk(self, records: List[Dict[str, Any]], source: str, *, full_snapshot: bool = False) -> int:

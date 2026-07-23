@@ -15,7 +15,7 @@ from . import (
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 from .pixie_value_profiles import (
@@ -30,7 +30,7 @@ from .pixie_value_profiles import (
 
 def _iter_mode_select_endpoints(inventory) -> list[PixieEndpoint]:
     """Return mode select endpoints from sensor controller and timer devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -68,7 +68,7 @@ def _iter_mode_select_endpoints(inventory) -> list[PixieEndpoint]:
 
 def _iter_brightness_threshold_endpoints(inventory) -> list[PixieEndpoint]:
     """Return brightness threshold select endpoints for sensor devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -91,7 +91,7 @@ def _iter_brightness_threshold_endpoints(inventory) -> list[PixieEndpoint]:
 
 def _iter_motion_sensitivity_endpoints(inventory) -> list[PixieEndpoint]:
     """Return motion sensitivity select endpoints for sensor devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]

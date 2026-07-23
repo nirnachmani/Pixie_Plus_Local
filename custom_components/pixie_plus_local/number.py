@@ -15,14 +15,14 @@ from . import (
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     endpoint_unique_identifier,
-    gateway_device_identifier,
+    parent_device_identifier,
     physical_device_identifier,
 )
 
 
 def _iter_timer_duration_endpoints(inventory) -> list[PixieEndpoint]:
     """Return timer duration number endpoints for timer-capable devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -45,7 +45,7 @@ def _iter_timer_duration_endpoints(inventory) -> list[PixieEndpoint]:
 
 def _iter_hold_time_endpoints(inventory) -> list[PixieEndpoint]:
     """Return hold time number endpoints for sensor devices."""
-    gateway_identifier = gateway_device_identifier(inventory)
+    gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     for device_id in sorted(inventory.devices_by_id):
         record = inventory.devices_by_id[device_id]
@@ -61,6 +61,29 @@ def _iter_hold_time_endpoints(inventory) -> list[PixieEndpoint]:
                 device_name=record.name,
                 via_device_identifier=gateway_identifier,
                 entity_name="Hold time",
+            )
+        )
+    return endpoints
+
+
+def _iter_power_poll_interval_endpoints(inventory) -> list[PixieEndpoint]:
+    """Return power-meter poll interval endpoints."""
+    gateway_identifier = parent_device_identifier(inventory)
+    endpoints: list[PixieEndpoint] = []
+    for device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[device_id]
+        if not record.capabilities.supports_power_metering:
+            continue
+        endpoints.append(
+            PixieEndpoint(
+                device_id=record.id,
+                endpoint_key="power_poll_interval",
+                command_target="power_poll_interval",
+                entity_unique_id=endpoint_unique_identifier(record, "power_poll_interval"),
+                device_identifier=physical_device_identifier(record),
+                device_name=record.name,
+                via_device_identifier=gateway_identifier,
+                entity_name="Power poll interval",
             )
         )
     return endpoints
@@ -82,6 +105,8 @@ async def async_setup_entry(
         entities.append(PixiePlusTimerDurationNumberEntity(runtime_data, endpoint))
     for endpoint in _iter_hold_time_endpoints(inventory):
         entities.append(PixiePlusHoldTimeNumberEntity(runtime_data, endpoint))
+    for endpoint in _iter_power_poll_interval_endpoints(inventory):
+        entities.append(PixiePlusPowerPollIntervalNumberEntity(runtime_data, endpoint))
     async_add_entities(entities)
 
 
@@ -149,5 +174,30 @@ class PixiePlusHoldTimeNumberEntity(PixiePlusCoordinatorEntity, NumberEntity):
                 command_sensor_param="hold_time",
                 command_sensor_param_value=hold_seconds,
             )
+        except Exception as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class PixiePlusPowerPollIntervalNumberEntity(PixiePlusCoordinatorEntity, NumberEntity):
+    """Number input for the 0208 metering poll interval."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = 1
+    _attr_native_max_value = 86400
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "s"
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
+        super().__init__(runtime_data, endpoint, domain=DOMAIN)
+
+    @property
+    def native_value(self) -> int | None:
+        return self.runtime_data.power_meter_poll_interval_seconds(self.record)
+
+    async def async_set_native_value(self, value: float) -> None:
+        seconds = max(1, min(86400, round(value)))
+        try:
+            await self.runtime_data.async_set_power_meter_poll_interval(self.record, seconds)
         except Exception as err:
             raise HomeAssistantError(str(err)) from err
