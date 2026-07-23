@@ -4,10 +4,25 @@
     "step": {
       "user": {
         "title": "Add Pixie home",
+        "description": "Choose how this Pixie installation is controlled.",
+        "data": {
+          "setup_path": "Pixie installation type"
+        }
+      },
+      "gateway": {
+        "title": "Pixie Plus with gateway",
         "description": "Use your Pixie account once to choose a home and retrieve the parameters needed for ongoing local operation.",
         "data": {
           "username": "Username",
           "password": "Password"
+        }
+      },
+      "ble_only": {
+        "title": "Pixie without gateway",
+        "description": "Add a Pixie Bluetooth-only installation. This requires an ESPHome Bluetooth proxy device already added to Home Assistant.",
+        "data": {
+          "home_name": "Home name",
+          "pixie_pin": "Pixie PIN"
         }
       },
       "home": {
@@ -106,7 +121,10 @@
       "invalid_auth": "Invalid Pixie username or password.",
       "invalid_gateway_ip": "Enter a valid IPv4 address.",
       "cannot_connect": "Could not connect to the Pixie gateway.",
+      "ble_only_cannot_connect": "Could not connect to the Pixie Bluetooth-only installation. Make sure an ESPHome Bluetooth proxy is available and the PIN is correct.",
       "bt_proxy_unavailable": "No working ESPHome Bluetooth proxy was found. Disable Bluetooth support to continue using TCP only.",
+      "required": "This field is required.",
+      "invalid_selection": "Unknown selection.",
       "unknown": "Unexpected error. Check the logs."
     },
     "abort": {
@@ -141,15 +159,9 @@
         "description": "Choose which Pixie option to change.",
         "menu_options": {
           "transport": "Bluetooth settings",
-          "clear_bluetooth_access_node": "Clear Bluetooth access-node preference",
           "update_device_versions": "Update device versions",
           "cover_controller": "Blind mapping"
         }
-      },
-      "clear_bluetooth_access_node": {
-        "title": "Clear Bluetooth access-node preference",
-        "description": "Clear learned Pixie Bluetooth access-node hints. Bluetooth remains enabled and the next BLE session will scan again.",
-        "data": {}
       },
       "update_device_versions": {
         "title": "Update device versions",
@@ -161,7 +173,8 @@
         "description": "Choose Bluetooth command behavior and access-node preference.",
         "data": {
           "command_transport": "Command transport",
-          "bt_access_node_preference": "Bluetooth access node"
+          "bt_access_node_preference": "Bluetooth access node",
+          "clear_bluetooth_access_node": "Clear Bluetooth access-node preference"
         }
       },
       "cover_controller": {
