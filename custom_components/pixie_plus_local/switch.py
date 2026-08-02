@@ -4,27 +4,40 @@ from __future__ import annotations
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from . import (
+from .pixie_const import (
     DOMAIN,
+)
+from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
     child_device_identifier,
+    device_added_signal,
     endpoint_unique_identifier,
     parent_device_identifier,
     physical_device_identifier,
 )
+from .pixie_inventory import (
+    supports_outlet_runtime_config,
+    supports_plug_led_settings,
+    supports_sensor_advanced_settings,
+)
 
-def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
+
+def _iter_switch_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return switch endpoints from inventory."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         parent_identifier = physical_device_identifier(record)
 
         if record.capabilities.supports_contact_sensor:
@@ -41,6 +54,22 @@ def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
                 )
             )
             continue
+
+        if supports_sensor_advanced_settings(record.capabilities):
+            endpoints.extend(
+                [
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="sensor_led_indicator",
+                        command_target="sensor_led_indicator",
+                        entity_unique_id=endpoint_unique_identifier(record, "sensor_led_indicator"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name="LED indicator",
+                    ),
+                ]
+            )
 
         if not record.capabilities.is_switch:
             continue
@@ -72,6 +101,41 @@ def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
                     ),
                 ]
             )
+            if supports_outlet_runtime_config(record.capabilities):
+                endpoints.extend(
+                    [
+                        PixieEndpoint(
+                            device_id=record.id,
+                            endpoint_key="outlet_led_indicator",
+                            command_target="outlet_led_indicator",
+                            entity_unique_id=endpoint_unique_identifier(record, "outlet_led_indicator"),
+                            device_identifier=parent_identifier,
+                            device_name=record.name,
+                            via_device_identifier=gateway_identifier,
+                            entity_name="LED indicator",
+                        ),
+                        PixieEndpoint(
+                            device_id=record.id,
+                            endpoint_key="outlet_all_device_control",
+                            command_target="outlet_all_device_control",
+                            entity_unique_id=endpoint_unique_identifier(record, "outlet_all_device_control"),
+                            device_identifier=parent_identifier,
+                            device_name=record.name,
+                            via_device_identifier=gateway_identifier,
+                            entity_name="“All devices” control",
+                        ),
+                        PixieEndpoint(
+                            device_id=record.id,
+                            endpoint_key="outlet_child_lock",
+                            command_target="outlet_child_lock",
+                            entity_unique_id=endpoint_unique_identifier(record, "outlet_child_lock"),
+                            device_identifier=parent_identifier,
+                            device_name=record.name,
+                            via_device_identifier=gateway_identifier,
+                            entity_name="Child lock",
+                        ),
+                    ]
+                )
             continue
 
         endpoints.append(
@@ -102,6 +166,41 @@ def _iter_switch_endpoints(inventory) -> list[PixieEndpoint]:
                 entity_name="USB",
             )
         )
+        if supports_plug_led_settings(record.capabilities):
+            endpoints.extend(
+                [
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="plug_socket_led_indicator",
+                        command_target="plug_socket_led_indicator",
+                        entity_unique_id=endpoint_unique_identifier(record, "plug_socket_led_indicator"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name="Socket LED indicator",
+                    ),
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="plug_usb_led_indicator",
+                        command_target="plug_usb_led_indicator",
+                        entity_unique_id=endpoint_unique_identifier(record, "plug_usb_led_indicator"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name="USB LED indicator",
+                    ),
+                    PixieEndpoint(
+                        device_id=record.id,
+                        endpoint_key="plug_all_devices_control",
+                        command_target="outlet_all_device_control",
+                        entity_unique_id=endpoint_unique_identifier(record, "plug_all_devices_control"),
+                        device_identifier=parent_identifier,
+                        device_name=record.name,
+                        via_device_identifier=gateway_identifier,
+                        entity_name="“All devices” control",
+                    ),
+                ]
+            )
     return endpoints
 
 
@@ -118,16 +217,37 @@ async def async_setup_entry(
 
     async_add_entities(PixiePlusSwitchEntity(runtime_data, endpoint) for endpoint in _iter_switch_endpoints(inventory))
 
+    @callback
+    def _async_add_device_entities(device_id: int) -> None:
+        current_inventory = runtime_data.pixie_runtime.inventory
+        if current_inventory is None:
+            return
+        endpoints = _iter_switch_endpoints(current_inventory, device_id=int(device_id))
+        if endpoints:
+            async_add_entities(PixiePlusSwitchEntity(runtime_data, endpoint) for endpoint in endpoints)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, device_added_signal(entry), _async_add_device_entities))
+
 
 class PixiePlusSwitchEntity(PixiePlusCoordinatorEntity, SwitchEntity):
     """Representation of a Pixie Plus switch endpoint."""
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
-        device_class = self.record.capabilities.switch_type or "switch"
-        self._attr_device_class = (
-            SwitchDeviceClass.OUTLET if device_class == "outlet" else SwitchDeviceClass.SWITCH
-        )
+        if endpoint.command_target in {
+            "outlet_led_indicator",
+            "outlet_all_device_control",
+            "outlet_child_lock",
+            "plug_socket_led_indicator",
+            "plug_usb_led_indicator",
+            "sensor_led_indicator",
+        }:
+            self._attr_entity_category = EntityCategory.CONFIG
+        else:
+            device_class = self.record.capabilities.switch_type or "switch"
+            self._attr_device_class = (
+                SwitchDeviceClass.OUTLET if device_class == "outlet" else SwitchDeviceClass.SWITCH
+            )
 
     @property
     def is_on(self) -> bool | None:
@@ -145,6 +265,18 @@ class PixiePlusSwitchEntity(PixiePlusCoordinatorEntity, SwitchEntity):
             return bool(runtime.r & 0x01) if isinstance(runtime.r, int) else None
         if target == "right":
             return bool(runtime.r & 0x02) if isinstance(runtime.r, int) else None
+        if target == "outlet_led_indicator":
+            return runtime.outlet_led_indicator
+        if target == "outlet_all_device_control":
+            return runtime.outlet_all_device_control
+        if target == "outlet_child_lock":
+            return runtime.outlet_child_lock
+        if target == "plug_socket_led_indicator":
+            return runtime.plug_socket_led_indicator
+        if target == "plug_usb_led_indicator":
+            return runtime.plug_usb_led_indicator
+        if target == "sensor_led_indicator":
+            return runtime.sensor_led_indicator
         return runtime.is_on
 
     async def async_turn_on(self, **kwargs) -> None:

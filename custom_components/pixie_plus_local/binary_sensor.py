@@ -4,26 +4,32 @@ from __future__ import annotations
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from . import (
+from .pixie_const import (
     DOMAIN,
+)
+from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
+    device_added_signal,
     endpoint_unique_identifier,
     parent_device_identifier,
     physical_device_identifier,
 )
 
 
-def _iter_binary_sensor_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_binary_sensor_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return binary sensor endpoints for supported sensor-style devices."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         parent_identifier = physical_device_identifier(record)
 
         if record.capabilities.supports_sensor:
@@ -74,6 +80,17 @@ async def async_setup_entry(
         for endpoint in _iter_binary_sensor_endpoints(inventory)
     )
 
+    @callback
+    def _async_add_device_entities(device_id: int) -> None:
+        current_inventory = runtime_data.pixie_runtime.inventory
+        if current_inventory is None:
+            return
+        endpoints = _iter_binary_sensor_endpoints(current_inventory, device_id=int(device_id))
+        if endpoints:
+            async_add_entities(PixiePlusBinarySensorEntity(runtime_data, endpoint) for endpoint in endpoints)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, device_added_signal(entry), _async_add_device_entities))
+
 
 class PixiePlusBinarySensorEntity(PixiePlusCoordinatorEntity, BinarySensorEntity):
     """Representation of a Pixie Plus binary sensor endpoint."""
@@ -90,6 +107,8 @@ class PixiePlusBinarySensorEntity(PixiePlusCoordinatorEntity, BinarySensorEntity
         if self.record.capabilities.supports_contact_sensor:
             return self.record.runtime.armed is not False
         mode = self.record.runtime.mode
+        if self.record.capabilities.supports_photocell_sensor and mode == 2:
+            return False
         # No sensor entity in switch/manual mode.
         if isinstance(mode, int):
             return mode != 0

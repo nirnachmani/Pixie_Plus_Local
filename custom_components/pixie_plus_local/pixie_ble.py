@@ -14,6 +14,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 
 from .pixie_inventory import PixieInventory
+from .pixie_const import BT_ACCESS_NODE_AUTO, BT_ACCESS_NODE_PREFER_GATEWAY
 from .pixie_runtime import (
     CloudParams,
     command_reply_route_kind,
@@ -24,6 +25,7 @@ from .pixie_ble_crypto import (
     build_login_packet,
     decrypt_notification_packet,
     encrypt_command_packet,
+    fn_eacc,
     process_login_response,
 )
 LOGGER = logging.getLogger(__name__)
@@ -35,15 +37,13 @@ PIXIE_CHAR_1912_SUFFIX = "1912"
 PIXIE_CHAR_1914_SUFFIX = "1914"
 PIXIE_DEFAULT_NAME = "Smart Light"
 BLE_NOTIFY_WAIT_SECONDS = 5.0
+BLE_CANDIDATE_CONNECT_TIMEOUT_SECONDS = 15.0
+BLE_FAILED_CANDIDATE_DISCONNECT_TIMEOUT_SECONDS = 2.0
 BLE_BETTER_RSSI_DELTA_DBM = 10
 BLE_ONLY_POST_LOGIN_COLLECT_SECONDS = 5.0
 BLE_ONLY_IDENTITY_REPLY_SECONDS = 1.5
 BLE_ONLY_CONNECT_SCAN_ATTEMPTS: tuple[float, ...] = (5.0, 5.0, 20.0)
 BLE_ONLY_BROADCAST_HASH_KEY = b"skytone"
-BT_ACCESS_NODE_AUTO = "auto"
-BT_ACCESS_NODE_PREFER_GATEWAY = "prefer_gateway"
-
-
 BT_STATE_DISABLED = "disabled"
 BT_STATE_READY = "ready"
 BT_STATE_NO_WORKING_PROXY = "no_working_proxy"
@@ -124,9 +124,11 @@ class PixieBleAdvertisementIdentity:
     product_type: int
     product_stype: int
     membership: str | None = None
+    gateway_mesh_value: str | None = None
     byte10: int | None = None
     manufacturer_id: int | None = None
     rssi: int | None = None
+    payload_hex: str | None = None
 
 
 @dataclass
@@ -162,7 +164,11 @@ class PixieBluetoothRuntime:
     login_seed: str | None = None
     membership: str | None = None
     send_runtime_sync_on_connect: bool = False
+    send_notify_enable_writes: bool = True
     active_scan_duration: float = 5.0
+    remember_access_node_on_connect: bool = True
+    compare_access_node_after_connect: bool = True
+    strict_preferred_access_node: bool = False
     proxy_refs: list[_ESPHomeProxyRef] | None = None
     health: PixieBluetoothHealth = field(default_factory=PixieBluetoothHealth)
     _task: asyncio.Task[None] | None = None
@@ -175,6 +181,7 @@ class PixieBluetoothRuntime:
     _notify_stop: Callable[[], Any] | None = None
     _notify_remove: Callable[[], None] | None = None
     _char_1912: int | None = None
+    _char_1914: int | None = None
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _reconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
     _reconnect_reason: str | None = None
@@ -182,6 +189,7 @@ class PixieBluetoothRuntime:
     _active_proxy_entry_id: str | None = None
     _active_proxy_title: str | None = None
     _post_connect_scan_task: asyncio.Task[None] | None = None
+    _pending_identity_requests: dict[int, asyncio.Future[PixieBleAdvertisementIdentity]] = field(default_factory=dict)
 
     @property
     def _log_prefix(self) -> str:
@@ -351,8 +359,16 @@ class PixieBluetoothRuntime:
             preferred_reason = "gateway preference"
         elif not self.better_candidate_seen:
             if self.preferred_access_node:
-                preferred_address = self.preferred_access_node
-                preferred_reason = "persisted strongest node"
+                if self._preferred_access_node_allowed(self.preferred_access_node):
+                    preferred_address = self.preferred_access_node
+                    preferred_reason = "selected target" if self.strict_preferred_access_node else "persisted strongest node"
+                else:
+                    scan_fallback_address = self.preferred_access_node
+                    LOGGER.info(
+                        "%sPixie BLE ignored persisted access node outside this home inventory: %s",
+                        self._log_prefix,
+                        self.preferred_access_node,
+                    )
         else:
             scan_fallback_address = self.preferred_access_node
             LOGGER.info(
@@ -385,6 +401,10 @@ class PixieBluetoothRuntime:
                         gateway_address=gateway_address,
                     )
                 except Exception as err:
+                    if self.strict_preferred_access_node and "Invalid login response" in str(err):
+                        raise RuntimeError(
+                            f"Selected Pixie BLE device {preferred_address} rejected the provisioning login"
+                        ) from err
                     LOGGER.debug(
                         "%sPixie BLE cached preferred access-node path failed; falling back to active scan: %s",
                         self._log_prefix,
@@ -395,6 +415,27 @@ class PixieBluetoothRuntime:
                     "%sPixie BLE preferred access-node %s was not in the HA Bluetooth cache; falling back to active scan",
                     self._log_prefix,
                     preferred_address,
+                )
+            if self.strict_preferred_access_node:
+                candidates = await _async_discover_candidates(
+                    self.hass,
+                    preferred_source=self.preferred_source,
+                    preferred_address=preferred_address,
+                    proxies=proxies,
+                    active_scan=True,
+                    scan_duration=self.active_scan_duration,
+                    include_discovered_service_info=True,
+                )
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if _normalize_mac(str(candidate.get("address") or "")) == _normalize_mac(preferred_address)
+                ]
+                if not candidates:
+                    raise RuntimeError(f"Selected Pixie BLE device {preferred_address} was not found during active scan")
+                return await self._try_connect_login_candidates(
+                    self._rank_candidates(candidates),
+                    gateway_address=gateway_address,
                 )
 
         candidates = await _async_discover_candidates(
@@ -464,20 +505,39 @@ class PixieBluetoothRuntime:
     ) -> asyncio.Queue[bytes]:
         """Try candidates in order until one completes the Pixie login flow."""
         last_error: Exception | None = None
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates, start=1):
+            address = candidate.get("address")
+            source = candidate.get("source")
+            rssi = candidate.get("rssi")
+            is_gateway = _normalize_mac(str(address or "")) == _normalize_mac(str(gateway_address or ""))
+            LOGGER.debug(
+                "%sPixie BLE trying candidate %s/%s address=%s source=%s rssi=%s gateway=%s timeout=%.1fs",
+                self._log_prefix,
+                index,
+                len(candidates),
+                address,
+                source,
+                rssi,
+                is_gateway,
+                BLE_CANDIDATE_CONNECT_TIMEOUT_SECONDS,
+            )
             try:
-                return await self._connect_login_enable_candidate(candidate, gateway_address=gateway_address)
+                return await asyncio.wait_for(
+                    self._connect_login_enable_candidate(candidate, gateway_address=gateway_address),
+                    timeout=BLE_CANDIDATE_CONNECT_TIMEOUT_SECONDS,
+                )
             except Exception as err:
                 last_error = err
                 LOGGER.debug(
-                    "%sPixie BLE candidate failed address=%s source=%s rssi=%s: %s",
+                    "%sPixie BLE candidate failed address=%s source=%s rssi=%s gateway=%s; trying next if available: %r",
                     self._log_prefix,
-                    candidate.get("address"),
-                    candidate.get("source"),
-                    candidate.get("rssi"),
+                    address,
+                    source,
+                    rssi,
+                    is_gateway,
                     err,
                 )
-                await self._disconnect_client()
+                await self._disconnect_client(timeout=BLE_FAILED_CANDIDATE_DISCONNECT_TIMEOUT_SECONDS)
         raise RuntimeError(f"No Pixie BLE candidate completed login/notify flow: {last_error}")
 
     def _known_inventory_macs(self) -> set[str]:
@@ -494,6 +554,13 @@ class PixieBluetoothRuntime:
         if gateway_mac:
             macs.add(gateway_mac)
         return macs
+
+    def _preferred_access_node_allowed(self, address: str) -> bool:
+        """Return whether a persisted access-node hint can be tried directly."""
+        known_macs = self._known_inventory_macs()
+        if not known_macs:
+            return True
+        return _normalize_mac(str(address or "")) in known_macs
 
     def _access_node_reply_route_node_id(self) -> int | None:
         """Return the connected access node's Pixie device id for reply routing."""
@@ -676,6 +743,7 @@ class PixieBluetoothRuntime:
             raise RuntimeError(f"Pixie GATT characteristics missing: discovered={sorted(chars)}")
         char_1914_handle = int(getattr(char_1914, "handle"))
         char_1911_handle = int(getattr(char_1911, "handle"))
+        self._char_1914 = char_1914_handle
         self._char_1912 = int(getattr(char_1912, "handle"))
 
         login_pkt, rand_phone = build_login_packet(
@@ -702,9 +770,10 @@ class PixieBluetoothRuntime:
             _notify_handler,
             timeout=10.0,
         )
-        await client.bluetooth_gatt_write(address_int, char_1911_handle, b"\x01", response=True, timeout=20.0)
-        await asyncio.sleep(0.05)
-        await client.bluetooth_gatt_write(address_int, char_1911_handle, b"\x01", response=True, timeout=20.0)
+        if self.send_notify_enable_writes:
+            await client.bluetooth_gatt_write(address_int, char_1911_handle, b"\x01", response=True, timeout=20.0)
+            await asyncio.sleep(0.05)
+            await client.bluetooth_gatt_write(address_int, char_1911_handle, b"\x01", response=True, timeout=20.0)
         if self.send_runtime_sync_on_connect:
             await self._send_runtime_sync_request()
         self.health.enabled = self.enabled
@@ -719,8 +788,16 @@ class PixieBluetoothRuntime:
             self.health.source,
             self._active_candidate_rssi,
         )
-        self._remember_access_node(better_candidate_seen=False)
-        if not (self.access_node_preference == BT_ACCESS_NODE_PREFER_GATEWAY and gateway_address and address == gateway_address):
+        if self.remember_access_node_on_connect:
+            self._remember_access_node(better_candidate_seen=False)
+        if (
+            self.compare_access_node_after_connect
+            and not (
+                self.access_node_preference == BT_ACCESS_NODE_PREFER_GATEWAY
+                and gateway_address
+                and address == gateway_address
+            )
+        ):
             self._schedule_post_connect_comparison_scan()
         return notify_queue
 
@@ -901,6 +978,104 @@ class PixieBluetoothRuntime:
                 if delay:
                     await asyncio.sleep(delay)
 
+    async def async_send_raw_core_hexes(
+        self,
+        device_id: int,
+        raw_hexes: list[str] | tuple[str, ...],
+        *,
+        target: str = "raw_management",
+        delay_after: float = 0.0,
+    ) -> None:
+        """Send captured transport-neutral command cores through the current BLE session."""
+        command_kwargs = {
+            "command_device_id": int(device_id),
+            "command_raw_hexes": tuple(str(item) for item in raw_hexes),
+            "command_raw_target": target,
+            "command_raw_delay": float(delay_after),
+        }
+        await self.async_send_command(command_kwargs)
+
+    async def async_send_plain_1912_hexes(
+        self,
+        plain_hexes: list[str] | tuple[str, ...],
+        *,
+        target: str,
+        delay_after: float = 0.0,
+        response: bool = True,
+    ) -> None:
+        """Encrypt and send exact plaintext 1912 packets without the command planner."""
+        if self._client is None or self._session_key is None or self._device_mac is None or self._char_1912 is None:
+            raise RuntimeError("Pixie BLE session is not ready")
+        async with self._write_lock:
+            for index, plain_hex in enumerate(plain_hexes, start=1):
+                raw = bytes.fromhex("".join(str(plain_hex).split()))
+                encrypted = encrypt_command_packet(self._session_key, self._device_mac, raw)
+                LOGGER.debug(
+                    "%sPixie BLE 1912 direct write target=%s %s/%s plain=%s cipher=%s",
+                    self._log_prefix,
+                    target,
+                    index,
+                    len(plain_hexes),
+                    raw.hex(),
+                    encrypted.hex(),
+                )
+                await self._client.bluetooth_gatt_write(
+                    self._ble_address_int,
+                    self._char_1912,
+                    encrypted,
+                    response=response,
+                    timeout=20.0,
+                )
+                if delay_after:
+                    await asyncio.sleep(delay_after)
+
+    def _encrypt_1914_block(self, command: int, plaintext16: bytes) -> bytes:
+        """Build a 1914 provisioning block using the logged-in session key."""
+        if self._session_key is None:
+            raise RuntimeError("Pixie BLE session key is not available")
+        if len(plaintext16) != 16:
+            raise ValueError(f"1914 provisioning block must be 16 bytes, got {len(plaintext16)}")
+        return bytes([int(command) & 0xFF]) + fn_eacc(self._session_key, plaintext16) + b"\x00\x00\x00"
+
+    async def async_write_provisioning_blocks(
+        self,
+        *,
+        netid: str,
+        mesh_key: bytes = bytes.fromhex("c0c1c2c3c4c5c6c7d8d9dadbdcdddedf"),
+    ) -> None:
+        """Write the captured 1914 provisioning blocks to the connected fresh target."""
+        if self._client is None or self._ble_address_int is None or self._char_1914 is None:
+            raise RuntimeError("Pixie BLE provisioning session is not ready")
+        blocks = (
+            (0x04, PIXIE_DEFAULT_NAME.encode().ljust(16, b"\x00")[:16]),
+            (0x05, str(netid).encode().ljust(16, b"\x00")[:16]),
+            (0x06, bytes(mesh_key).ljust(16, b"\x00")[:16]),
+        )
+        for command, plain in blocks:
+            packet = self._encrypt_1914_block(command, plain)
+            LOGGER.debug(
+                "%sPixie BLE 1914 provisioning write command=0x%02x plain=%s packet=%s",
+                self._log_prefix,
+                command,
+                plain.hex(),
+                packet.hex(),
+            )
+            await self._client.bluetooth_gatt_write(
+                self._ble_address_int,
+                self._char_1914,
+                packet,
+                response=True,
+                timeout=20.0,
+            )
+            await asyncio.sleep(0.15)
+        with suppress(Exception):
+            response = bytes(await self._client.bluetooth_gatt_read(
+                self._ble_address_int,
+                self._char_1914,
+                timeout=5.0,
+            ))
+            LOGGER.debug("%sPixie BLE 1914 provisioning read response=%s", self._log_prefix, response.hex())
+
     def _build_plain_1912_packets(self, command_kwargs: dict[str, Any]) -> list[tuple[bytes, float]]:
         """Build plaintext 1912 command packets from the shared core command plan."""
         builder = self.command_builder
@@ -959,6 +1134,7 @@ class PixieBluetoothRuntime:
         self.mark_update()
         hint = _decode_ble_payload(raw, payload)
         LOGGER.debug("%sPixie BLE notification raw=%s payload=%s hint=%s", self._log_prefix, raw.hex(), payload.hex(), hint)
+        self._resolve_identity_request_from_hint(hint)
         try:
             applied = self._apply_ble_payload_hint(hint)
         except Exception:
@@ -966,6 +1142,44 @@ class PixieBluetoothRuntime:
             return
         if applied and self.inventory is not None and self.inventory_update_callback is not None:
             self.inventory_update_callback(self.inventory)
+
+    def _resolve_identity_request_from_hint(self, hint: dict[str, Any]) -> None:
+        """Resolve a pending one-shot db1102 identity request, if this packet is its reply."""
+        identity = _identity_from_db1102_hint(hint, membership=self.membership)
+        if identity is None:
+            return
+        future = self._pending_identity_requests.get(int(identity.device_id))
+        if future is not None and not future.done():
+            future.set_result(identity)
+
+    async def async_request_identity(self, device_id: int, *, timeout: float = BLE_ONLY_IDENTITY_REPLY_SECONDS) -> PixieBleAdvertisementIdentity | None:
+        """Request and await one db1102 identity response for a logged-in mesh device."""
+        try:
+            target = int(device_id)
+        except (TypeError, ValueError):
+            return None
+        if target <= 0 or target > 255:
+            return None
+        if self._client is None or self._session_key is None or self._device_mac is None or self._char_1912 is None:
+            raise RuntimeError("Pixie BLE session is not ready")
+
+        existing = self._pending_identity_requests.get(target)
+        if existing is not None and not existing.done():
+            with suppress(TimeoutError):
+                return await asyncio.wait_for(asyncio.shield(existing), timeout=max(0.1, float(timeout)))
+            return None
+
+        future: asyncio.Future[PixieBleAdvertisementIdentity] = self.hass.loop.create_future()
+        self._pending_identity_requests[target] = future
+        try:
+            await self._send_identity_request(target)
+            return await asyncio.wait_for(future, timeout=max(0.1, float(timeout)))
+        except TimeoutError:
+            LOGGER.debug("%sPixie BLE identity request timed out target=%s", self._log_prefix, target)
+            return None
+        finally:
+            if self._pending_identity_requests.get(target) is future:
+                self._pending_identity_requests.pop(target, None)
 
     def _apply_ble_payload_hint(self, hint: dict[str, Any]) -> int:
         """Apply decoded BLE notification by feeding the shared runtime parser."""
@@ -987,7 +1201,7 @@ class PixieBluetoothRuntime:
             notify_inventory=False,
         ) or 0)
 
-    async def _disconnect_client(self) -> None:
+    async def _disconnect_client(self, *, timeout: float = 10.0) -> None:
         client = self._client
         address_int = self._ble_address_int
         notify_stop = self._notify_stop
@@ -1001,6 +1215,7 @@ class PixieBluetoothRuntime:
         self._notify_stop = None
         self._notify_remove = None
         self._char_1912 = None
+        self._char_1914 = None
         if client is None:
             return
         if notify_stop is not None:
@@ -1034,9 +1249,17 @@ class PixieBluetoothRuntime:
             )
             return
         try:
-            await client.bluetooth_device_disconnect(address_int, timeout=10.0)
-        except Exception:
-            LOGGER.debug("%sError while disconnecting Pixie BLE client", self._log_prefix, exc_info=True)
+            await client.bluetooth_device_disconnect(address_int, timeout=timeout)
+        except Exception as err:
+            if timeout <= BLE_FAILED_CANDIDATE_DISCONNECT_TIMEOUT_SECONDS:
+                LOGGER.debug(
+                    "%sPixie BLE failed-candidate disconnect did not complete within %.1fs: %r",
+                    self._log_prefix,
+                    timeout,
+                    err,
+                )
+            else:
+                LOGGER.debug("%sError while disconnecting Pixie BLE client", self._log_prefix, exc_info=True)
 
     def mark_update(self) -> None:
         """Record that BLE delivered a usable runtime update."""
@@ -1826,6 +2049,7 @@ def _decode_pixie_identity_manufacturer_block(
             continue
         byte10 = payload[8] if len(payload) >= 9 else None
         membership = payload[9:13].hex() if len(payload) >= 13 else None
+        gateway_mesh_value = payload[13:17].hex() if len(payload) >= 17 else None
         mac = ":".join(f"{byte:02X}" for byte in full_mac)
         adverts.append(PixieBleAdvertisementIdentity(
             mac=mac,
@@ -1835,9 +2059,11 @@ def _decode_pixie_identity_manufacturer_block(
             product_type=product_type,
             product_stype=product_stype,
             membership=membership,
+            gateway_mesh_value=gateway_mesh_value,
             byte10=byte10,
             manufacturer_id=manufacturer_id,
             rssi=rssi,
+            payload_hex=payload.hex(),
         ))
 
     return adverts

@@ -23,7 +23,7 @@ import queue
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Dict, Any, Optional, List, Tuple, Callable, Iterable
 
 # Network constants
 UDP_DISCOVERY_PORT = 41580
@@ -38,12 +38,19 @@ RUNTIME_COMMAND_MIN_GAP_SECONDS = 0.25
 LOCAL_TIMER_RESTART_GUARD_SECONDS = 4.0
 TIMER_STATUS_CORRECTION_DEADBAND_SECONDS = 1.0
 LOCAL_AMBIGUOUS_BLUE_CONFIRM_SECONDS = 8.0
+UNKNOWN_DEVICE_UPDATE_REPLAY_SECONDS = 15.0
 from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 from .pixie_protocol import PixieEnvelope, PixieMessage, PixieCrypto
-from .pixie_inventory import GatewayIdentity, PixieInventory
+from .pixie_inventory import (
+    GatewayIdentity,
+    PixieInventory,
+    supports_outlet_runtime_config,
+    supports_plug_led_settings,
+    supports_sensor_advanced_settings,
+)
 from .pixie_value_profiles import (
     EFFECT_COMMAND_ENCODINGS,
     decode_color_runtime_state_for_capabilities,
@@ -58,10 +65,35 @@ from .pixie_value_profiles import (
     sync_gate_motion_plan,
     gate_can_run_action,
     get_supported_sensor_mode_values_for_capabilities,
+    INDICATOR_LED_OFF_VALUES,
+    INDICATOR_LED_ON_VALUES,
     resolve_cover_command_position,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+GATE_OPEN_DURATION_FIELD_OFFSET_MS = 2000
+GATE_CLOSE_DURATION_FIELD_OFFSET_MS = 1000
+
+
+def _decode_gate_open_duration_ms(field_ms: int) -> int:
+    """Convert the gate open-duration wire field to app/HA display milliseconds."""
+    return max(0, int(field_ms) + GATE_OPEN_DURATION_FIELD_OFFSET_MS)
+
+
+def _decode_gate_close_duration_ms(field_ms: int) -> int:
+    """Convert the gate close-duration wire field to app/HA display milliseconds."""
+    return max(0, int(field_ms) - GATE_CLOSE_DURATION_FIELD_OFFSET_MS)
+
+
+def _encode_gate_open_duration_field_ms(duration_ms: int) -> int:
+    """Convert app/HA gate open-duration milliseconds to the wire field."""
+    return max(0, int(duration_ms) - GATE_OPEN_DURATION_FIELD_OFFSET_MS)
+
+
+def _encode_gate_close_duration_field_ms(duration_ms: int) -> int:
+    """Convert app/HA gate close-duration milliseconds to the wire field."""
+    return max(0, int(duration_ms) + GATE_CLOSE_DURATION_FIELD_OFFSET_MS)
 
 
 # ============================================================================
@@ -671,7 +703,11 @@ class PixieAuthHandler:
         self._cached_cloud_home_obj: Optional[Dict[str, Any]] = None
         self._pending_bulk_ble_updates: List[Dict[str, Any]] = []
         self._pending_bulk_lock = threading.Lock()
+        self._pending_unknown_ble_updates: Dict[int, Dict[str, Any]] = {}
+        self._unknown_ble_updates_hold_until = 0.0
         self._inventory_update_callback: Optional[Callable[[PixieInventory], None]] = None
+        self._config_update_callback: Optional[Callable[[List[int]], None]] = None
+        self._unknown_device_update_callback: Optional[Callable[[int], None]] = None
         self._awaiting_initial_gwdata_bulk = False
 
     def _debug_enabled(self) -> bool:
@@ -729,6 +765,20 @@ class PixieAuthHandler:
         """Register a callback invoked after runtime inventory changes."""
         self._inventory_update_callback = callback
 
+    def set_config_update_callback(
+        self,
+        callback: Optional[Callable[[List[int]], None]],
+    ) -> None:
+        """Register a callback invoked after gateway configuration changes."""
+        self._config_update_callback = callback
+
+    def set_unknown_device_update_callback(
+        self,
+        callback: Optional[Callable[[int], None]],
+    ) -> None:
+        """Register a callback invoked when runtime traffic references an unknown device."""
+        self._unknown_device_update_callback = callback
+
     def _notify_inventory_updated(self) -> None:
         """Notify the integration layer that runtime inventory changed."""
         if self.inventory is None or self._inventory_update_callback is None:
@@ -737,6 +787,95 @@ class PixieAuthHandler:
             self._inventory_update_callback(self.inventory)
         except Exception as exc:
             self._log_debug("Inventory update callback failed: %s", exc)
+
+    def _notify_config_updated(self, conf_index: List[int]) -> None:
+        """Notify the integration layer that gateway configuration changed."""
+        if self._config_update_callback is None:
+            return
+        try:
+            self._config_update_callback(conf_index)
+        except Exception as exc:
+            self._log_debug("Config update callback failed: %s", exc)
+
+    def _notify_unknown_device_update(self, device_id: int) -> None:
+        """Notify the integration layer that an unknown device appeared in runtime traffic."""
+        if self._unknown_device_update_callback is None:
+            return
+        try:
+            self._unknown_device_update_callback(int(device_id))
+        except Exception as exc:
+            self._log_debug("Unknown-device update callback failed: %s", exc)
+
+    def begin_unknown_device_update_hold(self, *, seconds: float = UNKNOWN_DEVICE_UPDATE_REPLAY_SECONDS, reason: str = "") -> None:
+        """Temporarily keep unknown single-device updates during inventory refresh."""
+        until = time.time() + max(0.0, float(seconds))
+        self._unknown_ble_updates_hold_until = max(self._unknown_ble_updates_hold_until, until)
+        self._log_debug(
+            "Replaying recent unknown device updates for %.1fs%s",
+            max(0.0, self._unknown_ble_updates_hold_until - time.time()),
+            f" ({reason})" if reason else "",
+        )
+
+    def _buffer_unknown_device_update(
+        self,
+        dev_id: int,
+        *,
+        ble_hex: str,
+        payload_meta: Dict[str, Any],
+        source: str,
+    ) -> bool:
+        """Remember latest unknown-device update for possible confUpdate replay."""
+        now = time.time()
+        stale_before = now - UNKNOWN_DEVICE_UPDATE_REPLAY_SECONDS
+        for stale_id, pending in list(self._pending_unknown_ble_updates.items()):
+            if float(pending.get("stored_at") or 0.0) < stale_before:
+                self._pending_unknown_ble_updates.pop(stale_id, None)
+        self._pending_unknown_ble_updates[int(dev_id)] = {
+            "ble_hex": ble_hex,
+            "payload_meta": dict(payload_meta or {}),
+            "source": source,
+            "stored_at": now,
+        }
+        if now <= self._unknown_ble_updates_hold_until:
+            self._log_debug(
+                "Buffered unknown dev_id=%s update pending inventory refresh source=%s",
+                dev_id,
+                source,
+            )
+            return True
+        return False
+
+    def replay_unknown_device_updates(self, device_ids: Optional[Iterable[int]] = None) -> int:
+        """Replay buffered unknown-device updates after inventory refresh adds those IDs."""
+        if not self.inventory or not self._pending_unknown_ble_updates:
+            return 0
+        wanted = set(int(device_id) for device_id in device_ids) if device_ids is not None else set(self.inventory.devices_by_id)
+        applied = 0
+        stale_before = time.time() - UNKNOWN_DEVICE_UPDATE_REPLAY_SECONDS
+        replay_ids = [
+            dev_id
+            for dev_id in sorted(self._pending_unknown_ble_updates)
+            if dev_id in wanted and dev_id in self.inventory.devices_by_id
+            and float(self._pending_unknown_ble_updates[dev_id].get("stored_at") or 0.0) >= stale_before
+        ]
+        for dev_id in replay_ids:
+            pending = self._pending_unknown_ble_updates.pop(dev_id, None)
+            if not pending:
+                continue
+            applied += self.apply_bledata_hex(
+                str(pending.get("ble_hex") or ""),
+                payload_meta=dict(pending.get("payload_meta") or {}),
+                source=str(pending.get("source") or "hub_update"),
+                notify_inventory=False,
+            )
+        now = time.time()
+        if now > self._unknown_ble_updates_hold_until:
+            self._pending_unknown_ble_updates.clear()
+            self._unknown_ble_updates_hold_until = 0.0
+        if applied > 0:
+            self._notify_inventory_updated()
+            self._log_debug("Replayed %s buffered unknown device update(s) after inventory refresh", applied)
+        return applied
 
     def _dump_structure_json(self, filename: str, payload: Any) -> None:
         """Write optional debug structure JSON files for offline shape comparison."""
@@ -892,6 +1031,45 @@ class PixieAuthHandler:
             }]
             return decoded
 
+        if len(raw) >= 13 and raw[7:10] in (b"\xfb\x6b\x69", b"\xfc\x6b\x69"):
+            dev_id = int.from_bytes(raw[5:7], byteorder="little")
+            rec = self.inventory.devices_by_id.get(dev_id) if self.inventory else None
+            if rec and rec.capabilities.supports_gate:
+                opcode = raw[7:10]
+                record: Dict[str, Any] = {
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                    "settings_kind": int(opcode[0]),
+                }
+                if opcode == b"\xfb\x6b\x69" and raw[10] == 0x01 and len(raw) >= 13:
+                    width_ds = int(raw[11])
+                    decoded["kind"] = "gate_settings"
+                    decoded["device_id"] = dev_id
+                    record["gate_signal_width_seconds"] = max(1, min(5, round(width_ds / 10)))
+                    decoded["records"] = [record]
+                    return decoded
+                if opcode == b"\xfc\x6b\x69" and raw[10] == 0x01 and len(raw) >= 20:
+                    door_index = int(raw[11])
+                    open_field_ms = int.from_bytes(raw[12:14], byteorder="little")
+                    close_field_ms = int.from_bytes(raw[14:16], byteorder="little")
+                    decoded["kind"] = "gate_settings"
+                    decoded["device_id"] = dev_id
+                    record.update({
+                        "gate_door": door_index,
+                        "gate_open_duration_ms": _decode_gate_open_duration_ms(open_field_ms),
+                        "gate_close_duration_ms": _decode_gate_close_duration_ms(close_field_ms),
+                        "gate_extra1_duration_ms": int.from_bytes(raw[16:18], byteorder="little"),
+                        "gate_extra2_duration_ms": int.from_bytes(raw[18:20], byteorder="little"),
+                    })
+                    decoded["records"] = [record]
+                    return decoded
+
         d3_pos = raw.find(b"\xd3\x69\x69")
         if d3_pos >= 0 and len(raw) >= d3_pos + 10:
             flag_byte = raw[d3_pos + 3]
@@ -939,6 +1117,114 @@ class PixieAuthHandler:
                     return decoded
                 decoded["records"] = [record]
                 return decoded
+            if rec and rec.capabilities.supports_switch_indicator_led and flag_byte == 0x99 and len(raw) >= data_start + 3:
+                block = int(raw[data_start])
+                if block == 0x10:
+                    decoded["kind"] = "indicator_led_settings"
+                    decoded["device_id"] = dev_id
+                    decoded["settings_kind"] = flag_byte
+                    decoded["settings_block"] = block
+                    decoded["records"] = [{
+                        "id": dev_id,
+                        "online": None,
+                        "br_raw": None,
+                        "br": {"type": "single", "raw": None, "pct": None},
+                        "indicator_led_on": int(raw[data_start + 1]),
+                        "indicator_led_off": int(raw[data_start + 2]),
+                        "value_byte": None,
+                        "tail_flag": None,
+                        "is_on_from_tail": None,
+                        "online_value": None,
+                    }]
+                    return decoded
+            if rec and supports_sensor_advanced_settings(rec.capabilities) and flag_byte == 0x94 and len(raw) >= data_start + 9:
+                block = int(raw[data_start])
+                if block == 0x10:
+                    led_code = int(raw[data_start + 2])
+                    decoded["kind"] = "sensor_advanced_settings"
+                    decoded["device_id"] = dev_id
+                    decoded["settings_kind"] = flag_byte
+                    decoded["settings_block"] = block
+                    decoded["records"] = [{
+                        "id": dev_id,
+                        "online": None,
+                        "br_raw": None,
+                        "br": {"type": "single", "raw": None, "pct": None},
+                        "sensor_led_indicator": led_code == 0x12,
+                        "value_byte": None,
+                        "tail_flag": None,
+                        "is_on_from_tail": None,
+                        "online_value": None,
+                    }]
+                    return decoded
+            if rec and supports_plug_led_settings(rec.capabilities) and flag_byte == 0x94 and len(raw) >= data_start + 9:
+                block = int(raw[data_start])
+                marker = int(raw[data_start + 1])
+                if block == 0x10 and marker == 0xFF:
+                    decoded["kind"] = "plug_led_settings"
+                    decoded["device_id"] = dev_id
+                    decoded["settings_kind"] = flag_byte
+                    decoded["settings_block"] = block
+                    decoded["records"] = [{
+                        "id": dev_id,
+                        "online": None,
+                        "br_raw": None,
+                        "br": {"type": "single", "raw": None, "pct": None},
+                        "plug_socket_led_indicator": int(raw[data_start + 2]) == 0x05,
+                        "plug_usb_led_indicator": int(raw[data_start + 5]) == 0xBC,
+                        "value_byte": None,
+                        "tail_flag": None,
+                        "is_on_from_tail": None,
+                        "online_value": None,
+                    }]
+                    return decoded
+            if rec and rec.capabilities.supports_gate and flag_byte in (0xbb, 0xbc, 0xbd):
+                decoded["kind"] = "gate_settings"
+                decoded["device_id"] = dev_id
+                decoded["settings_kind"] = flag_byte
+                record: Dict[str, Any] = {
+                    "id": dev_id,
+                    "online": None,
+                    "br_raw": None,
+                    "br": {"type": "single", "raw": None, "pct": None},
+                    "value_byte": None,
+                    "tail_flag": None,
+                    "is_on_from_tail": None,
+                    "online_value": None,
+                    "settings_kind": flag_byte,
+                }
+                try:
+                    if flag_byte == 0xbb and len(raw) >= data_start + 3 and raw[data_start] == 0x10:
+                        width_ds = int(raw[data_start + 1])
+                        record["gate_signal_width_seconds"] = max(1, min(5, round(width_ds / 10)))
+                    elif flag_byte == 0xbc and len(raw) >= data_start + 9:
+                        door_index = int(raw[data_start])
+                        open_field_ms = int.from_bytes(raw[data_start + 1 : data_start + 3], byteorder="little")
+                        close_field_ms = int.from_bytes(raw[data_start + 3 : data_start + 5], byteorder="little")
+                        record.update({
+                            "gate_door": door_index,
+                            "gate_open_duration_ms": _decode_gate_open_duration_ms(open_field_ms),
+                            "gate_close_duration_ms": _decode_gate_close_duration_ms(close_field_ms),
+                            "gate_extra1_duration_ms": int.from_bytes(raw[data_start + 5 : data_start + 7], byteorder="little"),
+                            "gate_extra2_duration_ms": int.from_bytes(raw[data_start + 7 : data_start + 9], byteorder="little"),
+                        })
+                    elif flag_byte == 0xbd:
+                        decoded["kind"] = "gate_settings_info"
+                        decoded["data_hex"] = raw[data_start:].hex()
+                        decoded["records"] = [record]
+                        return decoded
+                    else:
+                        decoded["kind"] = "d36969"
+                        decoded["flag"] = flag_byte
+                        decoded["data_hex"] = raw[data_start:].hex()
+                        return decoded
+                except Exception:
+                    decoded["kind"] = "d36969"
+                    decoded["flag"] = flag_byte
+                    decoded["data_hex"] = raw[data_start:].hex()
+                    return decoded
+                decoded["records"] = [record]
+                return decoded
             if flag_byte != 0xb9:
                 return None
 
@@ -971,10 +1257,15 @@ class PixieAuthHandler:
                     decoded["brightness_threshold"] = int(raw[data_start + 2])
                     decoded["hold_time_seconds"] = int.from_bytes(raw[data_start + 4 : data_start + 6], byteorder="little")
                     decoded["motion_sensitivity"] = int(raw[data_start + 6])
+                    decoded["learned_brightness_threshold_raw"] = int.from_bytes(
+                        raw[data_start + 7 : data_start + 9],
+                        byteorder="little",
+                    )
                 except Exception:
                     decoded["brightness_threshold"] = None
                     decoded["hold_time_seconds"] = None
                     decoded["motion_sensitivity"] = None
+                    decoded["learned_brightness_threshold_raw"] = None
                 decoded["records"] = [{
                     "id": dev_id,
                     "online": None,
@@ -983,6 +1274,7 @@ class PixieAuthHandler:
                     "hold_time_seconds": decoded.get("hold_time_seconds"),
                     "brightness_threshold": decoded.get("brightness_threshold"),
                     "motion_sensitivity": decoded.get("motion_sensitivity"),
+                    "learned_brightness_threshold_raw": decoded.get("learned_brightness_threshold_raw"),
                     "value_byte": None,
                     "tail_flag": None,
                     "is_on_from_tail": None,
@@ -1248,17 +1540,141 @@ class PixieAuthHandler:
                     hold_time_seconds=decoded.get("hold_time_seconds"),
                     brightness_threshold=decoded.get("brightness_threshold"),
                     motion_sensitivity=decoded.get("motion_sensitivity"),
+                    learned_brightness_threshold_raw=decoded.get("learned_brightness_threshold_raw"),
                 )
                 self._log_debug(
-                    "Sensor params update: dev_id=%s hold=%s bright=%s sens=%s",
+                    "Sensor params update: dev_id=%s hold=%s bright=%s sens=%s learned_raw=%s",
                     dev_id,
                     decoded.get("hold_time_seconds"),
                     decoded.get("brightness_threshold"),
                     decoded.get("motion_sensitivity"),
+                    decoded.get("learned_brightness_threshold_raw"),
                 )
                 if notify_inventory:
                     self._notify_inventory_updated()
                 return 1
+            return 0
+
+        if kind == "sensor_advanced_settings":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    sensor_led_indicator=first.get("sensor_led_indicator"),
+                )
+                self._log_debug(
+                    "Sensor advanced settings update: dev_id=%s led=%s",
+                    dev_id,
+                    first.get("sensor_led_indicator"),
+                )
+                if notify_inventory:
+                    self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "indicator_led_settings":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    indicator_led_on=first.get("indicator_led_on"),
+                    indicator_led_off=first.get("indicator_led_off"),
+                )
+                self._log_debug(
+                    "Indicator LED settings update: dev_id=%s on=%s off=%s",
+                    dev_id,
+                    first.get("indicator_led_on"),
+                    first.get("indicator_led_off"),
+                )
+                if notify_inventory:
+                    self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "plug_led_settings":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            if isinstance(dev_id, int) and dev_id in self.inventory.devices_by_id:
+                self.inventory.apply_device_update(
+                    dev_id,
+                    source=source,
+                    plug_socket_led_indicator=first.get("plug_socket_led_indicator"),
+                    plug_usb_led_indicator=first.get("plug_usb_led_indicator"),
+                )
+                self._log_debug(
+                    "Plug LED settings update: dev_id=%s socket=%s usb=%s",
+                    dev_id,
+                    first.get("plug_socket_led_indicator"),
+                    first.get("plug_usb_led_indicator"),
+                )
+                if notify_inventory:
+                    self._notify_inventory_updated()
+                return 1
+            return 0
+
+        if kind == "gate_settings":
+            if not self.inventory:
+                return 0
+            first = records[0] if records else {}
+            dev_id = first.get("id")
+            if not isinstance(dev_id, int) or dev_id not in self.inventory.devices_by_id:
+                return 0
+            rec = self.inventory.devices_by_id[dev_id]
+            if not rec.capabilities.supports_gate:
+                return 0
+
+            update_kwargs: Dict[str, Any] = {
+                "online": 1,
+                "presence": "online",
+            }
+            if "gate_signal_width_seconds" in first:
+                update_kwargs["gate_signal_width_seconds"] = first.get("gate_signal_width_seconds")
+
+            door_index = first.get("gate_door")
+            if isinstance(door_index, int):
+                if door_index == 0:
+                    update_kwargs["door1_open_duration_ms"] = first.get("gate_open_duration_ms")
+                    update_kwargs["door1_close_duration_ms"] = first.get("gate_close_duration_ms")
+                    update_kwargs["door1_extra1_duration_ms"] = first.get("gate_extra1_duration_ms")
+                    update_kwargs["door1_extra2_duration_ms"] = first.get("gate_extra2_duration_ms")
+                elif door_index == 1 and rec.capabilities.gate_doors >= 2:
+                    update_kwargs["door2_open_duration_ms"] = first.get("gate_open_duration_ms")
+                    update_kwargs["door2_close_duration_ms"] = first.get("gate_close_duration_ms")
+                    update_kwargs["door2_extra1_duration_ms"] = first.get("gate_extra1_duration_ms")
+                    update_kwargs["door2_extra2_duration_ms"] = first.get("gate_extra2_duration_ms")
+
+            self.inventory.apply_device_update(dev_id, source=source, **update_kwargs)
+            self._log_debug(
+                "Gate settings update: dev_id=%s signal_width=%s door=%s open_ms=%s close_ms=%s extra1_ms=%s extra2_ms=%s",
+                dev_id,
+                first.get("gate_signal_width_seconds"),
+                door_index,
+                first.get("gate_open_duration_ms"),
+                first.get("gate_close_duration_ms"),
+                first.get("gate_extra1_duration_ms"),
+                first.get("gate_extra2_duration_ms"),
+            )
+            if notify_inventory:
+                self._notify_inventory_updated()
+            return 1
+
+        if kind == "gate_settings_info":
+            if records:
+                self._log_debug(
+                    "Gate settings edit-info: dev_id=%s data=%s",
+                    records[0].get("id"),
+                    decoded.get("data_hex"),
+                )
             return 0
 
         if kind == "gate_status":
@@ -1355,6 +1771,13 @@ class PixieAuthHandler:
                 continue
             rec = self.inventory.devices_by_id.get(dev_id)
             if not rec:
+                self._buffer_unknown_device_update(
+                    dev_id,
+                    ble_hex=ble_hex,
+                    payload_meta=payload_meta,
+                    source=source,
+                )
+                self._notify_unknown_device_update(dev_id)
                 self._log_debug("Inventory: unknown dev_id=%s (not in inventory)", dev_id)
                 continue
 
@@ -1424,11 +1847,18 @@ class PixieAuthHandler:
                     left_on = bool(interpreted.get("left_on"))
                     right_on = bool(interpreted.get("right_on"))
                     update_kwargs["r"] = 3 if left_on and right_on else 1 if left_on else 2 if right_on else 0
+                    if supports_outlet_runtime_config(rec.capabilities):
+                        update_kwargs["outlet_led_indicator"] = bool(value_byte & 0x10)
+                        if isinstance(tail, int):
+                            update_kwargs["outlet_all_device_control"] = bool(tail & 0x01)
+                            update_kwargs["outlet_child_lock"] = bool(tail & 0x02)
                 elif mode == "plug_with_usb":
                     relay_on = bool(interpreted.get("main_relay_on"))
                     usb_on = bool(interpreted.get("usb_on"))
                     update_kwargs["r"] = (1 if relay_on else 0) | (2 if usb_on else 0)
                     update_kwargs["br"] = 100 if relay_on else 0
+                    if supports_plug_led_settings(rec.capabilities):
+                        update_kwargs["outlet_all_device_control"] = bool(value_byte & 0x08)
                 elif mode == "sensor_controller":
                     mode_value = interpreted.get("mode_value")
                     relay_on = interpreted.get("relay_on")
@@ -1745,7 +2175,14 @@ class PixieAuthHandler:
         command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_param: Optional[str] = None,
+        command_gate_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
+        command_indicator_led_action: Optional[str] = None,
+        command_indicator_led_on: Optional[int] = None,
+        command_indicator_led_off: Optional[int] = None,
+        command_raw_hexes: Optional[Tuple[str, ...]] = None,
+        command_raw_target: Optional[str] = None,
     ) -> PixieRuntimeSession:
         """Start the long-lived 41578 runtime session."""
         runtime_session = PixieRuntimeSession(
@@ -1772,7 +2209,12 @@ class PixieAuthHandler:
                 "command_power_meter_action": command_power_meter_action,
                 "command_sensor_param": command_sensor_param,
                 "command_sensor_param_value": command_sensor_param_value,
+                "command_gate_param": command_gate_param,
+                "command_gate_param_value": command_gate_param_value,
                 "command_gate_door": command_gate_door,
+                "command_indicator_led_action": command_indicator_led_action,
+                "command_indicator_led_on": command_indicator_led_on,
+                "command_indicator_led_off": command_indicator_led_off,
             },
         )
         runtime_session.start()
@@ -1995,7 +2437,12 @@ class PixieAuthHandler:
         command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_param: Optional[str] = None,
+        command_gate_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
+        command_indicator_led_action: Optional[str] = None,
+        command_indicator_led_on: Optional[int] = None,
+        command_indicator_led_off: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = False,
         wait_for_shutdown: bool = False,
@@ -2029,7 +2476,12 @@ class PixieAuthHandler:
             command_power_meter_action=command_power_meter_action,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
+            command_gate_param=command_gate_param,
+            command_gate_param_value=command_gate_param_value,
             command_gate_door=command_gate_door,
+            command_indicator_led_action=command_indicator_led_action,
+            command_indicator_led_on=command_indicator_led_on,
+            command_indicator_led_off=command_indicator_led_off,
             stop_event=stop_event,
             keep_control_alive=keep_control_alive,
             wait_for_shutdown=wait_for_shutdown,
@@ -2131,7 +2583,12 @@ class PixieAuthHandler:
         command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_param: Optional[str] = None,
+        command_gate_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
+        command_indicator_led_action: Optional[str] = None,
+        command_indicator_led_on: Optional[int] = None,
+        command_indicator_led_off: Optional[int] = None,
         stop_event: Optional[threading.Event] = None,
         keep_control_alive: bool = True,
         wait_for_shutdown: bool = True,
@@ -2231,7 +2688,12 @@ class PixieAuthHandler:
                         command_power_meter_action=command_power_meter_action,
                         command_sensor_param=command_sensor_param,
                         command_sensor_param_value=command_sensor_param_value,
+                        command_gate_param=command_gate_param,
+                        command_gate_param_value=command_gate_param_value,
                         command_gate_door=command_gate_door,
+                        command_indicator_led_action=command_indicator_led_action,
+                        command_indicator_led_on=command_indicator_led_on,
+                        command_indicator_led_off=command_indicator_led_off,
                         stop_event=stop_event,
                         keep_control_alive=keep_control_alive,
                         wait_for_shutdown=wait_for_shutdown,
@@ -2274,7 +2736,12 @@ class PixieAuthHandler:
             command_power_meter_action=command_power_meter_action,
             command_sensor_param=command_sensor_param,
             command_sensor_param_value=command_sensor_param_value,
+            command_gate_param=command_gate_param,
+            command_gate_param_value=command_gate_param_value,
             command_gate_door=command_gate_door,
+            command_indicator_led_action=command_indicator_led_action,
+            command_indicator_led_on=command_indicator_led_on,
+            command_indicator_led_off=command_indicator_led_off,
         )
 
         priming_timeout = 5.0
@@ -2294,65 +2761,6 @@ class PixieAuthHandler:
                 sync_timeout=sync_timeout,
                 cloud_home_cached=cloud_home_cached,
             )
-
-        # One-time startup poll for timer devices to populate timer_total_seconds
-        # from the gateway (the device-list seed value may be stale).  Space
-        # requests so the gateway has time to respond to each.
-        if (
-            hydrate_inventory
-            and self.inventory is not None
-            and runtime_session.is_alive()
-        ):
-            for device_id in sorted(self.inventory.devices_by_id):
-                rec = self.inventory.devices_by_id[device_id]
-                if not rec.capabilities.supports_timer:
-                    continue
-                self._log_debug(
-                    "Startup timer poll: dev_id=%s name=%s",
-                    device_id,
-                    rec.name,
-                )
-                try:
-                    runtime_session.send_command({
-                        "command_device_id": device_id,
-                        "command_timer_action": "poll",
-                    })
-                except Exception as exc:
-                    self._log_warning(
-                        "Startup timer poll failed for dev_id=%s: %s",
-                        device_id,
-                        exc,
-                    )
-                time.sleep(0.5)
-
-            # One-time startup poll for sensor devices to populate params
-            for device_id in sorted(self.inventory.devices_by_id):
-                rec = self.inventory.devices_by_id[device_id]
-                if not rec.capabilities.supports_sensor:
-                    continue
-                if not (
-                    rec.capabilities.supports_hold_time
-                    or rec.capabilities.supports_brightness_threshold
-                    or rec.capabilities.supports_motion_sensitivity
-                ):
-                    continue
-                self._log_debug(
-                    "Startup sensor poll: dev_id=%s name=%s",
-                    device_id,
-                    rec.name,
-                )
-                try:
-                    runtime_session.send_command({
-                        "command_device_id": device_id,
-                        "command_timer_action": "poll",
-                    })
-                except Exception as exc:
-                    self._log_warning(
-                        "Startup sensor poll failed for dev_id=%s: %s",
-                        device_id,
-                        exc,
-                    )
-                time.sleep(0.5)
 
         if keep_control_alive and wait_for_shutdown:
             self._log_debug("Control channel remains active on port %s awaiting shutdown", TCP_CONTROL_PORT)
@@ -2396,9 +2804,18 @@ class PixieAuthHandler:
     @staticmethod
     def _build_sync_53216_ea(unix_seconds: int, net_id: int, nonce: int) -> bytes:
         """Build EA wire message: ea + len + nonce + base64(0x01 + AES_CBC(payload))."""
+        return PixieAuthHandler._build_sync_53216_ea_for_payload(
+            unix_seconds,
+            net_id,
+            nonce,
+            b'{"get":{"selected":127}}',
+        )
+
+    @staticmethod
+    def _build_sync_53216_ea_for_payload(unix_seconds: int, net_id: int, nonce: int, plaintext: bytes) -> bytes:
+        """Build EA wire message for an arbitrary 53216 JSON payload."""
         iv = b"0" * 16
         key = PixieAuthHandler._derive_sync_53216_key(unix_seconds, net_id)
-        plaintext = b'{"get":{"selected":127}}'
         ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, 16))
         payload_b64 = base64.b64encode(bytes([0x01]) + ciphertext).decode("ascii")
         wire = f"ea{len(payload_b64):08x}{nonce:08x}{payload_b64}".encode("ascii")
@@ -2647,8 +3064,23 @@ class PixieAuthHandler:
             source=source,
         )
         preserved_versions = self.inventory.preserve_ble_advertised_versions_from(previous_inventory)
+        preserved_gate_settings = self.inventory.preserve_gate_settings_from(previous_inventory)
+        preserved_indicator_led_settings = self.inventory.preserve_indicator_led_settings_from(previous_inventory)
+        preserved_sensor_config_settings = self.inventory.preserve_sensor_config_settings_from(previous_inventory)
+        preserved_plug_config_settings = self.inventory.preserve_plug_config_settings_from(previous_inventory)
         self.gateway_identity = self.inventory.gateway
-        self._log_debug("Built inventory from %s%s", source, f"; preserved {preserved_versions} BLE firmware version(s)" if preserved_versions else "")
+        preserved_parts = []
+        if preserved_versions:
+            preserved_parts.append(f"preserved {preserved_versions} BLE firmware version(s)")
+        if preserved_gate_settings:
+            preserved_parts.append(f"preserved {preserved_gate_settings} gate setting record(s)")
+        if preserved_indicator_led_settings:
+            preserved_parts.append(f"preserved {preserved_indicator_led_settings} indicator LED setting record(s)")
+        if preserved_sensor_config_settings:
+            preserved_parts.append(f"preserved {preserved_sensor_config_settings} sensor config setting record(s)")
+        if preserved_plug_config_settings:
+            preserved_parts.append(f"preserved {preserved_plug_config_settings} plug config setting record(s)")
+        self._log_debug("Built inventory from %s%s", source, f"; {'; '.join(preserved_parts)}" if preserved_parts else "")
         show = self.verbose if show_devices is None else bool(show_devices)
         if show:
             debug_dump = (
@@ -2710,6 +3142,7 @@ class PixieAuthHandler:
         net_id_int: int,
         mesh_net2_int: int,
         timeout: float = 5.0,
+        selected: int = 127,
         force_ts: Optional[int] = None,
         force_nonce: Optional[int] = None,
         force_ea_b64: Optional[str] = None,
@@ -2720,11 +3153,16 @@ class PixieAuthHandler:
         ts = int(force_ts) if force_ts is not None else int(ts_float)
         nonce = int(force_nonce) if force_nonce is not None else self._derive_sync_53216_nonce(ts, mesh_net2_int)
         key_hex = self._derive_sync_53216_key(ts, net_id_int).hex()
+        selected_int = max(0, int(selected))
         if force_ea_b64:
             ea_payload_b64 = "".join(str(force_ea_b64).split())
             ea_wire = f"ea{len(ea_payload_b64):08x}{nonce:08x}{ea_payload_b64}".encode("ascii")
         else:
-            ea_wire = self._build_sync_53216_ea(ts, net_id_int, nonce)
+            plaintext = json.dumps(
+                {"get": {"selected": selected_int}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            ea_wire = self._build_sync_53216_ea_for_payload(ts, net_id_int, nonce, plaintext)
         ea_wire_ascii = ea_wire.decode("ascii", errors="replace")
 
         if debug_mode:
@@ -2736,6 +3174,7 @@ class PixieAuthHandler:
                 "ts_source: forced" if force_ts is not None else "ts_source: current_time",
                 "nonce_source: forced" if force_nonce is not None else "nonce_source: derived_from_ts",
                 "ea_payload_source: forced" if force_ea_b64 else "ea_payload_source: generated",
+                f"selected: {selected_int}",
                 f"key_hex(ts): {key_hex}",
                 f"EA bytes: {len(ea_wire)}",
                 f"EA wire: {ea_wire_ascii}",
@@ -2802,6 +3241,7 @@ class PixieAuthHandler:
             "force_ts": force_ts,
             "force_nonce": force_nonce,
             "force_ea_b64": force_ea_b64,
+            "selected": selected_int,
             "key_hex": key_hex,
             "ea_wire": ea_wire_ascii,
             "eb_raw_ascii": eb_raw.decode("ascii", errors="replace"),
@@ -2820,6 +3260,7 @@ class PixieAuthHandler:
                 f"ts_recv_start: {recv_start_ts}",
                 f"ts_recv_end: {recv_end_ts}",
                 f"nonce_hex: 0x{nonce:08x}",
+                f"selected: {selected_int}",
                 f"payload_sources: {', '.join(label for label, _ in attempts)}",
             ]
             self._log_multiline_debug("53216 decrypt attempt metadata", metadata_lines)
@@ -2924,6 +3365,64 @@ class PixieAuthHandler:
                 json.dump(debug_bundle, fp, ensure_ascii=False, indent=2)
             self._log_debug("Wrote 53216 debug bundle: sync53216_debug_last.json")
         raise PixieAuthError(f"Failed to decrypt EB payload from 53216: {last_err}")
+
+    def send_53216_json(
+        self,
+        hub_ip: str,
+        net_id_int: int,
+        mesh_net2_int: int,
+        payload: Dict[str, Any],
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Send one captured 53216 management JSON payload and return decrypted response."""
+        ts_float = time.time()
+        ts = int(ts_float)
+        nonce = self._derive_sync_53216_nonce(ts, mesh_net2_int)
+        plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ea_wire = self._build_sync_53216_ea_for_payload(ts, net_id_int, nonce, plaintext)
+        if self._debug_enabled():
+            self._log_debug(
+                "53216 management request payload=%s wire_len=%s nonce=0x%08x",
+                plaintext.decode("utf-8", errors="replace"),
+                len(ea_wire),
+                nonce,
+            )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((hub_ip, TCP_SYNC_PORT))
+            sock.sendall(ea_wire)
+            eb_raw, eb_parts, eb_frame_infos = self._read_sync_53216_eb_frames(sock, timeout=timeout)
+
+        if self._debug_enabled():
+            self._log_debug(
+                "53216 management response raw_len=%s parts=%s frames=%s",
+                len(eb_raw),
+                len(eb_parts),
+                eb_frame_infos,
+            )
+        last_err: Exception | None = None
+        timestamp_candidates = (ts, ts - 1, ts + 1, ts - 2, ts + 2)
+        attempts: List[Tuple[str, str]] = []
+        if len(eb_parts) > 1:
+            attempts.append(("concat", "".join(eb_parts)))
+        for i, part in enumerate(eb_parts):
+            attempts.append((f"part[{i}]", part))
+        for label, payload_b64 in attempts:
+            for ts_candidate in timestamp_candidates:
+                try:
+                    data, mode = self._decrypt_sync_53216_eb_payload(ts_candidate, int(net_id_int), payload_b64)
+                    if self._debug_enabled():
+                        self._log_debug(
+                            "53216 management decrypt succeeded source=%s mode=%s ts=%s data=%s",
+                            label,
+                            mode,
+                            ts_candidate,
+                            data,
+                        )
+                    return data if isinstance(data, dict) else {"data": data}
+                except Exception as err:
+                    last_err = err
+        raise PixieAuthError(f"Failed to decrypt 53216 management response: {last_err}")
 
     def _find_meshnet_record(self, api_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Find the best record in LiveGroup response with meshNet/meshNet2/netID."""
@@ -3312,7 +3811,38 @@ class PixieAuthHandler:
         command_power_meter_action = command_kwargs.get("command_power_meter_action")
         command_sensor_param = command_kwargs.get("command_sensor_param")
         command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
+        command_gate_param = command_kwargs.get("command_gate_param")
+        command_gate_param_value = command_kwargs.get("command_gate_param_value")
+        command_indicator_led_action = command_kwargs.get("command_indicator_led_action")
+        command_indicator_led_on = command_kwargs.get("command_indicator_led_on")
+        command_indicator_led_off = command_kwargs.get("command_indicator_led_off")
         command_target = command_kwargs.get("command_target")
+
+        if command_indicator_led_action == "set":
+            return PixieOptimisticUpdateIntent(
+                device_id=device_id,
+                target="indicator_led_settings",
+                value={
+                    "on": command_indicator_led_on,
+                    "off": command_indicator_led_off,
+                },
+            )
+
+        if command_gate_param is not None:
+            target = str(command_gate_param)
+            if target == "signal_width" and command_gate_param_value is not None:
+                return PixieOptimisticUpdateIntent(device_id=device_id, target="gate_signal_width", value=int(command_gate_param_value))
+            if target in {"door_open_duration", "door_close_duration"} and command_gate_param_value is not None:
+                return PixieOptimisticUpdateIntent(
+                    device_id=device_id,
+                    target=f"gate_{target}",
+                    value={
+                        "door": int(command_kwargs.get("command_gate_door") or 0),
+                        "seconds": int(command_gate_param_value),
+                    },
+                )
+            if target == "refresh_settings":
+                return None
 
         if command_sensor_param is not None and command_sensor_param_value is not None:
             target = str(command_sensor_param)
@@ -3453,8 +3983,15 @@ class PixieAuthHandler:
         command_power_meter_action = command_kwargs.get("command_power_meter_action")
         command_sensor_param = command_kwargs.get("command_sensor_param")
         command_sensor_param_value = command_kwargs.get("command_sensor_param_value")
+        command_gate_param = command_kwargs.get("command_gate_param")
+        command_gate_param_value = command_kwargs.get("command_gate_param_value")
         command_gate_door = command_kwargs.get("command_gate_door")
+        command_indicator_led_action = command_kwargs.get("command_indicator_led_action")
+        command_indicator_led_on = command_kwargs.get("command_indicator_led_on")
+        command_indicator_led_off = command_kwargs.get("command_indicator_led_off")
         command_target = command_kwargs.get("command_target")
+        command_raw_hexes = command_kwargs.get("command_raw_hexes")
+        command_raw_target = str(command_kwargs.get("command_raw_target") or "raw")
 
         is_cover_cmd = command_cover_action is not None
         is_effect_cmd = command_effect is not None
@@ -3494,6 +4031,25 @@ class PixieAuthHandler:
             if str(command_effect).strip().lower() not in allowed_effects:
                 raise PixieAuthError(f"Effect '{command_effect}' not allowed for model {rec.model_no}: {allowed_effects}")
 
+        if command_indicator_led_action is not None:
+            action = str(command_indicator_led_action)
+            if action not in {"poll", "set"}:
+                raise PixieAuthError(f"Unsupported indicator LED action: {action}")
+            if action == "poll":
+                if not rec.capabilities.supports_switch_indicator_led and not supports_plug_led_settings(rec.capabilities):
+                    raise PixieAuthError(f"Model {rec.model_no} does not support LED settings")
+            elif not rec.capabilities.supports_switch_indicator_led:
+                raise PixieAuthError(f"Model {rec.model_no} does not support switch indicator LED settings")
+            if action == "set":
+                if command_indicator_led_on is None or command_indicator_led_off is None:
+                    raise PixieAuthError("Both indicator LED values are required")
+                on_value = int(command_indicator_led_on)
+                off_value = int(command_indicator_led_off)
+                if on_value not in INDICATOR_LED_ON_VALUES:
+                    raise PixieAuthError(f"Unsupported indicator LED on value: {on_value}")
+                if off_value not in INDICATOR_LED_OFF_VALUES:
+                    raise PixieAuthError(f"Unsupported indicator LED off value: {off_value}")
+
         def _packet(
             command_hex: str,
             *,
@@ -3508,6 +4064,29 @@ class PixieAuthHandler:
                 delay_after=delay_after,
                 log_message=log_message,
                 log_args=log_args,
+            )
+
+        if command_raw_hexes is not None:
+            packets: list[PixieCoreCommandPacket] = []
+            for index, raw_hex in enumerate(command_raw_hexes):
+                raw = "".join(str(raw_hex).split()).lower()
+                try:
+                    bytes.fromhex(raw)
+                except ValueError as exc:
+                    raise PixieAuthError(f"Invalid raw Pixie command hex: {raw_hex}") from exc
+                packets.append(_packet(
+                    raw,
+                    tcp_repeat=int(command_kwargs.get("command_raw_repeat", 0) or 0),
+                    delay_after=float(command_kwargs.get("command_raw_delay", 0.0) or 0.0),
+                    log_message="Sending raw Pixie management command: device_id=%s target=%s hex=%s",
+                    log_args=(device_id, command_raw_target, raw),
+                ))
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target=command_raw_target,
+                packets=tuple(packets),
+                optimistic_intent=None,
+                result={"target": command_raw_target, "device_id": device_id, "packets": len(packets)},
             )
 
         if command_power_meter_action == "poll":
@@ -3534,6 +4113,137 @@ class PixieAuthHandler:
                 optimistic_intent=optimistic_intent,
                 result={"target": "power_meter_poll", "device_id": device_id},
             )
+
+        if command_indicator_led_action is not None:
+            action = str(command_indicator_led_action)
+            if action == "poll":
+                refresh_target = (
+                    "plug_led_settings_refresh"
+                    if supports_plug_led_settings(rec.capabilities) and not rec.capabilities.supports_switch_indicator_led
+                    else "indicator_led_settings_refresh"
+                )
+                refresh_label = (
+                    "plug LED"
+                    if refresh_target == "plug_led_settings_refresh"
+                    else "indicator LED"
+                )
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target=refresh_target,
+                    packets=(_packet(
+                        (
+                            self._build_plug_led_poll_command_hex(device_id)
+                            if refresh_target == "plug_led_settings_refresh"
+                            else self._build_indicator_led_poll_command_hex(device_id)
+                        ),
+                        tcp_repeat=1,
+                        log_message="Sending %s settings poll: dev_id=%s opcode=d96b69",
+                        log_args=(refresh_label, device_id),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": refresh_target, "device_id": device_id},
+                )
+            on_value = int(command_indicator_led_on)
+            off_value = int(command_indicator_led_off)
+            return PixieCoreCommandPlan(
+                device_id=device_id,
+                target="indicator_led_settings",
+                packets=(_packet(
+                    self._build_indicator_led_set_command_hex(device_id, on_value=on_value, off_value=off_value),
+                    tcp_repeat=1,
+                    log_message="Sending indicator LED settings: dev_id=%s on=%s off=%s opcode=d96b69",
+                    log_args=(device_id, on_value, off_value),
+                ),),
+                optimistic_intent=optimistic_intent,
+                result={"target": "indicator_led_settings", "device_id": device_id},
+            )
+
+        if command_gate_param is not None:
+            if not rec.capabilities.supports_gate:
+                raise PixieAuthError(f"Model {rec.model_no} does not support gate settings")
+            param = str(command_gate_param)
+            door_index = int(command_gate_door) if command_gate_door is not None else 0
+            if door_index < 0 or door_index >= max(1, int(rec.capabilities.gate_doors)):
+                raise PixieAuthError(f"Gate door index out of range: {door_index}")
+            ka = {"counter_attr": "_timer_command_counter", "minimum_counter": 0x01}
+            if param == "refresh_settings":
+                packets = [
+                    _packet(
+                        self._build_shifted_prefix_command_hex(device_id, opcode=b"\xfd\x6b\x69", payload=b"\x10\x00", **ka),
+                        tcp_repeat=1,
+                        delay_after=0.2,
+                        log_message="Gate settings refresh cmd hex: %s",
+                    ),
+                    _packet(
+                        self._build_gate_signal_width_query_command_hex(device_id),
+                        tcp_repeat=1,
+                        delay_after=0.2,
+                        log_message="Gate signal-width query cmd hex: %s",
+                    ),
+                ]
+                for current_door in range(max(1, int(rec.capabilities.gate_doors))):
+                    packets.append(_packet(
+                        self._build_gate_duration_query_command_hex(device_id, current_door),
+                        tcp_repeat=1,
+                        delay_after=0.2,
+                        log_message="Gate duration query cmd hex: %s",
+                    ))
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target="gate_settings_refresh",
+                    packets=tuple(packets),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": "gate_settings_refresh", "device_id": device_id},
+                )
+            if command_gate_param_value is None:
+                raise PixieAuthError(f"Missing value for gate param: {param}")
+            if param == "signal_width":
+                seconds = max(1, min(5, int(command_gate_param_value)))
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target="gate_signal_width",
+                    packets=(_packet(
+                        self._build_gate_signal_width_set_command_hex(device_id, seconds),
+                        tcp_repeat=1,
+                        log_message="Sending gate signal width: dev_id=%s seconds=%s opcode=fb6b69",
+                        log_args=(device_id, seconds),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": "gate_signal_width", "device_id": device_id},
+                )
+            if param in {"door_open_duration", "door_close_duration"}:
+                seconds = max(1, min(60, int(command_gate_param_value)))
+                current_open = rec.runtime.door1_open_duration_ms if door_index == 0 else rec.runtime.door2_open_duration_ms
+                current_close = rec.runtime.door1_close_duration_ms if door_index == 0 else rec.runtime.door2_close_duration_ms
+                if param == "door_open_duration":
+                    open_ms = seconds * 1000
+                    close_ms = current_close
+                else:
+                    open_ms = current_open
+                    close_ms = seconds * 1000
+                if not isinstance(open_ms, int) or not isinstance(close_ms, int):
+                    raise PixieAuthError("Gate durations are not known; refresh gate settings first")
+                extra1_ms = rec.runtime.door1_extra1_duration_ms if door_index == 0 else rec.runtime.door2_extra1_duration_ms
+                extra2_ms = rec.runtime.door1_extra2_duration_ms if door_index == 0 else rec.runtime.door2_extra2_duration_ms
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target=f"gate_{param}",
+                    packets=(_packet(
+                        self._build_gate_duration_set_command_hex(
+                            device_id,
+                            door_index,
+                            open_duration_ms=open_ms,
+                            close_duration_ms=close_ms,
+                            extra1_ms=extra1_ms,
+                            extra2_ms=extra2_ms,
+                        ),
+                        log_message="Sending gate duration: dev_id=%s door=%s param=%s seconds=%s opcode=fc6b69",
+                        log_args=(device_id, door_index + 1, param, seconds),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": f"gate_{param}", "device_id": device_id, "door": door_index},
+                )
+            raise PixieAuthError(f"Unknown gate param: {param}")
 
         if is_cover_cmd and rec.capabilities.supports_gate:
             door_index = int(command_gate_door) if command_gate_door is not None else 0
@@ -3573,6 +4283,21 @@ class PixieAuthHandler:
             )
 
         if command_sensor_param is not None and rec.capabilities.supports_sensor:
+            if str(command_sensor_param) == "advanced_settings":
+                if not supports_sensor_advanced_settings(rec.capabilities):
+                    raise PixieAuthError(f"Model {rec.model_no} does not support advanced sensor settings")
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target="sensor_advanced_settings_refresh",
+                    packets=(_packet(
+                        self._build_sensor_advanced_poll_command_hex(device_id),
+                        tcp_repeat=1,
+                        log_message="Sending sensor advanced settings poll: dev_id=%s opcode=d96b69",
+                        log_args=(device_id,),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": "sensor_advanced_settings_refresh", "device_id": device_id},
+                )
             param_map = {
                 "hold_time": 5,
                 "brightness_threshold": 4,
@@ -3830,6 +4555,70 @@ class PixieAuthHandler:
 
         if command_state is not None:
             effective_target = self._resolve_command_target_for_device(device_id, command_target)
+            if effective_target == "sensor_led_indicator":
+                if not supports_sensor_advanced_settings(rec.capabilities):
+                    raise PixieAuthError(f"Model {rec.model_no} does not support advanced sensor settings")
+                command_hex = self._build_sensor_led_indicator_command_hex(device_id, enabled=bool(command_state))
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target=effective_target,
+                    packets=(_packet(
+                        command_hex,
+                        log_message="Sending sensor config command: device_id=%s target=%s state=%s opcode=ff6969",
+                        log_args=(device_id, effective_target, "on" if command_state else "off"),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": effective_target, "device_id": device_id},
+                )
+            if effective_target in {"plug_socket_led_indicator", "plug_usb_led_indicator"}:
+                if not supports_plug_led_settings(rec.capabilities):
+                    raise PixieAuthError(f"Model {rec.model_no} does not support plug LED settings")
+                command_hex = self._build_plug_led_indicator_command_hex(
+                    device_id,
+                    target=effective_target,
+                    enabled=bool(command_state),
+                    current_socket_enabled=rec.runtime.plug_socket_led_indicator,
+                    current_usb_enabled=rec.runtime.plug_usb_led_indicator,
+                )
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target=effective_target,
+                    packets=(_packet(
+                        command_hex,
+                        log_message="Sending plug LED config command: device_id=%s target=%s state=%s opcode=ff6969",
+                        log_args=(device_id, effective_target, "on" if command_state else "off"),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": effective_target, "device_id": device_id},
+                )
+            if effective_target in {"outlet_led_indicator", "outlet_all_device_control", "outlet_child_lock"}:
+                supports_config_target = supports_outlet_runtime_config(rec.capabilities) or (
+                    effective_target == "outlet_all_device_control"
+                    and supports_plug_led_settings(rec.capabilities)
+                )
+                if not supports_config_target:
+                    raise PixieAuthError(f"Model {rec.model_no} does not support outlet configuration commands")
+                if effective_target == "outlet_led_indicator":
+                    command_hex = self._build_outlet_led_indicator_command_hex(device_id, enabled=bool(command_state))
+                    opcode_name = "ff6969"
+                else:
+                    command_hex = self._build_outlet_control_flag_command_hex(
+                        device_id,
+                        target=effective_target,
+                        enabled=bool(command_state),
+                    )
+                    opcode_name = "fe6b69"
+                return PixieCoreCommandPlan(
+                    device_id=device_id,
+                    target=effective_target,
+                    packets=(_packet(
+                        command_hex,
+                        log_message="Sending outlet config command: device_id=%s target=%s state=%s opcode=%s",
+                        log_args=(device_id, effective_target, "on" if command_state else "off", opcode_name),
+                    ),),
+                    optimistic_intent=optimistic_intent,
+                    result={"target": effective_target, "device_id": device_id},
+                )
             if rec.capabilities.supports_sensor and effective_target == "relay":
                 command_hex = self._build_mode_command_hex(device_id, mode=0, relay=1 if bool(command_state) else 0)
                 log_args = (device_id, "relay/main", "on" if command_state else "off", "c16969", 0)
@@ -3967,6 +4756,32 @@ class PixieAuthHandler:
             update_kwargs["brightness_threshold"] = int(value) if value is not None else None
         elif target == "motion_sensitivity":
             update_kwargs["motion_sensitivity"] = int(value) if value is not None else None
+        elif target == "sensor_led_indicator":
+            update_kwargs["sensor_led_indicator"] = bool(value)
+        elif target == "indicator_led_settings":
+            if isinstance(value, dict):
+                update_kwargs["indicator_led_on"] = value.get("on")
+                update_kwargs["indicator_led_off"] = value.get("off")
+        elif target == "outlet_led_indicator":
+            update_kwargs["outlet_led_indicator"] = bool(value)
+        elif target == "outlet_all_device_control":
+            update_kwargs["outlet_all_device_control"] = bool(value)
+        elif target == "outlet_child_lock":
+            update_kwargs["outlet_child_lock"] = bool(value)
+        elif target == "plug_socket_led_indicator":
+            update_kwargs["plug_socket_led_indicator"] = bool(value)
+        elif target == "plug_usb_led_indicator":
+            update_kwargs["plug_usb_led_indicator"] = bool(value)
+        elif target == "gate_signal_width":
+            update_kwargs["gate_signal_width_seconds"] = int(value) if value is not None else None
+        elif target in {"gate_door_open_duration", "gate_door_close_duration"}:
+            if isinstance(value, dict):
+                door_index = int(value.get("door") or 0)
+                duration_ms = int(value.get("seconds") or 0) * 1000
+                if target == "gate_door_open_duration":
+                    update_kwargs["door1_open_duration_ms" if door_index == 0 else "door2_open_duration_ms"] = duration_ms
+                else:
+                    update_kwargs["door1_close_duration_ms" if door_index == 0 else "door2_close_duration_ms"] = duration_ms
         elif target == "timer_poll_stamp":
             import time as _time
             update_kwargs["last_timer_poll_requested_at"] = _time.time()
@@ -4130,7 +4945,12 @@ class PixieAuthHandler:
         command_power_meter_action: Optional[str] = None,
         command_sensor_param: Optional[str] = None,
         command_sensor_param_value: Optional[int] = None,
+        command_gate_param: Optional[str] = None,
+        command_gate_param_value: Optional[int] = None,
         command_gate_door: Optional[int] = None,
+        command_indicator_led_action: Optional[str] = None,
+        command_indicator_led_on: Optional[int] = None,
+        command_indicator_led_off: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Perform full client-mode TCP handshake sequence (matches Java app flow).
@@ -4332,6 +5152,31 @@ class PixieAuthHandler:
                 queue_bulk=decoded.get("kind") == "bulk",
             )
 
+        def _apply_conf_update(parsed: Dict[str, Any]) -> None:
+            """Apply gateway configuration-change notifications."""
+            payload = parsed.get("json")
+            if not isinstance(payload, dict):
+                return
+
+            data = payload.get("data")
+            if not isinstance(data, dict) or data.get("type") != "confUpdate":
+                return
+
+            raw_conf_index = data.get("confIndex")
+            if not isinstance(raw_conf_index, list):
+                self._log_debug("Gateway confUpdate ignored without confIndex: %s", data)
+                return
+
+            conf_index: List[int] = []
+            for value in raw_conf_index:
+                try:
+                    conf_index.append(int(value))
+                except (TypeError, ValueError):
+                    self._log_debug("Gateway confUpdate ignored with invalid confIndex: %s", raw_conf_index)
+                    return
+            self._log_debug("Gateway confUpdate received confIndex=%s", conf_index)
+            self._notify_config_updated(conf_index)
+
         def _send_requested_local_command(
             *,
             command_device_id: int,
@@ -4350,7 +5195,16 @@ class PixieAuthHandler:
             command_power_meter_action: Optional[str] = None,
             command_sensor_param: Optional[str] = None,
             command_sensor_param_value: Optional[int] = None,
+            command_gate_param: Optional[str] = None,
+            command_gate_param_value: Optional[int] = None,
             command_gate_door: Optional[int] = None,
+            command_indicator_led_action: Optional[str] = None,
+            command_indicator_led_on: Optional[int] = None,
+            command_indicator_led_off: Optional[int] = None,
+            command_raw_hexes: Optional[Tuple[str, ...]] = None,
+            command_raw_target: Optional[str] = None,
+            command_raw_repeat: int = 0,
+            command_raw_delay: float = 0.0,
         ) -> Dict[str, Any]:
             """Send one local command on the already-authenticated TCP socket."""
             if not readiness["ready_signaled"]:
@@ -4398,7 +5252,16 @@ class PixieAuthHandler:
                 "command_power_meter_action": command_power_meter_action,
                 "command_sensor_param": command_sensor_param,
                 "command_sensor_param_value": command_sensor_param_value,
+                "command_gate_param": command_gate_param,
+                "command_gate_param_value": command_gate_param_value,
                 "command_gate_door": command_gate_door,
+                "command_indicator_led_action": command_indicator_led_action,
+                "command_indicator_led_on": command_indicator_led_on,
+                "command_indicator_led_off": command_indicator_led_off,
+                "command_raw_hexes": command_raw_hexes,
+                "command_raw_target": command_raw_target,
+                "command_raw_repeat": command_raw_repeat,
+                "command_raw_delay": command_raw_delay,
             }
             plan = self.build_core_command_plan(command_kwargs)
 
@@ -4567,6 +5430,7 @@ class PixieAuthHandler:
 
                 if route == "device_or_control_update":
                     _apply_flag1_update(parsed)
+                    _apply_conf_update(parsed)
                 processed += 1
 
             return processed
@@ -4716,6 +5580,7 @@ class PixieAuthHandler:
                         command_timer_action,
                         command_power_meter_action,
                         command_sensor_param,
+                        command_indicator_led_action,
                     )
                 )
                 if command_device_id is not None and has_any_command:
@@ -4737,7 +5602,16 @@ class PixieAuthHandler:
                             command_power_meter_action=command_power_meter_action,
                             command_sensor_param=command_sensor_param,
                             command_sensor_param_value=command_sensor_param_value,
+                            command_gate_param=command_gate_param,
+                            command_gate_param_value=command_gate_param_value,
                             command_gate_door=command_gate_door,
+                            command_indicator_led_action=command_indicator_led_action,
+                            command_indicator_led_on=command_indicator_led_on,
+                            command_indicator_led_off=command_indicator_led_off,
+                            command_raw_hexes=command_raw_hexes,
+                            command_raw_target=command_raw_target,
+                            command_raw_repeat=command_raw_repeat,
+                            command_raw_delay=command_raw_delay,
                         )
                     except Exception as exc:
                         self._log_warning("Local command not sent: %s", exc)
@@ -4934,6 +5808,71 @@ class PixieAuthHandler:
         payload = state_byte + selector_byte + (b"\x00" * 8)
         packet = sequence + src_bytes + dst_bytes + bytes([int(opcode) & 0xFF, 0x69, 0x69]) + payload
         return packet.hex()
+
+    def _build_outlet_led_indicator_command_hex(self, destination_id: int, *, enabled: bool) -> str:
+        """Build captured 0208 LED indicator command using opcode ff6969."""
+        payload = (b"\xff" if enabled else b"\x00") + (b"\x00" * 9)
+        return self._build_shifted_prefix_command_hex(
+            destination_id,
+            opcode=b"\xff\x69\x69",
+            payload=payload,
+            counter_attr="_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_outlet_control_flag_command_hex(self, destination_id: int, *, target: str, enabled: bool) -> str:
+        """Build captured 0208 all-device-control/child-lock command using opcode fe6b69."""
+        if target == "outlet_all_device_control":
+            payload_value = 0x01 if enabled else 0x00
+        elif target == "outlet_child_lock":
+            payload_value = 0x03 if enabled else 0x02
+        else:
+            raise PixieAuthError(f"Unsupported outlet config target: {target}")
+        return self._build_shifted_prefix_command_hex(
+            destination_id,
+            opcode=b"\xfe\x6b\x69",
+            payload=bytes([payload_value]),
+            counter_attr="_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_plug_led_indicator_command_hex(
+        self,
+        destination_id: int,
+        *,
+        target: str,
+        enabled: bool,
+        current_socket_enabled: Optional[bool],
+        current_usb_enabled: Optional[bool],
+    ) -> str:
+        """Build captured 0107 socket/USB LED settings block using opcode ff6969."""
+        socket_enabled = bool(current_socket_enabled) if current_socket_enabled is not None else True
+        usb_enabled = bool(current_usb_enabled) if current_usb_enabled is not None else True
+        if target == "plug_socket_led_indicator":
+            socket_enabled = bool(enabled)
+        elif target == "plug_usb_led_indicator":
+            usb_enabled = bool(enabled)
+        else:
+            raise PixieAuthError(f"Unsupported plug LED target: {target}")
+        payload = bytes([
+            0xFF,
+            0x05 if socket_enabled else 0x00,
+            0x00,
+            0x00,
+            0xBC if usb_enabled else 0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ])
+        return self._build_shifted_prefix_command_hex(
+            destination_id,
+            opcode=b"\xff\x69\x69",
+            payload=payload,
+            counter_attr="_command_counter",
+            minimum_counter=0x01,
+        )
 
     def _build_0107_usb_command_hex(self, destination_id: int, *, is_on: bool) -> str:
         """Build 0107 USB command for direct local TCP test using state bytes 0x08/0x0c.
@@ -5205,6 +6144,70 @@ class PixieAuthHandler:
             minimum_counter=0x01,
         )
 
+    def _build_gate_signal_width_query_command_hex(self, device_id: int) -> str:
+        """Build fb6b69 gate signal-width query command."""
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xfb\x6b\x69",
+            payload=b"\x00\x00\x00",
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_gate_signal_width_set_command_hex(self, device_id: int, seconds: int) -> str:
+        """Build fb6b69 gate signal-width set command."""
+        width_ds = max(10, min(50, int(seconds) * 10))
+        payload = b"\x01" + bytes([width_ds, width_ds])
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xfb\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_gate_duration_query_command_hex(self, device_id: int, door_index: int) -> str:
+        """Build fc6b69 gate duration query command for one door."""
+        payload = b"\x00" + bytes([int(door_index) & 0xFF]) + b"\x00" * 8
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xfc\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_gate_duration_set_command_hex(
+        self,
+        device_id: int,
+        door_index: int,
+        *,
+        open_duration_ms: int,
+        close_duration_ms: int,
+        extra1_ms: Optional[int],
+        extra2_ms: Optional[int],
+    ) -> str:
+        """Build fc6b69 gate duration set command for one door."""
+        open_field_ms = _encode_gate_open_duration_field_ms(open_duration_ms)
+        close_field_ms = _encode_gate_close_duration_field_ms(close_duration_ms)
+        extra1 = 3000 if extra1_ms is None else max(0, int(extra1_ms))
+        extra2 = 3000 if extra2_ms is None else max(0, int(extra2_ms))
+        payload = (
+            b"\x01"
+            + bytes([int(door_index) & 0xFF])
+            + int(open_field_ms).to_bytes(2, byteorder="little", signed=False)
+            + int(close_field_ms).to_bytes(2, byteorder="little", signed=False)
+            + int(extra1).to_bytes(2, byteorder="little", signed=False)
+            + int(extra2).to_bytes(2, byteorder="little", signed=False)
+        )
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xfc\x6b\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
     # ------------------------------------------------------------------
     # Sensor (3001/3002) parameter commands
     # ------------------------------------------------------------------
@@ -5230,6 +6233,58 @@ class PixieAuthHandler:
         return self._build_shifted_prefix_command_hex(
             device_id,
             opcode=b"\xd2\x6c\x69",
+            payload=payload,
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_sensor_advanced_poll_command_hex(self, device_id: int) -> str:
+        """Build the captured sensor LED settings poll."""
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xd9\x6b\x69",
+            payload=b"\x77\x00",
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_sensor_led_indicator_command_hex(self, device_id: int, *, enabled: bool) -> str:
+        """Build the captured sensor LED indicator command."""
+        payload = (b"\xa0\x12" if enabled else b"\xa0\x00") + b"\x00" * 8
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xff\x69\x69",
+            payload=payload,
+            counter_attr="_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_indicator_led_poll_command_hex(self, device_id: int) -> str:
+        """Build the d96b69 switch indicator LED settings poll."""
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xd9\x6b\x69",
+            payload=b"\x00\x00\x00",
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_plug_led_poll_command_hex(self, device_id: int) -> str:
+        """Build the captured 0107 socket/USB LED settings poll."""
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xd9\x6b\x69",
+            payload=b"\x77\x00",
+            counter_attr="_timer_command_counter",
+            minimum_counter=0x01,
+        )
+
+    def _build_indicator_led_set_command_hex(self, device_id: int, *, on_value: int, off_value: int) -> str:
+        """Build the d96b69 switch indicator LED settings command."""
+        payload = bytes([int(on_value), int(off_value), 0x01])
+        return self._build_shifted_prefix_command_hex(
+            device_id,
+            opcode=b"\xd9\x6b\x69",
             payload=payload,
             counter_attr="_timer_command_counter",
             minimum_counter=0x01,

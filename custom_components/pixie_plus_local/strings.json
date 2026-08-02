@@ -25,6 +25,11 @@
           "pixie_pin": "Pixie PIN"
         }
       },
+      "ble_only_create_modes": {
+        "title": "Choose device mode",
+        "description": "Choose the required setup mode for the selected Pixie device.",
+        "data": {}
+      },
       "home": {
         "title": "Choose Pixie home",
         "description": "Choose which Pixie home to add to Home Assistant{finish_text}.",
@@ -160,12 +165,25 @@
         "menu_options": {
           "transport": "Bluetooth settings",
           "update_device_versions": "Update device versions",
+          "ha_name_sync": "Device name sync",
           "cover_controller": "Blind mapping"
+        }
+      },
+      "ha_name_sync": {
+        "title": "Device name sync",
+        "description": "Choose whether Home Assistant device name changes should also rename the device in the Pixie app. Entity name changes are not synced.",
+        "data": {
+          "sync_ha_device_names": "Sync HA device name changes to Pixie"
         }
       },
       "update_device_versions": {
         "title": "Update device versions",
         "description": "Scan briefly for Pixie Bluetooth advertisements and update device firmware versions when the devices report a newer value.",
+        "data": {}
+      },
+      "add_device_modes": {
+        "title": "Choose device mode",
+        "description": "Choose the required setup mode for the selected Pixie device.",
         "data": {}
       },
       "transport": {

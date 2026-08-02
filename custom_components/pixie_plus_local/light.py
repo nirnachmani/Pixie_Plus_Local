@@ -14,15 +14,19 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from . import (
+from .pixie_const import (
     DOMAIN,
+)
+from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
+    device_added_signal,
     endpoint_unique_identifier,
     parent_device_identifier,
     physical_device_identifier,
@@ -69,12 +73,14 @@ def _kelvin_to_raw_cct(kelvin: int, min_kelvin: int, max_kelvin: int, raw_min: i
     return int(round(raw_min + ((raw_max - raw_min) * fraction)))
 
 
-def _iter_light_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_light_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return light endpoints from inventory."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         if not record.capabilities.is_light:
             continue
         endpoints.append(
@@ -104,6 +110,17 @@ async def async_setup_entry(
         return
 
     async_add_entities(PixiePlusLightEntity(runtime_data, endpoint) for endpoint in _iter_light_endpoints(inventory))
+
+    @callback
+    def _async_add_device_entities(device_id: int) -> None:
+        current_inventory = runtime_data.pixie_runtime.inventory
+        if current_inventory is None:
+            return
+        endpoints = _iter_light_endpoints(current_inventory, device_id=int(device_id))
+        if endpoints:
+            async_add_entities(PixiePlusLightEntity(runtime_data, endpoint) for endpoint in endpoints)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, device_added_signal(entry), _async_add_device_entities))
 
 
 class PixiePlusLightEntity(PixiePlusCoordinatorEntity, LightEntity):

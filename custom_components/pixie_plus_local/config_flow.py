@@ -17,12 +17,15 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
 )
 
-from . import (
+from .pixie_const import (
     CONF_BLE_MEMBERSHIP,
     CONF_BLE_INVENTORY,
     CONF_GATEWAY_IP,
@@ -38,6 +41,7 @@ from . import (
     CONF_PIXIE_PIN,
     CONF_PIXIE_USERNAME,
     CONF_USER_ID,
+    CONF_SYNC_HA_DEVICE_NAMES,
     CONF_BT_ACCESS_NODE,
     CONF_BT_BETTER_CANDIDATE_SEEN,
     CONF_BT_ENABLED,
@@ -57,6 +61,8 @@ from . import (
     COMMAND_TRANSPORT_TCP_PRIMARY,
     BT_ACCESS_NODE_AUTO,
     BT_ACCESS_NODE_PREFER_GATEWAY,
+)
+from .pixie_ha import (
     _async_delete_missing_credentials_issue,
     _async_delete_gateway_ip_issue,
     _async_run_global_ble_version_scan,
@@ -73,6 +79,10 @@ from .pixie_ble import (
     hash_mesh_id_to_broadcast,
 )
 from .pixie_inventory import PixieInventory
+from .pixie_provisioning import (
+    async_create_ble_only_home_from_devices,
+    async_scan_addable_pixie_devices,
+)
 from .pixie_runtime import (
     CloudHomeList,
     CloudParams,
@@ -107,9 +117,24 @@ CONF_ALLOW_FINISH_SETUP = "_allow_finish_setup"
 CONF_ENABLE_BT = "enable_bt"
 CONF_ENABLE_BT_LABEL = "Enable Bluetooth support (requires ESPHome Bluetooth proxy)"
 CONF_CLEAR_BLUETOOTH_ACCESS_NODE = "clear_bluetooth_access_node"
+CONF_SCAN_AGAIN = "scan_again"
+
+
+def _candidate_post_add_mode_selection(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return a candidate's post-add mode-selection profile, if one applies."""
+    selection = candidate.get("post_add_mode_selection")
+    return selection if isinstance(selection, dict) and selection.get("choices") else {}
+
+
+def _candidate_requires_post_add_mode(candidate: dict[str, Any]) -> bool:
+    """Return True when a selected candidate needs a mandatory post-add mode."""
+    return bool(_candidate_post_add_mode_selection(candidate))
 CONF_SETUP_PATH = "setup_path"
 CONF_SETUP_PATH_GATEWAY = "gateway"
 CONF_SETUP_PATH_BLE_ONLY = "ble_only"
+CONF_BLE_ONLY_HOME_MODE = "ble_only_home_mode"
+CONF_BLE_ONLY_HOME_MODE_EXISTING = "existing"
+CONF_BLE_ONLY_HOME_MODE_CREATE = "create"
 FINISH_SETUP_VALUE = "__finish_setup__"
 BLE_ONLY_SETUP_VALUE = "__ble_only__"
 BT_INSTALL_PROBE_TIMEOUT = 75.0
@@ -126,6 +151,63 @@ def _enable_bt_from_user_input(user_input: dict[str, Any]) -> bool:
 def _bluetooth_data_schema(*, default: bool) -> vol.Schema:
     """Build a Bluetooth form schema with a readable fallback field label."""
     return vol.Schema({vol.Required(CONF_ENABLE_BT_LABEL, default=default): bool})
+
+
+def _add_device_select_schema(
+    candidates: list[dict[str, Any]],
+    *,
+    default_scan_again: bool = False,
+) -> vol.Schema:
+    """Build the multi-select schema for addable Pixie devices."""
+    options = [
+        {"value": str(candidate["key"]), "label": str(candidate["label"])}
+        for candidate in candidates
+    ]
+    fields: dict[Any, Any] = {}
+    if options:
+        fields[vol.Optional("devices", default=[])] = SelectSelector(
+            SelectSelectorConfig(
+                options=options,
+                multiple=True,
+                mode=SelectSelectorMode.LIST,
+            )
+        )
+    fields[vol.Optional(CONF_SCAN_AGAIN, default=default_scan_again)] = bool
+    return vol.Schema(fields)
+
+
+def _add_device_post_add_mode_schema(
+    candidates: list[dict[str, Any]],
+    field_map: dict[str, str],
+) -> vol.Schema:
+    """Build the mandatory mode-selection schema for selected add-device candidates."""
+    fields: dict[Any, Any] = {}
+    used_labels: set[str] = set()
+    for candidate in candidates:
+        selection = _candidate_post_add_mode_selection(candidate)
+        if not selection:
+            continue
+        base_label = str(selection.get("title") or "Mode")
+        if sum(1 for item in candidates if _candidate_post_add_mode_selection(item)) > 1:
+            base_label = f"{candidate.get('label') or 'Pixie device'} {base_label}".strip()
+        label = base_label
+        suffix = 2
+        while label in used_labels:
+            label = f"{base_label} {suffix}"
+            suffix += 1
+        used_labels.add(label)
+        field_map[label] = str(candidate["key"])
+        options = [
+            {"value": str(choice["value"]), "label": str(choice.get("label") or choice["value"])}
+            for choice in selection.get("choices") or []
+        ]
+        fields[vol.Required(label, default=str(selection.get("default") or options[0]["value"]))] = SelectSelector(
+            SelectSelectorConfig(
+                options=options,
+                mode=SelectSelectorMode.LIST,
+            )
+        )
+    return vol.Schema(fields)
 
 
 def _flow_home_log_prefix(data: dict[str, Any] | None, fallback: str | None = None) -> str:
@@ -735,6 +817,15 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         self._available_homes: list[dict[str, Any]] = []
         self._exclude_home_ids: set[str] = set()
         self._allow_finish_setup = False
+        self._ble_only_home_name: str | None = None
+        self._ble_only_pin: str | None = None
+        self._ble_only_membership: str | None = None
+        self._ble_only_create_candidates: list[dict[str, Any]] = []
+        self._ble_only_create_pending_chosen: list[dict[str, Any]] = []
+        self._ble_only_create_mode_field_map: dict[str, str] = {}
+        self._ble_only_create_scan_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        self._ble_only_create_add_task: asyncio.Task[Any] | None = None
+        self._ble_only_create_error: str | None = None
 
     async def _async_finish_validated_setup(self):
         """Continue to the remaining setup steps after validation succeeds."""
@@ -920,6 +1011,7 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             home_name = str(user_input.get(CONF_HOME_NAME) or "").strip()
             pin = str(user_input.get(CONF_PIXIE_PIN) or "").strip()
+            mode = str(user_input.get(CONF_BLE_ONLY_HOME_MODE) or CONF_BLE_ONLY_HOME_MODE_EXISTING)
             if not home_name:
                 errors[CONF_HOME_NAME] = "required"
             if not pin:
@@ -927,6 +1019,16 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             if not errors:
                 try:
                     membership = hash_mesh_id_to_broadcast(pin)
+                    home_id = f"pixie_ble:{membership}"
+                    if home_id in self._configured_home_ids():
+                        return self.async_abort(reason="already_configured")
+                    if mode == CONF_BLE_ONLY_HOME_MODE_CREATE:
+                        self._ble_only_home_name = home_name
+                        self._ble_only_pin = pin
+                        self._ble_only_membership = membership
+                        self._ble_only_create_candidates = []
+                        self._ble_only_create_error = None
+                        return self._start_ble_only_create_scan()
                     LOGGER.info(
                         "[%s] Pixie BLE-only setup connecting to mesh for login validation",
                         home_name,
@@ -952,9 +1054,196 @@ class PixiePlusLocalConfigFlow(ConfigFlow, domain=DOMAIN):
             {
                 vol.Required(CONF_HOME_NAME): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
                 vol.Required(CONF_PIXIE_PIN): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+                vol.Required(CONF_BLE_ONLY_HOME_MODE, default=CONF_BLE_ONLY_HOME_MODE_EXISTING): vol.In(
+                    {
+                        CONF_BLE_ONLY_HOME_MODE_EXISTING: "Add existing home",
+                        CONF_BLE_ONLY_HOME_MODE_CREATE: "Create new home",
+                    }
+                ),
             }
         )
         return self.async_show_form(step_id="ble_only", data_schema=data_schema, errors=errors)
+
+    def _start_ble_only_create_scan(self):
+        """Start scanning for fresh devices for a new BLE-only home."""
+        home_name = self._ble_only_home_name or "Pixie"
+        membership = self._ble_only_membership or ""
+        inventory = PixieInventory.from_ble_advertisements([], home_name=home_name, membership=membership)
+        log_prefix = f"[{home_name}] " if home_name else ""
+        self._ble_only_create_scan_task = self.hass.async_create_task(
+            async_scan_addable_pixie_devices(self.hass, inventory, log_prefix=log_prefix)
+        )
+        return self.async_show_progress(
+            step_id="ble_only_create_scan",
+            progress_action="scanning_for_pixie_devices",
+            progress_task=self._ble_only_create_scan_task,
+        )
+
+    def _start_ble_only_create_add(self, chosen: list[dict[str, Any]]):
+        """Start provisioning selected devices for a new BLE-only home."""
+        self._ble_only_create_add_task = self.hass.async_create_task(
+            self._async_create_ble_only_home_task(chosen)
+        )
+        return self.async_show_progress(
+            step_id="ble_only_create_add",
+            progress_action="adding_pixie_devices",
+            progress_task=self._ble_only_create_add_task,
+        )
+
+    async def _async_create_ble_only_home_task(self, chosen: list[dict[str, Any]]) -> Any:
+        """Provision a new BLE-only home without leaking task exceptions to HA."""
+        try:
+            home_name = self._ble_only_home_name or "Pixie"
+            pin = self._ble_only_pin or ""
+            membership = self._ble_only_membership or hash_mesh_id_to_broadcast(pin)
+            cloud_params = _ble_only_cloud_params(home_name=home_name, membership=membership, pin=pin)
+            return await async_create_ble_only_home_from_devices(
+                self.hass,
+                home_name=home_name,
+                pin=pin,
+                membership=membership,
+                cloud_params=cloud_params,
+                candidates=chosen,
+            )
+        except Exception as err:
+            LOGGER.exception("Pixie BLE-only new-home provisioning failed")
+            return err
+
+    async def async_step_ble_only_create_scan(self, user_input: dict[str, Any] | None = None):
+        """Wait for new BLE-only home scan completion."""
+        if self._ble_only_create_scan_task is None:
+            return self._start_ble_only_create_scan()
+        if not self._ble_only_create_scan_task.done():
+            return self.async_show_progress(
+                step_id="ble_only_create_scan",
+                progress_action="scanning_for_pixie_devices",
+                progress_task=self._ble_only_create_scan_task,
+            )
+        try:
+            self._ble_only_create_candidates = self._ble_only_create_scan_task.result()
+        except Exception:
+            LOGGER.exception("Pixie BLE-only new-home device scan failed")
+            self._ble_only_create_scan_task = None
+            return self.async_abort(reason="add_device_scan_failed")
+        self._ble_only_create_scan_task = None
+        return self.async_show_progress_done(next_step_id="ble_only_create_results")
+
+    async def async_step_ble_only_create_results(self, user_input: dict[str, Any] | None = None):
+        """Show fresh-device choices for a new BLE-only home."""
+        errors = {"base": self._ble_only_create_error} if self._ble_only_create_error else {}
+        self._ble_only_create_error = None
+        if user_input is not None:
+            if bool(user_input.get(CONF_SCAN_AGAIN)):
+                self._ble_only_create_candidates = []
+                self._ble_only_create_pending_chosen = []
+                self._ble_only_create_mode_field_map = {}
+                return self._start_ble_only_create_scan()
+            selected = user_input.get("devices") or []
+            if isinstance(selected, str):
+                selected = [selected]
+            candidate_by_key = {str(item["key"]): item for item in self._ble_only_create_candidates}
+            chosen = [candidate_by_key[str(key)] for key in selected if str(key) in candidate_by_key]
+            if not chosen:
+                return self.async_show_form(
+                    step_id="ble_only_create_results",
+                    data_schema=_add_device_select_schema(
+                        self._ble_only_create_candidates,
+                        default_scan_again=not self._ble_only_create_candidates,
+                    ),
+                    errors={"base": "no_devices_selected"},
+                )
+            if any(_candidate_requires_post_add_mode(candidate) for candidate in chosen):
+                self._ble_only_create_pending_chosen = chosen
+                return await self.async_step_ble_only_create_modes()
+            return self._start_ble_only_create_add(chosen)
+
+        return self.async_show_form(
+            step_id="ble_only_create_results",
+            data_schema=_add_device_select_schema(
+                self._ble_only_create_candidates,
+                default_scan_again=not self._ble_only_create_candidates,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_ble_only_create_modes(self, user_input: dict[str, Any] | None = None):
+        """Choose required post-add modes for selected devices in a new BLE-only home."""
+        if not self._ble_only_create_pending_chosen:
+            return await self.async_step_ble_only_create_results()
+        if user_input is not None:
+            candidate_by_key = {
+                str(candidate["key"]): candidate
+                for candidate in self._ble_only_create_pending_chosen
+            }
+            for field_label, candidate_key in self._ble_only_create_mode_field_map.items():
+                candidate = candidate_by_key.get(candidate_key)
+                if candidate is not None:
+                    selection = _candidate_post_add_mode_selection(candidate)
+                    candidate["post_add_mode"] = str(user_input.get(field_label, selection.get("default", "")))
+            chosen = self._ble_only_create_pending_chosen
+            self._ble_only_create_pending_chosen = []
+            self._ble_only_create_mode_field_map = {}
+            return self._start_ble_only_create_add(chosen)
+
+        self._ble_only_create_mode_field_map = {}
+        return self.async_show_form(
+            step_id="ble_only_create_modes",
+            data_schema=_add_device_post_add_mode_schema(
+                self._ble_only_create_pending_chosen,
+                self._ble_only_create_mode_field_map,
+            ),
+        )
+
+    async def async_step_ble_only_create_add(self, user_input: dict[str, Any] | None = None):
+        """Wait for new BLE-only home provisioning completion."""
+        if self._ble_only_create_add_task is None:
+            return await self.async_step_ble_only_create_results()
+        if not self._ble_only_create_add_task.done():
+            return self.async_show_progress(
+                step_id="ble_only_create_add",
+                progress_action="adding_pixie_devices",
+                progress_task=self._ble_only_create_add_task,
+            )
+        result = self._ble_only_create_add_task.result()
+        self._ble_only_create_add_task = None
+        if isinstance(result, Exception):
+            self._ble_only_create_error = "add_device_failed"
+            return self.async_show_progress_done(next_step_id="ble_only_create_results")
+        add_result = result.result
+        added = len(getattr(add_result, "added", []) or [])
+        failed = len(getattr(add_result, "failed", []) or [])
+        if added <= 0:
+            self._ble_only_create_error = "add_device_failed"
+            return self.async_show_progress_done(next_step_id="ble_only_create_results")
+        if failed:
+            LOGGER.info(
+                "[%s] Pixie BLE-only new-home partial success added=%s failed=%s",
+                self._ble_only_home_name or "Pixie",
+                getattr(add_result, "added", []) or [],
+                getattr(add_result, "failed", []) or [],
+            )
+
+        home_name = self._ble_only_home_name or "Pixie"
+        pin = self._ble_only_pin or ""
+        membership = self._ble_only_membership or hash_mesh_id_to_broadcast(pin)
+        data = _build_ble_only_entry_data(home_name=home_name, pin=pin, membership=membership)
+        data[CONF_BLE_INVENTORY] = result.inventory.to_dict()
+        self._validated_setup = ValidatedSetup(
+            title=home_name,
+            data=data,
+            options={
+                CONF_COMMAND_TRANSPORT: COMMAND_TRANSPORT_BT_ONLY,
+                CONF_BT_ACCESS_NODE_PREFERENCE: BT_ACCESS_NODE_AUTO,
+            },
+            inventory=result.inventory,
+            has_cover_devices=any(device.capabilities.cover_type == "blind" for device in result.inventory.devices_by_id.values()),
+            cover_devices=_cover_controller_choices(result.inventory),
+        )
+        return self.async_show_progress_done(next_step_id="ble_only_create_finish")
+
+    async def async_step_ble_only_create_finish(self, user_input: dict[str, Any] | None = None):
+        """Finish setup after creating a BLE-only Pixie home."""
+        return await self._async_finish_validated_setup()
 
     async def async_step_home(self, user_input: dict[str, Any] | None = None):
         """Choose which Pixie Home to add."""
@@ -1468,6 +1757,13 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
     def __init__(self) -> None:
         """Initialize the options flow."""
         self._selected_cover_controller_id: str | None = None
+        self._add_device_candidates: list[dict[str, Any]] = []
+        self._add_device_pending_chosen: list[dict[str, Any]] = []
+        self._add_device_mode_field_map: dict[str, str] = {}
+        self._add_device_scan_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        self._add_device_add_task: asyncio.Task[Any] | None = None
+        self._add_device_error: str | None = None
+        self._add_device_result: Any | None = None
 
     def _cover_devices(self) -> dict[str, str]:
         """Return current cover-controller choices from runtime inventory."""
@@ -1494,10 +1790,60 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
         if changed:
             self.hass.config_entries.async_update_entry(self.config_entry, data=data)
 
+    def _start_add_device_scan(self, runtime_data: Any):
+        """Start add-device scanning and show the progress step."""
+        self._add_device_scan_task = self.hass.async_create_task(
+            runtime_data.async_scan_addable_pixie_devices()
+        )
+        return self.async_show_progress(
+            step_id="add_device_scan",
+            progress_action="scanning_for_pixie_devices",
+            progress_task=self._add_device_scan_task,
+        )
+
+    def _start_add_device_add(self, runtime_data: Any, chosen: list[dict[str, Any]]):
+        """Start add-device provisioning and show the progress step."""
+        self._add_device_add_task = self.hass.async_create_task(
+            self._async_add_pixie_devices_task(runtime_data, chosen)
+        )
+        return self.async_show_progress(
+            step_id="add_device_add",
+            progress_action="adding_pixie_devices",
+            progress_task=self._add_device_add_task,
+        )
+
+    async def _async_add_pixie_devices_task(self, runtime_data: Any, chosen: list[dict[str, Any]]) -> Any:
+        """Run add-device provisioning without leaking task exceptions to HA."""
+        try:
+            return await runtime_data.async_add_pixie_devices(chosen)
+        except Exception as err:
+            LOGGER.exception("Pixie add-device flow failed")
+            return err
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         """Choose which Pixie options to configure."""
-        menu_options = ["cover_controller"]
+        menu_options = []
+        if self._cover_devices():
+            menu_options.append("cover_controller")
         ble_only = _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        inventory = runtime_data.pixie_runtime.inventory if runtime_data is not None else None
+        supports_add_remove = (
+            _entry_bt_enabled(self.config_entry)
+            and (
+                ble_only
+                or _entry_gateway_supports_local_inventory_53216(self.config_entry, inventory)
+            )
+        )
+        supports_ha_name_sync = (
+            not ble_only
+            and _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_LOCAL_53216
+            and _entry_gateway_supports_local_inventory_53216(self.config_entry, inventory)
+        )
+        if supports_add_remove:
+            menu_options.insert(0, "add_device")
+        if supports_ha_name_sync:
+            menu_options.append("ha_name_sync")
         if ble_only:
             menu_options = [
                 "transport",
@@ -1510,10 +1856,200 @@ class PixiePlusLocalOptionsFlow(OptionsFlowWithReload):
                 *menu_options,
             ]
 
+        if not menu_options:
+            return self.async_create_entry(title="", data=dict(self.config_entry.options))
+
         return self.async_show_menu(
             step_id="init",
             menu_options=menu_options,
         )
+
+    async def async_step_ha_name_sync(self, user_input: dict[str, Any] | None = None):
+        """Configure optional HA-to-Pixie device name sync."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        inventory = runtime_data.pixie_runtime.inventory if runtime_data is not None else None
+        if (
+            _entry_inventory_mode(self.config_entry) != INVENTORY_MODE_LOCAL_53216
+            or not _entry_gateway_supports_local_inventory_53216(self.config_entry, inventory)
+        ):
+            return self.async_create_entry(title="", data=dict(self.config_entry.options))
+
+        if user_input is not None:
+            options = dict(self.config_entry.options)
+            options[CONF_SYNC_HA_DEVICE_NAMES] = bool(user_input.get(CONF_SYNC_HA_DEVICE_NAMES))
+            return self.async_create_entry(title="", data=options)
+
+        return self.async_show_form(
+            step_id="ha_name_sync",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_SYNC_HA_DEVICE_NAMES,
+                        default=bool(self.config_entry.options.get(CONF_SYNC_HA_DEVICE_NAMES, False)),
+                    ): bool,
+                }
+            ),
+        )
+
+    async def async_step_add_device(self, user_input: dict[str, Any] | None = None):
+        """Scan for and add newly discovered Pixie devices."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        if runtime_data is None:
+            return self.async_abort(reason="runtime_not_ready")
+        ble_only = _entry_inventory_mode(self.config_entry) == INVENTORY_MODE_BLE_ADVERTISEMENT
+        inventory = runtime_data.pixie_runtime.inventory
+        if not _entry_bt_enabled(self.config_entry):
+            return self.async_abort(reason="bt_not_enabled")
+        if not ble_only and not _entry_gateway_supports_local_inventory_53216(self.config_entry, inventory):
+            return self.async_abort(reason="unsupported_gateway")
+
+        self._add_device_candidates = []
+        self._add_device_pending_chosen = []
+        self._add_device_mode_field_map = {}
+        self._add_device_error = None
+        self._add_device_result = None
+        return self._start_add_device_scan(runtime_data)
+
+    async def async_step_add_device_scan(self, user_input: dict[str, Any] | None = None):
+        """Wait for add-device scan completion."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        if runtime_data is None:
+            return self.async_abort(reason="runtime_not_ready")
+
+        if self._add_device_scan_task is None:
+            return self._start_add_device_scan(runtime_data)
+
+        if not self._add_device_scan_task.done():
+            return self.async_show_progress(
+                step_id="add_device_scan",
+                progress_action="scanning_for_pixie_devices",
+                progress_task=self._add_device_scan_task,
+            )
+
+        try:
+            self._add_device_candidates = self._add_device_scan_task.result()
+        except Exception:
+            LOGGER.exception("Pixie add-device scan failed")
+            self._add_device_scan_task = None
+            return self.async_abort(reason="add_device_scan_failed")
+        self._add_device_scan_task = None
+        return self.async_show_progress_done(next_step_id="add_device_results")
+
+    async def async_step_add_device_results(self, user_input: dict[str, Any] | None = None):
+        """Show add-device scan results and optionally provision selected devices."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        if runtime_data is None:
+            return self.async_abort(reason="runtime_not_ready")
+
+        errors = {"base": self._add_device_error} if self._add_device_error else {}
+        self._add_device_error = None
+        if user_input is not None:
+            if bool(user_input.get(CONF_SCAN_AGAIN)):
+                self._add_device_candidates = []
+                self._add_device_pending_chosen = []
+                self._add_device_mode_field_map = {}
+                return self._start_add_device_scan(runtime_data)
+            selected = user_input.get("devices") or []
+            if isinstance(selected, str):
+                selected = [selected]
+            candidate_by_key = {str(item["key"]): item for item in self._add_device_candidates}
+            chosen = [candidate_by_key[str(key)] for key in selected if str(key) in candidate_by_key]
+            if not chosen:
+                return self.async_show_form(
+                    step_id="add_device_results",
+                    data_schema=_add_device_select_schema(
+                        self._add_device_candidates,
+                        default_scan_again=not self._add_device_candidates,
+                    ),
+                    errors={"base": "no_devices_selected"},
+                )
+            if any(_candidate_requires_post_add_mode(candidate) for candidate in chosen):
+                self._add_device_pending_chosen = chosen
+                return await self.async_step_add_device_modes()
+            return self._start_add_device_add(runtime_data, chosen)
+
+        return self.async_show_form(
+            step_id="add_device_results",
+            data_schema=_add_device_select_schema(
+                self._add_device_candidates,
+                default_scan_again=not self._add_device_candidates,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_add_device_modes(self, user_input: dict[str, Any] | None = None):
+        """Choose required post-add modes for selected Pixie devices."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        if runtime_data is None:
+            return self.async_abort(reason="runtime_not_ready")
+        if not self._add_device_pending_chosen:
+            return await self.async_step_add_device_results()
+        if user_input is not None:
+            candidate_by_key = {
+                str(candidate["key"]): candidate
+                for candidate in self._add_device_pending_chosen
+            }
+            for field_label, candidate_key in self._add_device_mode_field_map.items():
+                candidate = candidate_by_key.get(candidate_key)
+                if candidate is not None:
+                    selection = _candidate_post_add_mode_selection(candidate)
+                    candidate["post_add_mode"] = str(user_input.get(field_label, selection.get("default", "")))
+            chosen = self._add_device_pending_chosen
+            self._add_device_pending_chosen = []
+            self._add_device_mode_field_map = {}
+            return self._start_add_device_add(runtime_data, chosen)
+
+        self._add_device_mode_field_map = {}
+        return self.async_show_form(
+            step_id="add_device_modes",
+            data_schema=_add_device_post_add_mode_schema(
+                self._add_device_pending_chosen,
+                self._add_device_mode_field_map,
+            ),
+        )
+
+    async def async_step_add_device_add(self, user_input: dict[str, Any] | None = None):
+        """Wait for add-device provisioning completion."""
+        if self._add_device_add_task is None:
+            return await self.async_step_add_device_results()
+        if not self._add_device_add_task.done():
+            return self.async_show_progress(
+                step_id="add_device_add",
+                progress_action="adding_pixie_devices",
+                progress_task=self._add_device_add_task,
+            )
+        result = self._add_device_add_task.result()
+        if isinstance(result, Exception):
+            self._add_device_add_task = None
+            self._add_device_error = "add_device_failed"
+            return self.async_show_progress_done(next_step_id="add_device_results")
+        self._add_device_result = result
+        self._add_device_add_task = None
+        added = len(getattr(result, "added", []) or [])
+        failed = len(getattr(result, "failed", []) or [])
+        if added <= 0 and failed > 0:
+            self._add_device_error = "add_device_failed"
+            return self.async_show_progress_done(next_step_id="add_device_results")
+        if added > 0 and failed > 0:
+            LOGGER.info(
+                "Pixie add-device partial success added=%s failed=%s",
+                getattr(result, "added", []) or [],
+                getattr(result, "failed", []) or [],
+            )
+            added_macs = {str(mac) for mac in (getattr(result, "added_macs", []) or [])}
+            if added_macs:
+                self._add_device_candidates = [
+                    candidate
+                    for candidate in self._add_device_candidates
+                    if str(candidate.get("key")) not in added_macs
+                ]
+            self._add_device_error = "add_device_partial"
+            return self.async_show_progress_done(next_step_id="add_device_results")
+        return self.async_show_progress_done(next_step_id="add_device_finish")
+
+    async def async_step_add_device_finish(self, user_input: dict[str, Any] | None = None):
+        """Finish options flow after adding Pixie devices."""
+        return self.async_create_entry(title="", data=dict(self.config_entry.options))
 
     async def async_step_update_device_versions(self, user_input: dict[str, Any] | None = None):
         """Run a manual BLE scan to refresh device firmware versions."""

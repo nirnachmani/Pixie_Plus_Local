@@ -10,13 +10,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_interval
 
-from . import (
+from .pixie_const import (
     DOMAIN,
+)
+from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
+    device_added_signal,
     endpoint_unique_identifier,
     parent_device_identifier,
     physical_device_identifier,
@@ -34,12 +38,14 @@ from .pixie_value_profiles import (
 )
 
 
-def _iter_cover_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_cover_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return blind cover endpoints (excludes gate devices)."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         if not record.capabilities.supports_cover or record.capabilities.supports_gate:
             continue
         endpoints.append(
@@ -57,13 +63,15 @@ def _iter_cover_endpoints(inventory) -> list[PixieEndpoint]:
     return endpoints
 
 
-def _iter_gate_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_gate_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return gate door cover endpoints."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
     door_names = {0: "Door 1", 1: "Door 2"}
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         if not record.capabilities.supports_gate:
             continue
         for door in range(gate_endpoint_count_for_capabilities(record.capabilities)):
@@ -99,6 +107,21 @@ async def async_setup_entry(
     for endpoint in _iter_gate_endpoints(inventory):
         entities.append(PixiePlusGateCoverEntity(runtime_data, endpoint))
     async_add_entities(entities)
+
+    @callback
+    def _async_add_device_entities(device_id: int) -> None:
+        current_inventory = runtime_data.pixie_runtime.inventory
+        if current_inventory is None:
+            return
+        entities_to_add: list = []
+        for endpoint in _iter_cover_endpoints(current_inventory, device_id=int(device_id)):
+            entities_to_add.append(PixiePlusCoverEntity(runtime_data, entry, endpoint))
+        for endpoint in _iter_gate_endpoints(current_inventory, device_id=int(device_id)):
+            entities_to_add.append(PixiePlusGateCoverEntity(runtime_data, endpoint))
+        if entities_to_add:
+            async_add_entities(entities_to_add)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, device_added_signal(entry), _async_add_device_entities))
 
 
 class PixiePlusCoverEntity(PixiePlusCoordinatorEntity, CoverEntity):

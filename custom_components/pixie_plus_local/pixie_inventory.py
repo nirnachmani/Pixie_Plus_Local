@@ -59,6 +59,45 @@ def _normalize_optional_int(value: Any) -> Optional[int]:
     return None
 
 
+def _normalize_optional_bool(value: Any) -> Optional[bool]:
+    """Normalize optional bool fields from snapshots and runtime patches."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in ("1", "true", "yes", "on"):
+            return True
+        if candidate in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def supports_outlet_runtime_config(capabilities: Any) -> bool:
+    """Return whether normal outlet updates carry SP023/BTAM config bits."""
+    return (
+        getattr(capabilities, "switch_type", "") == "outlet"
+        and bool(getattr(capabilities, "supports_multi_channel", False))
+        and bool(getattr(capabilities, "supports_power_metering", False))
+    )
+
+
+def supports_plug_led_settings(capabilities: Any) -> bool:
+    """Return whether ESS105/BT exposes socket/USB LED settings."""
+    return (
+        getattr(capabilities, "switch_type", "") == "outlet"
+        and bool(getattr(capabilities, "supports_usb_subentity", False))
+    )
+
+
+def supports_sensor_advanced_settings(capabilities: Any) -> bool:
+    """Return whether a sensor exposes LED/learn-threshold settings."""
+    return bool(getattr(capabilities, "supports_sensor", False))
+
+
 def derive_is_on_from_state(
     capabilities: "DeviceCapabilities",
     br: Optional[int],
@@ -202,6 +241,16 @@ class RuntimeState:
     hold_time_seconds: Optional[int] = None
     brightness_threshold: Optional[int] = None
     motion_sensitivity: Optional[int] = None
+    learned_brightness_threshold_raw: Optional[int] = None
+    sensor_led_indicator: Optional[bool] = None
+    indicator_led_on: Optional[int] = None
+    indicator_led_off: Optional[int] = None
+    outlet_led_indicator: Optional[bool] = None
+    outlet_all_device_control: Optional[bool] = None
+    outlet_child_lock: Optional[bool] = None
+    plug_socket_led_indicator: Optional[bool] = None
+    plug_usb_led_indicator: Optional[bool] = None
+    gate_signal_width_seconds: Optional[int] = None
     door1_state: Optional[int] = None
     door2_state: Optional[int] = None
     door1_decoded: Optional[Dict[str, Any]] = None
@@ -210,8 +259,12 @@ class RuntimeState:
     door2_motion_plan: Optional[Dict[str, Any]] = None
     door1_open_duration_ms: Optional[int] = None
     door1_close_duration_ms: Optional[int] = None
+    door1_extra1_duration_ms: Optional[int] = None
+    door1_extra2_duration_ms: Optional[int] = None
     door2_open_duration_ms: Optional[int] = None
     door2_close_duration_ms: Optional[int] = None
+    door2_extra1_duration_ms: Optional[int] = None
+    door2_extra2_duration_ms: Optional[int] = None
     raw: Dict[str, Any] = field(default_factory=dict)
     last_source: str = "cloud_seed"
     last_updated_ms: Optional[int] = None
@@ -243,6 +296,16 @@ class RuntimeState:
             "hold_time_seconds": self.hold_time_seconds,
             "brightness_threshold": self.brightness_threshold,
             "motion_sensitivity": self.motion_sensitivity,
+            "learned_brightness_threshold_raw": self.learned_brightness_threshold_raw,
+            "sensor_led_indicator": self.sensor_led_indicator,
+            "indicator_led_on": self.indicator_led_on,
+            "indicator_led_off": self.indicator_led_off,
+            "outlet_led_indicator": self.outlet_led_indicator,
+            "outlet_all_device_control": self.outlet_all_device_control,
+            "outlet_child_lock": self.outlet_child_lock,
+            "plug_socket_led_indicator": self.plug_socket_led_indicator,
+            "plug_usb_led_indicator": self.plug_usb_led_indicator,
+            "gate_signal_width_seconds": self.gate_signal_width_seconds,
             "door1_state": self.door1_state,
             "door2_state": self.door2_state,
             "door1_decoded": self.door1_decoded,
@@ -251,8 +314,12 @@ class RuntimeState:
             "door2_motion_plan": self.door2_motion_plan,
             "door1_open_duration_ms": self.door1_open_duration_ms,
             "door1_close_duration_ms": self.door1_close_duration_ms,
+            "door1_extra1_duration_ms": self.door1_extra1_duration_ms,
+            "door1_extra2_duration_ms": self.door1_extra2_duration_ms,
             "door2_open_duration_ms": self.door2_open_duration_ms,
             "door2_close_duration_ms": self.door2_close_duration_ms,
+            "door2_extra1_duration_ms": self.door2_extra1_duration_ms,
+            "door2_extra2_duration_ms": self.door2_extra2_duration_ms,
             "raw": self.raw,
             "last_source": self.last_source,
             "last_updated_ms": self.last_updated_ms,
@@ -289,6 +356,16 @@ class RuntimeState:
             hold_time_seconds=_normalize_optional_int(data.get("hold_time_seconds")),
             brightness_threshold=_normalize_optional_int(data.get("brightness_threshold")),
             motion_sensitivity=_normalize_optional_int(data.get("motion_sensitivity")),
+            learned_brightness_threshold_raw=_normalize_optional_int(data.get("learned_brightness_threshold_raw")),
+            sensor_led_indicator=_normalize_optional_bool(data.get("sensor_led_indicator")),
+            indicator_led_on=_normalize_optional_int(data.get("indicator_led_on")),
+            indicator_led_off=_normalize_optional_int(data.get("indicator_led_off")),
+            outlet_led_indicator=_normalize_optional_bool(data.get("outlet_led_indicator")),
+            outlet_all_device_control=_normalize_optional_bool(data.get("outlet_all_device_control")),
+            outlet_child_lock=_normalize_optional_bool(data.get("outlet_child_lock")),
+            plug_socket_led_indicator=_normalize_optional_bool(data.get("plug_socket_led_indicator")),
+            plug_usb_led_indicator=_normalize_optional_bool(data.get("plug_usb_led_indicator")),
+            gate_signal_width_seconds=_normalize_optional_int(data.get("gate_signal_width_seconds")),
             door1_state=_normalize_optional_int(data.get("door1_state")),
             door2_state=_normalize_optional_int(data.get("door2_state")),
             door1_decoded=dict(data.get("door1_decoded") or {}) or None,
@@ -297,8 +374,12 @@ class RuntimeState:
             door2_motion_plan=dict(data.get("door2_motion_plan") or {}) or None,
             door1_open_duration_ms=_normalize_optional_int(data.get("door1_open_duration_ms")),
             door1_close_duration_ms=_normalize_optional_int(data.get("door1_close_duration_ms")),
+            door1_extra1_duration_ms=_normalize_optional_int(data.get("door1_extra1_duration_ms")),
+            door1_extra2_duration_ms=_normalize_optional_int(data.get("door1_extra2_duration_ms")),
             door2_open_duration_ms=_normalize_optional_int(data.get("door2_open_duration_ms")),
             door2_close_duration_ms=_normalize_optional_int(data.get("door2_close_duration_ms")),
+            door2_extra1_duration_ms=_normalize_optional_int(data.get("door2_extra1_duration_ms")),
+            door2_extra2_duration_ms=_normalize_optional_int(data.get("door2_extra2_duration_ms")),
             raw=dict(data.get("raw") or {}),
             last_source=str(data.get("last_source") or "snapshot"),
             last_updated_ms=data.get("last_updated_ms"),
@@ -354,6 +435,16 @@ class DeviceStateStore:
         hold_time_seconds: Any = STATE_UNSET,
         brightness_threshold: Any = STATE_UNSET,
         motion_sensitivity: Any = STATE_UNSET,
+        learned_brightness_threshold_raw: Any = STATE_UNSET,
+        sensor_led_indicator: Any = STATE_UNSET,
+        indicator_led_on: Any = STATE_UNSET,
+        indicator_led_off: Any = STATE_UNSET,
+        outlet_led_indicator: Any = STATE_UNSET,
+        outlet_all_device_control: Any = STATE_UNSET,
+        outlet_child_lock: Any = STATE_UNSET,
+        plug_socket_led_indicator: Any = STATE_UNSET,
+        plug_usb_led_indicator: Any = STATE_UNSET,
+        gate_signal_width_seconds: Any = STATE_UNSET,
         door1_state: Any = STATE_UNSET,
         door2_state: Any = STATE_UNSET,
         door1_decoded: Any = STATE_UNSET,
@@ -362,8 +453,12 @@ class DeviceStateStore:
         door2_motion_plan: Any = STATE_UNSET,
         door1_open_duration_ms: Any = STATE_UNSET,
         door1_close_duration_ms: Any = STATE_UNSET,
+        door1_extra1_duration_ms: Any = STATE_UNSET,
+        door1_extra2_duration_ms: Any = STATE_UNSET,
         door2_open_duration_ms: Any = STATE_UNSET,
         door2_close_duration_ms: Any = STATE_UNSET,
+        door2_extra1_duration_ms: Any = STATE_UNSET,
+        door2_extra2_duration_ms: Any = STATE_UNSET,
         raw: Any = STATE_UNSET,
         updated_ms: Optional[int] = None,
     ) -> Optional[RuntimeState]:
@@ -439,6 +534,26 @@ class DeviceStateStore:
             runtime.brightness_threshold = _normalize_optional_int(brightness_threshold)
         if motion_sensitivity is not STATE_UNSET:
             runtime.motion_sensitivity = _normalize_optional_int(motion_sensitivity)
+        if learned_brightness_threshold_raw is not STATE_UNSET:
+            runtime.learned_brightness_threshold_raw = _normalize_optional_int(learned_brightness_threshold_raw)
+        if sensor_led_indicator is not STATE_UNSET:
+            runtime.sensor_led_indicator = _normalize_optional_bool(sensor_led_indicator)
+        if indicator_led_on is not STATE_UNSET:
+            runtime.indicator_led_on = _normalize_optional_int(indicator_led_on)
+        if indicator_led_off is not STATE_UNSET:
+            runtime.indicator_led_off = _normalize_optional_int(indicator_led_off)
+        if outlet_led_indicator is not STATE_UNSET:
+            runtime.outlet_led_indicator = _normalize_optional_bool(outlet_led_indicator)
+        if outlet_all_device_control is not STATE_UNSET:
+            runtime.outlet_all_device_control = _normalize_optional_bool(outlet_all_device_control)
+        if outlet_child_lock is not STATE_UNSET:
+            runtime.outlet_child_lock = _normalize_optional_bool(outlet_child_lock)
+        if plug_socket_led_indicator is not STATE_UNSET:
+            runtime.plug_socket_led_indicator = _normalize_optional_bool(plug_socket_led_indicator)
+        if plug_usb_led_indicator is not STATE_UNSET:
+            runtime.plug_usb_led_indicator = _normalize_optional_bool(plug_usb_led_indicator)
+        if gate_signal_width_seconds is not STATE_UNSET:
+            runtime.gate_signal_width_seconds = _normalize_optional_int(gate_signal_width_seconds)
         if door1_state is not STATE_UNSET:
             runtime.door1_state = _normalize_optional_int(door1_state)
         if door2_state is not STATE_UNSET:
@@ -455,10 +570,18 @@ class DeviceStateStore:
             runtime.door1_open_duration_ms = _normalize_optional_int(door1_open_duration_ms)
         if door1_close_duration_ms is not STATE_UNSET:
             runtime.door1_close_duration_ms = _normalize_optional_int(door1_close_duration_ms)
+        if door1_extra1_duration_ms is not STATE_UNSET:
+            runtime.door1_extra1_duration_ms = _normalize_optional_int(door1_extra1_duration_ms)
+        if door1_extra2_duration_ms is not STATE_UNSET:
+            runtime.door1_extra2_duration_ms = _normalize_optional_int(door1_extra2_duration_ms)
         if door2_open_duration_ms is not STATE_UNSET:
             runtime.door2_open_duration_ms = _normalize_optional_int(door2_open_duration_ms)
         if door2_close_duration_ms is not STATE_UNSET:
             runtime.door2_close_duration_ms = _normalize_optional_int(door2_close_duration_ms)
+        if door2_extra1_duration_ms is not STATE_UNSET:
+            runtime.door2_extra1_duration_ms = _normalize_optional_int(door2_extra1_duration_ms)
+        if door2_extra2_duration_ms is not STATE_UNSET:
+            runtime.door2_extra2_duration_ms = _normalize_optional_int(door2_extra2_duration_ms)
         if raw is not STATE_UNSET:
             runtime.raw = raw
 
@@ -518,6 +641,11 @@ class DeviceStateStore:
             update_door2 = STATE_UNSET
             update_door1_decoded = STATE_UNSET
             update_door2_decoded = STATE_UNSET
+            update_outlet_led_indicator = STATE_UNSET
+            update_outlet_all_device_control = STATE_UNSET
+            update_outlet_child_lock = STATE_UNSET
+            update_plug_socket_led_indicator = STATE_UNSET
+            update_plug_usb_led_indicator = STATE_UNSET
 
             # Handle mode/relay for sensor-capable devices.
             mode_val = rec_data.get("mode")
@@ -657,6 +785,15 @@ class DeviceStateStore:
                             update_effect = decoded_color.get("effect")
                         if decoded_color.get("effect") is None and isinstance(decoded_color.get("rgb"), list):
                             update_rgb = [int(channel) for channel in decoded_color["rgb"]]
+                elif inv_rec.capabilities.supports_usb_subentity:
+                    raw_value = _normalize_optional_int(br_obj.get("raw"))
+                    if isinstance(raw_value, int):
+                        main_relay_on = bool(raw_value & 0x01)
+                        usb_on = bool(raw_value & 0x02)
+                        update_r = (1 if main_relay_on else 0) | (2 if usb_on else 0)
+                        update_br = 100 if main_relay_on else 0
+                        if supports_plug_led_settings(inv_rec.capabilities):
+                            update_outlet_all_device_control = bool(raw_value & 0x08)
                 elif br_obj.get("type") == "single":
                     pct = br_obj.get("pct")
                     if isinstance(pct, int):
@@ -673,8 +810,14 @@ class DeviceStateStore:
                     else:
                         update_r = 0
 
-                    if inv_rec.capabilities.supports_usb_subentity:
-                        update_br = 100 if bool(update_r & 0x01) else 0
+                    if supports_outlet_runtime_config(inv_rec.capabilities):
+                        raw_value = _normalize_optional_int(br_obj.get("raw"))
+                        tail_value = _normalize_optional_int(rec_data.get("rssi_raw"))
+                        if isinstance(raw_value, int):
+                            update_outlet_led_indicator = bool(raw_value & 0x10)
+                        if isinstance(tail_value, int):
+                            update_outlet_all_device_control = bool(tail_value & 0x01)
+                            update_outlet_child_lock = bool(tail_value & 0x02)
 
             runtime = self.apply_device_update(
                 devices_by_id,
@@ -696,6 +839,11 @@ class DeviceStateStore:
                 door2_state=update_door2,
                 door1_decoded=update_door1_decoded,
                 door2_decoded=update_door2_decoded,
+                outlet_led_indicator=update_outlet_led_indicator,
+                outlet_all_device_control=update_outlet_all_device_control,
+                outlet_child_lock=update_outlet_child_lock,
+                plug_socket_led_indicator=update_plug_socket_led_indicator,
+                plug_usb_led_indicator=update_plug_usb_led_indicator,
                 updated_ms=now_ms,
             )
             if runtime is None:
@@ -766,6 +914,7 @@ class DeviceCapabilities:
     supports_motion_sensor: bool = False
     supports_photocell_sensor: bool = False
     supports_timer: bool = False
+    supports_switch_indicator_led: bool = False
     timer_modes: List[str] = field(default_factory=list)
     supports_hold_time: bool = False
     supports_brightness_threshold: bool = False
@@ -774,6 +923,7 @@ class DeviceCapabilities:
     motion_sensitivity_options: List[str] = field(default_factory=list)
     supports_gate: bool = False
     gate_doors: int = 0
+    post_add_mode_selection: Dict[str, Any] = field(default_factory=dict)
     capability_hints: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -809,6 +959,7 @@ class DeviceCapabilities:
             "supports_motion_sensor": self.supports_motion_sensor,
             "supports_photocell_sensor": self.supports_photocell_sensor,
             "supports_timer": self.supports_timer,
+            "supports_switch_indicator_led": self.supports_switch_indicator_led,
             "timer_modes": list(self.timer_modes),
             "supports_hold_time": self.supports_hold_time,
             "supports_brightness_threshold": self.supports_brightness_threshold,
@@ -817,6 +968,7 @@ class DeviceCapabilities:
             "motion_sensitivity_options": list(self.motion_sensitivity_options),
             "supports_gate": self.supports_gate,
             "gate_doors": self.gate_doors,
+            "post_add_mode_selection": dict(self.post_add_mode_selection),
             "capability_hints": dict(self.capability_hints),
         }
 
@@ -854,6 +1006,7 @@ class DeviceCapabilities:
             supports_motion_sensor=bool(data.get("supports_motion_sensor", False)),
             supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
             supports_timer=bool(data.get("supports_timer", False)),
+            supports_switch_indicator_led=bool(data.get("supports_switch_indicator_led", False)),
             timer_modes=list(data.get("timer_modes") or []),
             supports_hold_time=bool(data.get("supports_hold_time", False)),
             supports_brightness_threshold=bool(data.get("supports_brightness_threshold", False)),
@@ -862,6 +1015,7 @@ class DeviceCapabilities:
             motion_sensitivity_options=list(data.get("motion_sensitivity_options") or []),
             supports_gate=bool(data.get("supports_gate", False)),
             gate_doors=int(data.get("gate_doors", 0)),
+            post_add_mode_selection=dict(data.get("post_add_mode_selection") or {}),
             capability_hints=dict(data.get("capability_hints") or {}),
         )
 
@@ -884,6 +1038,7 @@ class DeviceRecord:
 
     rooms: List[Any] = field(default_factory=list)
     import_mode: Optional[int] = None
+    raw_device: Dict[str, Any] = field(default_factory=dict)
 
     capabilities: DeviceCapabilities = field(default_factory=DeviceCapabilities)
     runtime: RuntimeState = field(default_factory=RuntimeState)
@@ -902,6 +1057,7 @@ class DeviceRecord:
             "right_name": self.right_name,
             "rooms": list(self.rooms),
             "import_mode": self.import_mode,
+            "raw_device": dict(self.raw_device),
             "capabilities": self.capabilities.to_dict(),
             "runtime": self.runtime.to_dict(),
         }
@@ -921,6 +1077,8 @@ class DeviceRecord:
             capabilities.switch_type = str(model_caps.get("switch_type", "switch"))
         if model_caps.get("supports_power_metering", False):
             capabilities.supports_power_metering = True
+        if model_caps.get("supports_switch_indicator_led", False):
+            capabilities.supports_switch_indicator_led = True
         if capabilities.supports_contact_sensor and not capabilities.contact_sensor_type:
             capabilities.contact_sensor_type = str(model_caps.get("contact_sensor_type", "standard_contact"))
         if capabilities.supports_cover and not capabilities.cover_type:
@@ -944,6 +1102,7 @@ class DeviceRecord:
             right_name=data.get("right_name"),
             rooms=list(data.get("rooms") or []),
             import_mode=data.get("import_mode"),
+            raw_device=dict(data.get("raw_device") or {}),
             capabilities=capabilities,
             runtime=RuntimeState.from_dict(dict(data.get("runtime") or {})),
         )
@@ -960,6 +1119,7 @@ class PixieInventory:
     mesh_net: Optional[str]
     mesh_net2: Optional[str]
     generated_at: datetime
+    conf_index: List[int] = field(default_factory=list)
     gateway: Optional[GatewayIdentity] = None
     devices_by_id: Dict[int, DeviceRecord] = field(default_factory=dict)
     state_store: DeviceStateStore = field(default_factory=DeviceStateStore)
@@ -1014,6 +1174,7 @@ class PixieInventory:
         cap.supports_motion_sensor = model_caps["supports_motion_sensor"]
         cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
         cap.supports_timer = model_caps["supports_timer"]
+        cap.supports_switch_indicator_led = model_caps["supports_switch_indicator_led"]
         cap.timer_modes = model_caps["timer_modes"]
         cap.supports_hold_time = model_caps["supports_hold_time"]
         cap.supports_brightness_threshold = model_caps["supports_brightness_threshold"]
@@ -1059,6 +1220,11 @@ class PixieInventory:
             mesh_net=str(home_obj.get("meshNet")) if home_obj.get("meshNet") is not None else None,
             mesh_net2=str(home_obj.get("meshNet2")) if home_obj.get("meshNet2") is not None else None,
             generated_at=datetime.now(),
+            conf_index=[
+                int(value)
+                for value in (home_obj.get("ConfIndex") or home_obj.get("confIndex") or [])
+                if isinstance(value, (int, float, str)) and str(value).strip().lstrip("-").isdigit()
+            ],
         )
 
         online_map = home_obj.get("onlineList") or {}
@@ -1084,6 +1250,7 @@ class PixieInventory:
                 right_name=d.get("right_name"),
                 rooms=list(d.get("rooms") or []),
                 import_mode=d.get("importMode"),
+                raw_device=dict(d),
             )
 
             rec.capabilities = cls._infer_capabilities(d, online)
@@ -1271,6 +1438,136 @@ class PixieInventory:
                 preserved += 1
         return preserved
 
+    def preserve_gate_settings_from(self, previous: "PixieInventory | None") -> int:
+        """Carry learned gate settings forward by MAC after inventory rebuild."""
+        if previous is None:
+            return 0
+        previous_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in previous.devices_by_id.values()
+            if self._normalize_mac(record.mac) and record.capabilities.supports_gate
+        }
+        preserved = 0
+        for record in self.devices_by_id.values():
+            if not record.capabilities.supports_gate:
+                continue
+            previous_record = previous_by_mac.get(self._normalize_mac(record.mac))
+            if previous_record is None:
+                continue
+            before = record.runtime.to_dict()
+            record.runtime.gate_signal_width_seconds = previous_record.runtime.gate_signal_width_seconds
+            record.runtime.door1_open_duration_ms = previous_record.runtime.door1_open_duration_ms
+            record.runtime.door1_close_duration_ms = previous_record.runtime.door1_close_duration_ms
+            record.runtime.door1_extra1_duration_ms = previous_record.runtime.door1_extra1_duration_ms
+            record.runtime.door1_extra2_duration_ms = previous_record.runtime.door1_extra2_duration_ms
+            record.runtime.door2_open_duration_ms = previous_record.runtime.door2_open_duration_ms
+            record.runtime.door2_close_duration_ms = previous_record.runtime.door2_close_duration_ms
+            record.runtime.door2_extra1_duration_ms = previous_record.runtime.door2_extra1_duration_ms
+            record.runtime.door2_extra2_duration_ms = previous_record.runtime.door2_extra2_duration_ms
+            after = record.runtime.to_dict()
+            if any(before.get(key) != after.get(key) for key in (
+                "gate_signal_width_seconds",
+                "door1_open_duration_ms",
+                "door1_close_duration_ms",
+                "door1_extra1_duration_ms",
+                "door1_extra2_duration_ms",
+                "door2_open_duration_ms",
+                "door2_close_duration_ms",
+                "door2_extra1_duration_ms",
+                "door2_extra2_duration_ms",
+            )):
+                preserved += 1
+        return preserved
+
+    def preserve_indicator_led_settings_from(self, previous: "PixieInventory | None") -> int:
+        """Carry switch indicator LED settings forward by MAC after inventory rebuild."""
+        if previous is None:
+            return 0
+        previous_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in previous.devices_by_id.values()
+            if self._normalize_mac(record.mac) and record.capabilities.supports_switch_indicator_led
+        }
+        preserved = 0
+        for record in self.devices_by_id.values():
+            if not record.capabilities.supports_switch_indicator_led:
+                continue
+            previous_record = previous_by_mac.get(self._normalize_mac(record.mac))
+            if previous_record is None:
+                continue
+            before = record.runtime.to_dict()
+            record.runtime.indicator_led_on = previous_record.runtime.indicator_led_on
+            record.runtime.indicator_led_off = previous_record.runtime.indicator_led_off
+            after = record.runtime.to_dict()
+            if (
+                before.get("indicator_led_on") != after.get("indicator_led_on")
+                or before.get("indicator_led_off") != after.get("indicator_led_off")
+            ):
+                preserved += 1
+        return preserved
+
+    def preserve_sensor_config_settings_from(self, previous: "PixieInventory | None") -> int:
+        """Carry sensor configuration settings forward by MAC after inventory rebuild."""
+        if previous is None:
+            return 0
+        previous_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in previous.devices_by_id.values()
+            if self._normalize_mac(record.mac) and record.capabilities.supports_sensor
+        }
+        preserved = 0
+        for record in self.devices_by_id.values():
+            if not record.capabilities.supports_sensor:
+                continue
+            previous_record = previous_by_mac.get(self._normalize_mac(record.mac))
+            if previous_record is None:
+                continue
+            before = record.runtime.to_dict()
+            record.runtime.hold_time_seconds = previous_record.runtime.hold_time_seconds
+            record.runtime.brightness_threshold = previous_record.runtime.brightness_threshold
+            record.runtime.motion_sensitivity = previous_record.runtime.motion_sensitivity
+            record.runtime.learned_brightness_threshold_raw = previous_record.runtime.learned_brightness_threshold_raw
+            record.runtime.sensor_led_indicator = previous_record.runtime.sensor_led_indicator
+            after = record.runtime.to_dict()
+            if any(before.get(key) != after.get(key) for key in (
+                "hold_time_seconds",
+                "brightness_threshold",
+                "motion_sensitivity",
+                "learned_brightness_threshold_raw",
+                "sensor_led_indicator",
+            )):
+                preserved += 1
+        return preserved
+
+    def preserve_plug_config_settings_from(self, previous: "PixieInventory | None") -> int:
+        """Carry ESS105/BT plug config settings forward by MAC after inventory rebuild."""
+        if previous is None:
+            return 0
+        previous_by_mac = {
+            self._normalize_mac(record.mac): record
+            for record in previous.devices_by_id.values()
+            if self._normalize_mac(record.mac) and supports_plug_led_settings(record.capabilities)
+        }
+        preserved = 0
+        for record in self.devices_by_id.values():
+            if not supports_plug_led_settings(record.capabilities):
+                continue
+            previous_record = previous_by_mac.get(self._normalize_mac(record.mac))
+            if previous_record is None:
+                continue
+            before = record.runtime.to_dict()
+            record.runtime.plug_socket_led_indicator = previous_record.runtime.plug_socket_led_indicator
+            record.runtime.plug_usb_led_indicator = previous_record.runtime.plug_usb_led_indicator
+            record.runtime.outlet_all_device_control = previous_record.runtime.outlet_all_device_control
+            after = record.runtime.to_dict()
+            if any(before.get(key) != after.get(key) for key in (
+                "plug_socket_led_indicator",
+                "plug_usb_led_indicator",
+                "outlet_all_device_control",
+            )):
+                preserved += 1
+        return preserved
+
     def apply_ble_advertised_version(self, mac: str, version: int) -> DeviceRecord | None:
         """Apply a BLE-advertised firmware version by MAC, returning the changed record."""
         normalized_mac = self._normalize_mac(mac)
@@ -1350,6 +1647,93 @@ class PixieInventory:
             "retained_missing": max(0, len(self.devices_by_id) - len(scanned.devices_by_id) - added),
         }
 
+    def add_or_update_ble_identity_device(
+        self,
+        identity: Any,
+        *,
+        device_id: int,
+        name: Optional[str] = None,
+        model_no_override: Optional[str] = None,
+        source: str = "ble_provisioning",
+    ) -> DeviceRecord:
+        """Add or update one device from a decoded Pixie BLE identity."""
+        dev_id = int(device_id)
+        if model_no_override:
+            model_no = str(model_no_override)
+            try:
+                dtype = int(model_no[:2])
+                dstype = int(model_no[2:])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid Pixie model override {model_no_override!r}") from exc
+        else:
+            dtype = int(getattr(identity, "product_type"))
+            dstype = int(getattr(identity, "product_stype"))
+            model_no = f"{dtype:02d}{dstype:02d}"
+        identity_mac = self._normalize_mac(str(getattr(identity, "mac", "") or ""))
+        if identity_mac:
+            identity_mac = ":".join(identity_mac[i : i + 2] for i in range(0, 12, 2)).lower()
+        else:
+            identity_mac = str(getattr(identity, "mac", "") or "")
+        device_obj = {
+            "id": dev_id,
+            "type": dtype,
+            "stype": dstype,
+            "mac": identity_mac,
+        }
+        cap = self._infer_capabilities(device_obj, {})
+        normalized_mac = self._normalize_mac(device_obj["mac"])
+        current = self.devices_by_id.get(dev_id)
+        if current is None and normalized_mac:
+            for candidate in self.devices_by_id.values():
+                if self._normalize_mac(candidate.mac) == normalized_mac:
+                    current = candidate
+                    break
+        if current is None:
+            current = DeviceRecord(
+                id=dev_id,
+                type=dtype,
+                stype=dstype,
+                model_no=model_no,
+                name=name or self._default_ble_name(model_no, dev_id, cap),
+                mac=identity_mac,
+                version=_normalize_optional_int(getattr(identity, "version", None)),
+                version_source=VERSION_SOURCE_BLE_ADVERTISEMENT,
+            )
+            current.capabilities = cap
+            current.runtime = self.state_store.bind(
+                dev_id,
+                RuntimeState(
+                    online=None,
+                    presence="offline",
+                    raw={source: {"membership": getattr(identity, "membership", None)}},
+                    last_source=source,
+                    last_updated_ms=int(datetime.now().timestamp() * 1000),
+                ),
+            )
+            self.devices_by_id[dev_id] = current
+            return current
+
+        if current.id != dev_id:
+            self.devices_by_id.pop(current.id, None)
+            self.state_store.states_by_id.pop(current.id, None)
+            current.id = dev_id
+            current.runtime = self.state_store.bind(dev_id, current.runtime)
+            self.devices_by_id[dev_id] = current
+        current.type = dtype
+        current.stype = dstype
+        current.model_no = model_no
+        current.mac = identity_mac
+        current.version = _normalize_optional_int(getattr(identity, "version", None))
+        current.version_source = VERSION_SOURCE_BLE_ADVERTISEMENT
+        current.capabilities = cap
+        if name:
+            current.name = name
+        current.runtime.raw[source] = {"membership": getattr(identity, "membership", None)}
+        current.runtime.last_source = source
+        current.runtime.last_updated_ms = int(datetime.now().timestamp() * 1000)
+        self.generated_at = datetime.now()
+        return current
+
     def remove_device_by_ha_identifier(self, identifier: str) -> DeviceRecord | None:
         """Remove one physical device record by an HA device identifier."""
         normalized_identifier = str(identifier or "")
@@ -1391,6 +1775,7 @@ class PixieInventory:
             "mesh_net": self.mesh_net,
             "mesh_net2": self.mesh_net2,
             "generated_at": self.generated_at.isoformat(),
+            "conf_index": list(self.conf_index),
             "gateway": self.gateway.to_dict() if self.gateway is not None else None,
             "devices": [
                 self.devices_by_id[dev_id].to_dict()
@@ -1414,6 +1799,11 @@ class PixieInventory:
             mesh_net=str(data.get("mesh_net")) if data.get("mesh_net") is not None else None,
             mesh_net2=str(data.get("mesh_net2")) if data.get("mesh_net2") is not None else None,
             generated_at=generated_at,
+            conf_index=[
+                int(value)
+                for value in (data.get("conf_index") or [])
+                if isinstance(value, (int, float, str)) and str(value).strip().lstrip("-").isdigit()
+            ],
             gateway=GatewayIdentity.from_dict(dict(data.get("gateway") or {})) if isinstance(data.get("gateway"), dict) else None,
         )
 
