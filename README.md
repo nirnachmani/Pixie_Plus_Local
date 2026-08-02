@@ -5,18 +5,30 @@ Pixie Plus Local is a Home Assistant custom integration for SAL Pixie Plus devic
 ## Features
 
 - Support Pixie installations with a gateway (via TCP and/or BT) and without a gateway (via BT). BT functionality requires an ESPHome Bluetooth proxy and will not work without one. This is equivalent to the Pixie Plus app and to the SAL Pixie app.
-- Automatic gateway discovery with manual IP option (e.g. if gateway is on another subnet) 
+- Automatic gateway discovery with manual IP option (e.g. if gateway is on another subnet)
 - Local control through the Pixie Plus gateway and/or Bluetooth
 - Local push-style state updates from the live gateway session and Bluetooth
 - Supports many Pixie devices
 - Supports multiple Homes/Gateways
+- Add and remove Pixie devices from Home Assistant for supported gateway and no-gateway installations
+- Device configuration entities for supported Pixie device settings
 
 The integration intentionally does not implement Pixie Plus groups, scenes, schedules, or timers. Home Assistant already covers those use cases more cleanly.
 
+The integration also doesn't currently support:
+- Pairing secondary devices (devices that control other devices but do not show up in the app)
+- Creating a new gateway Home (a gateway home can be added to the integration but not created within the integration)
+- Configuring a Timer Control (STC/BT), Translator Control (PC100T/R/BTAS), Touch Panel or Pixie Portal
+- Firmware updates
+- Creating a Pixie account
+
+A Pixie Plus App is required for those.
+
 ## Requirements
 
-- All devices already paired and configured in the official Pixie Plus or SAL Pixie apps.
-- Pixie credentials (for gateway installations) and PIN for installations without a gateway. 
+- Pixie credentials for gateway installations.
+- The Pixie PIN for installations without a gateway.
+- An ESPHome Bluetooth proxy if using Bluetooth, adding/removing devices, or using a no-gateway Pixie installation.
 
 ## Supported Devices
 
@@ -43,20 +55,19 @@ The current code includes support for these models:
 - Dual Relay Control - PC206DR/R/BTAM
 - Blind and Signal Control - PC206BS/R/BTAM
 - Contact Sensor Transceiver - PC100CS/R/BTAM
-- Translator control - PC100T/R/BTAS
 
 ## Installation
 
 ### HACS
 
 1. Open HACS.
-2. Go to the custom repositories section (HACS →  ⋮ (top right corner) → Custom repositories).
+2. Go to the custom repositories section (HACS → ⋮ (top right corner) → Custom repositories).
 3. Add `https://github.com/nirnachmani/Pixie_Plus_local` as an `Integration` repository.
 4. Search for `Pixie Plus Local` in HACS and download it.
 5. Restart Home Assistant.
 6. Go to Settings > Devices & Services > Add Integration.
 7. Search for `Pixie Plus Local` and complete the setup flow.
-8. Enter your Pixie Plus username and password when prompted.
+8. Choose whether you are adding a Pixie Plus gateway installation or a Pixie installation without a gateway.
 
 ### Manual
 
@@ -69,7 +80,7 @@ config/custom_components/pixie_plus_local/
 2. Restart Home Assistant.
 3. Go to Settings > Devices & Services > Add Integration.
 4. Search for `Pixie Plus Local` and complete the setup flow.
-5. Enter your Pixie Plus username and password when prompted.
+5. Choose whether you are adding a Pixie Plus gateway installation or a Pixie installation without a gateway.
 
 ## Notes on migration from the old integration
 
@@ -77,23 +88,51 @@ Delete the old integration before installing the current one (theoretically they
 
 Entity ID should remain the same as with the old integration but check that this is the case, especially for devices with multiple entities. 
 
-## Bluetooth functionality
+## Setup
 
-- Bluetooth (BT) functionality requires an ESPHome bluetooth proxy. See [here](https://esphome.io/components/bluetooth_proxy/). ***It will not work without one***.
-- The integration will connect to one Pixie device via BT and will use the BLE mesh to send commands and get updates. 
-- Once enabled when gateway is present, the user can select if commands will be sent via TCP or BT. 
-- Updates from devices will arrive from both TCP and BT, and will race.
-- BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via reconfigure (under ⋮ after clicking on the integration ) -> Bluetooth support.
-- The added benefit of BT is currently minimal, but I am hoping to add the ability to add and remove devices straight from HA, which requires BT. 
+When adding the integration, choose one of the two setup types:
+
+- Pixie Plus with gateway - use this for homes controlled by the Pixie Plus app. Enter your Pixie Plus username and password. The integration will fetch the list of homes from the Pixie cloud during setup and then work locally whenever possible.
+- Pixie without gateway - requires an ESPHome Bluetooth proxy. Use this for homes controlled by the SAL Pixie app. Enter a local home name and the Pixie PIN.
+
+If more than one Pixie home is available, the setup flow will ask which home to add and will give the option to add the remaining homes or finish setup.
+
+For gateway homes, the integration normally stores the local identifiers needed for local control and does not need to log in to the cloud on every restart. Some older gateways or entries using cloud fallback require stored credentials because local inventory is not available.
 
 ## Multiple Homes/Gateways
 
-- Each Home/Gateway is added as a Hub under the integration. 
-- On initial setup the integration will ask which Home to add and will give an opportunity to add other Homes and non-gateway devices
-- Homes can be added later by using the "Add hub" in the integration page or deleted (click on the ⋮ of the relevant home -> Delete)
-- The integration will attempt to find the gateway that the linked to the home and will prompt for an IP address if it can't find it
+- Each Home/Gateway is added as a Hub under the integration.
+- On initial setup the integration will ask which Home to add and will give an opportunity to add other Homes and non-gateway devices.
+- Homes can be added later by using the "Add hub" in the integration page or deleted (click on the ⋮ of the relevant home -> Delete).
+- The integration will attempt to find the gateway linked to the home and will prompt for an IP address if it can't find it.
+
+## Bluetooth functionality
+
+- Bluetooth (BT) functionality requires an ESPHome bluetooth proxy. See [here](https://esphome.io/components/bluetooth_proxy/). ***It will not work without one***.
+- The integration will connect to one Pixie device via BT and will use the BLE mesh to send commands and get updates.
+- Once enabled when a gateway is present, the user can select if commands will be sent via TCP or BT.
+- Updates from devices may arrive from both TCP and BT.
+- BT can be enabled on initial installation (the integration will ask the user during the install process). It can later be enabled or disabled via Reconfigure (under ⋮ after clicking on the integration) -> Bluetooth support.
+- No-gateway Pixie homes always use BT.
+- The integration stores a preferred Bluetooth access node. If this node stops being suitable, the integration can scan and choose another node.
+
+## Device entities and settings
+
+Devices are exposed using the closest Home Assistant entity type, such as lights, switches, covers, binary sensors, buttons, selects, numbers, and sensors.
+
+Some Pixie device settings are exposed as Home Assistant configuration entities. Others are exposed as normal control entities when they affect day-to-day operation. Where a Pixie setting must be queried from the device, the integration may expose a refresh button and may also refresh the setting on startup/reload when the device is online.
 
 ## Configuration menu (cogwheel icon on each integration instance)
+
+The Configuration menu contains optional per-home settings. The options shown depend on the home type, gateway type, Bluetooth status, and devices found in that home.
+
+### Add Pixie device
+
+This option shows when Bluetooth is enabled and the home supports adding/removing devices.
+
+The integration scans for Pixie devices and shows devices that can be added to the selected home. Multiple devices can be selected in one run. Some devices require a mode selection during add, similar to the official app.
+
+Device removal uses the Home Assistant device remove action. When supported, removing a device from Home Assistant also removes it from the Pixie home. If a device is offline, it may be removed from the Pixie/Home Assistant inventory without being physically reset.
 
 ### Bluetooth settings (only shows if BT is enabled for this home)
 
@@ -113,7 +152,15 @@ Entity ID should remain the same as with the old integration but check that this
 
 ### Update device versions (only shows if BT is enabled for this home)
 
-Some devices can show the wrong firmware version (as reported by the gateway). If BT is enabled this scan BT adverts for the correct firmware version for all the devices   
+Some devices can show the wrong firmware version (as reported by the gateway). If BT is enabled this scans BT adverts for the correct firmware version for all the devices.
+
+### Device name sync
+
+This option shows for supported gateway homes.
+
+By default, changing a Home Assistant device name does not rename the device in the Pixie app. Enable this option if you want Home Assistant device name changes to be written back to Pixie.
+
+Entity name changes are not synced. Only the Home Assistant device name is used.
 
 ### Blind mapping
 
@@ -150,6 +197,32 @@ Important notes:
 
 Blind entities are exposed as assumed-state covers. The integration sends the configured button commands locally, but it does not derive a state from the gateway.
 
+## Reconfigure menu (⋮ on each integration instance)
+
+The Reconfigure menu is used for connection and setup-level changes. The options shown depend on the home type and current inventory mode.
+
+### Update fallback credentials
+
+Stores Pixie credentials for a gateway home when direct local inventory is unavailable. Device control and live updates still use the local gateway connection.
+
+### Try local inventory
+
+Shows for gateway homes that are currently using cloud-assisted inventory mode and whose gateway supports local inventory.
+
+This option attempts to switch the home back to direct local inventory over the gateway. If it succeeds, stored Pixie credentials are removed from the entry.
+
+### Gateway connection settings
+
+Choose whether the integration should discover the gateway automatically over UDP or use a stored manual gateway IP address.
+
+Use the manual IP option if the gateway is on another subnet or UDP discovery does not work reliably in your network.
+
+### Bluetooth support
+
+Enable or disable the optional Bluetooth pathway for a gateway home.
+
+For no-gateway Pixie homes, Bluetooth is required, so this reconfigure step verifies the Bluetooth path rather than offering a TCP-only mode.
+
 ## Troubleshooting
 
 If setup fails:
@@ -157,7 +230,9 @@ If setup fails:
 - Verify your Pixie username and password.
 - Make sure Home Assistant and the Pixie gateway are on the same LAN.
 - Confirm that the gateway and devices are already working in the Pixie app.
+- If using Bluetooth, confirm that an ESPHome Bluetooth proxy is added to Home Assistant and close to at least one Pixie node.
 - Check the Home Assistant logs for `pixie_plus_local` messages.
+- If some device functionality doesn't work, make sure the devices has the latest firmware 
 
 If blind actions are wrong:
 
