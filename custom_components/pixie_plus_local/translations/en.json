@@ -22,8 +22,32 @@
         "description": "Add a Pixie Bluetooth-only installation. This requires an ESPHome Bluetooth proxy device already added to Home Assistant.",
         "data": {
           "home_name": "Home name",
-          "pixie_pin": "Pixie PIN"
+          "pixie_pin": "Pixie PIN",
+          "ble_only_home_mode": "Home setup"
         }
+      },
+      "ble_only_create_scan": {
+        "title": "Create Pixie Bluetooth home",
+        "description": "Scanning for Pixie devices...",
+        "data": {}
+      },
+      "ble_only_create_results": {
+        "title": "Create Pixie Bluetooth home",
+        "description": "Choose the unprovisioned Pixie device or devices to add to this new home.",
+        "data": {
+          "devices": "Pixie devices",
+          "scan_again": "Scan again"
+        }
+      },
+      "ble_only_create_modes": {
+        "title": "Choose device mode",
+        "description": "Choose the required setup mode for the selected Pixie device.",
+        "data": {}
+      },
+      "ble_only_create_add": {
+        "title": "Create Pixie Bluetooth home",
+        "description": "Adding Pixie devices...",
+        "data": {}
       },
       "home": {
         "title": "Choose Pixie home",
@@ -123,6 +147,8 @@
       "cannot_connect": "Could not connect to the Pixie gateway.",
       "ble_only_cannot_connect": "Could not connect to the Pixie Bluetooth-only installation. Make sure an ESPHome Bluetooth proxy is available and the PIN is correct.",
       "bt_proxy_unavailable": "No working ESPHome Bluetooth proxy was found. Disable Bluetooth support to continue using TCP only.",
+      "add_device_failed": "The selected Pixie device could not be added.",
+      "no_devices_selected": "Choose at least one Pixie device.",
       "required": "This field is required.",
       "invalid_selection": "Unknown selection.",
       "unknown": "Unexpected error. Check the logs."
@@ -130,8 +156,13 @@
     "abort": {
       "already_configured": "This Pixie home is already configured.",
       "setup_complete": "Pixie home setup is complete.",
+      "add_device_scan_failed": "The Pixie device scan failed.",
       "reconfigure_successful": "Pixie configuration updated.",
       "reconfigure_failed": "The Pixie entry could not be reconfigured."
+    },
+    "progress": {
+      "scanning_for_pixie_devices": "Scanning for Pixie devices...",
+      "adding_pixie_devices": "Adding Pixie devices..."
     }
   },
   "issues": {
@@ -158,15 +189,50 @@
         "title": "Pixie options",
         "description": "Choose which Pixie option to change.",
         "menu_options": {
+          "add_device": "Add Pixie device",
           "transport": "Bluetooth settings",
           "update_device_versions": "Update device versions",
+          "ha_name_sync": "Device name sync",
           "cover_controller": "Blind mapping"
         }
+      },
+      "add_device": {
+        "title": "Add Pixie device",
+        "description": "Choose the discovered Pixie device or devices to add.",
+        "data": {
+          "devices": "Pixie devices",
+          "scan_again": "Scan again"
+        }
+      },
+      "add_device_scan": {
+        "title": "Add Pixie device",
+        "description": "Scanning for Pixie devices...",
+        "data": {}
+      },
+      "add_device_results": {
+        "title": "Add Pixie device",
+        "description": "Choose the discovered Pixie device or devices to add.",
+        "data": {
+          "devices": "Pixie devices",
+          "scan_again": "Scan again"
+        }
+      },
+      "add_device_modes": {
+        "title": "Choose device mode",
+        "description": "Choose the required setup mode for the selected Pixie device.",
+        "data": {}
       },
       "update_device_versions": {
         "title": "Update device versions",
         "description": "Scan briefly for Pixie Bluetooth advertisements and update device firmware versions when the devices report a newer value.",
         "data": {}
+      },
+      "ha_name_sync": {
+        "title": "Device name sync",
+        "description": "Choose whether Home Assistant device name changes should also rename the device in the Pixie app. Entity name changes are not synced.",
+        "data": {
+          "sync_ha_device_names": "Sync HA device name changes to Pixie"
+        }
       },
       "transport": {
         "title": "Bluetooth settings",
@@ -195,8 +261,22 @@
         }
       }
     },
+    "progress": {
+      "scanning_for_pixie_devices": "Scanning for Pixie devices...",
+      "adding_pixie_devices": "Adding Pixie device..."
+    },
     "abort": {
-      "no_blind_devices": "No blind devices were found for this Pixie home."
+      "add_device_scan_failed": "The Pixie device scan failed.",
+      "bt_not_enabled": "Bluetooth support is not enabled for this Pixie home.",
+      "no_addable_devices": "No new Pixie devices were found.",
+      "no_blind_devices": "No blind devices were found for this Pixie home.",
+      "runtime_not_ready": "The Pixie runtime is not ready.",
+      "unsupported_gateway": "This Pixie gateway does not support adding or removing devices."
+    },
+    "error": {
+      "add_device_failed": "The selected Pixie device could not be added.",
+      "add_device_partial": "Some Pixie devices were added. The remaining selected devices could not be added.",
+      "no_devices_selected": "Choose at least one Pixie device."
     }
   },
   "entity": {

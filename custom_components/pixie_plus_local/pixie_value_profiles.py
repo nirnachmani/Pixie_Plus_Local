@@ -30,6 +30,148 @@ EFFECT_COMMAND_ENCODINGS = {
     "template": EFFECT_COMMAND_TEMPLATES,
 }
 
+GATE_POST_ADD_MODE_SELECTION = {
+    "key": "gate_mode",
+    "title": "Gate mode",
+    "default": "roller_1",
+    "firmware_ranges": [
+        {
+            "min": 15,
+            "choices": [
+                {
+                    "value": "roller_1",
+                    "label": "Roller door, 1 door",
+                    "result_model_no": "1201",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b6901010c",
+                    "ack_prefix_hex": "d36969b8010c",
+                },
+                {
+                    "value": "roller_2",
+                    "label": "Roller door, 2 doors",
+                    "result_model_no": "1217",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b6901110c",
+                    "ack_prefix_hex": "d36969b8110c",
+                },
+                {
+                    "value": "swing",
+                    "label": "Swing gate",
+                    "result_model_no": "1202",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b6901020c",
+                    "ack_prefix_hex": "d36969b8020c",
+                },
+                {
+                    "value": "sliding",
+                    "label": "Sliding gate",
+                    "result_model_no": "1203",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b6901030c",
+                    "ack_prefix_hex": "d36969b8030c",
+                },
+            ],
+        },
+    ],
+}
+
+CONTACT_POST_ADD_MODE_SELECTION = {
+    "key": "contact_mode",
+    "title": "Contact sensor mode",
+    "default": "door",
+    "firmware_ranges": [
+        {
+            "min": 1,
+            "choices": [
+                {
+                    "value": "door",
+                    "label": "Door",
+                    "result_model_no": "3010",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b69010a1e0000",
+                    "ack_prefix_hex": "d36969b80a1e",
+                },
+                {
+                    "value": "latch",
+                    "label": "Latch",
+                    "result_model_no": "3011",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b69010b1e0000",
+                    "ack_prefix_hex": "d36969b80b1e",
+                },
+                {
+                    "value": "pulse",
+                    "label": "Pulse",
+                    "result_model_no": "3012",
+                    "command_device_id": 0,
+                    "command_body_hex": "f86b69010c1e0000",
+                    "ack_prefix_hex": "d36969b80c1e",
+                },
+            ],
+        },
+    ],
+}
+
+STARTUP_CONFIG_REFRESH_SPECS = (
+    {
+        "key": "timer_settings",
+        "match_capabilities": ("supports_timer",),
+        "command_kwargs": {
+            "command_timer_action": "poll",
+        },
+    },
+    {
+        "key": "sensor_settings",
+        "match_any_capabilities": (
+            "supports_hold_time",
+            "supports_brightness_threshold",
+            "supports_motion_sensitivity",
+        ),
+        "command_kwargs": {
+            "command_timer_action": "poll",
+        },
+    },
+    {
+        "key": "sensor_advanced_settings",
+        "match_capabilities": ("supports_sensor",),
+        "command_kwargs": {
+            "command_sensor_param": "advanced_settings",
+            "command_sensor_param_value": 0,
+        },
+    },
+    {
+        "key": "gate_settings",
+        "match_capabilities": ("supports_gate",),
+        "command_kwargs": {
+            "command_gate_param": "refresh_settings",
+        },
+    },
+    {
+        "key": "indicator_led_settings",
+        "match_capabilities": ("supports_switch_indicator_led",),
+        "command_kwargs": {
+            "command_indicator_led_action": "poll",
+        },
+    },
+    {
+        "key": "plug_led_settings",
+        "match_capabilities": ("supports_usb_subentity",),
+        "command_kwargs": {
+            "command_indicator_led_action": "poll",
+        },
+    },
+)
+
+INDICATOR_LED_OPTIONS = {
+    0: "off",
+    1: "bright blue",
+    2: "dim blue",
+    3: "bright orange",
+    4: "dim orange",
+}
+INDICATOR_LED_ON_VALUES = (1, 3, 4, 0)
+INDICATOR_LED_OFF_VALUES = (2, 3, 4, 0)
+
 
 # Human-readable model names (optional but useful for logs/debug).
 hardware_list = {
@@ -53,9 +195,9 @@ hardware_list = {
     "2212": "Smart Switch G2 - SWL350BT",
     "2312": "Smart Dimmer G2 - SDD350BT",
     "2311": "Smart Dimmer G2 - SDD350BT",
-    "3011": "Contact Sensor Transceiver - PC100CS/R/BTAM",
-    "3010": "Contact Sensor Transceiver - PC100CS/R/BTAM",
-    "3012": "Contact Sensor Transceiver - PC100CS/R/BTAM",
+    "3011": "Contact Sensor Transceiver - PC100CS/R/BTAM (Latch mode)",
+    "3010": "Contact Sensor Transceiver - PC100CS/R/BTAM (Door sensor mode)",
+    "3012": "Contact Sensor Transceiver - PC100CS/R/BTAM (Pulse mode)",
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",    
     "2113": "Smart Timer Switch - STS600BTAM",
@@ -150,6 +292,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": False,
         "supports_color": False,
         "supports_effects": False,
@@ -161,6 +304,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": False,
         "supports_color": False,
         "supports_effects": False,
@@ -172,6 +316,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": False,
         "supports_color": False,
         "supports_effects": False,
@@ -183,6 +328,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_effects": False,
@@ -194,6 +340,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_effects": False,
@@ -205,6 +352,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_effects": False,
@@ -216,6 +364,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_effects": False,
@@ -271,6 +420,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "supports_cover": False,
         "supports_contact_sensor": True,
         "contact_sensor_type": "inverted_door",
+        "post_add_mode_selection": CONTACT_POST_ADD_MODE_SELECTION,
     },
     "3011": {
         "is_light": False,
@@ -340,6 +490,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": False,
         "supports_color": False,
         "supports_effects": False,
@@ -353,6 +504,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_color_temp": True,
@@ -376,6 +528,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "is_light": True,
         "is_switch": False,
         "supports_onoff": True,
+        "supports_switch_indicator_led": True,
         "supports_dimming": True,
         "supports_color": False,
         "supports_effects": False,
@@ -396,6 +549,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "cover_type": "door",
         "supports_gate": True,
         "gate_doors": 2,
+        "post_add_mode_selection": GATE_POST_ADD_MODE_SELECTION,
     },
     "1201": {
         "is_light": False,
@@ -410,6 +564,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "cover_type": "door",
         "supports_gate": True,
         "gate_doors": 1,
+        "post_add_mode_selection": GATE_POST_ADD_MODE_SELECTION,
     },
     "1202": {
         "is_light": False,
@@ -424,6 +579,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "cover_type": "door",
         "supports_gate": True,
         "gate_doors": 1,
+        "post_add_mode_selection": GATE_POST_ADD_MODE_SELECTION,
     },
     "1203": {
         "is_light": False,
@@ -438,6 +594,7 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
         "cover_type": "door",
         "supports_gate": True,
         "gate_doors": 1,
+        "post_add_mode_selection": GATE_POST_ADD_MODE_SELECTION,
     },
     "2704": {
         "is_light": True,
@@ -550,6 +707,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "is_switch": is_switch,
         "switch_type": str(caps.get("switch_type", "switch" if is_switch else "")),
         "supports_onoff": bool(caps.get("supports_onoff", False)),
+        "supports_switch_indicator_led": bool(caps.get("supports_switch_indicator_led", False)),
         "supports_dimming": bool(caps.get("supports_dimming", False)),
         "supports_color": bool(caps.get("supports_color", False)),
         "color_runtime_encoding": str(caps.get("color_runtime_encoding", "")),
@@ -583,7 +741,73 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "motion_sensitivity_options": [str(o) for o in caps.get("motion_sensitivity_options", [])],
         "supports_gate": bool(caps.get("supports_gate", False)),
         "gate_doors": int(caps.get("gate_doors", 0)),
+        "post_add_mode_selection": dict(caps.get("post_add_mode_selection") or {}),
     }
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Return an integer or None for optional firmware/profile values."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _identity_model_no(identity: Any) -> str:
+    """Return the profile model number for a decoded advertisement identity."""
+    model_no = str(getattr(identity, "model_no", "") or "")
+    if model_no:
+        return model_no
+    try:
+        return f"{int(getattr(identity, 'product_type')):02d}{int(getattr(identity, 'product_stype')):02d}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def get_post_add_mode_selection_for_identity(identity: Any) -> Dict[str, Any]:
+    """Return the matching post-add mode-selection profile for an identity."""
+    model_no = _identity_model_no(identity)
+    firmware = _int_or_none(getattr(identity, "version", None))
+    if not model_no or firmware is None:
+        return {}
+    profile = get_model_capabilities(model_no).get("post_add_mode_selection") or {}
+    ranges = profile.get("firmware_ranges") or []
+    for firmware_range in ranges:
+        min_version = _int_or_none(firmware_range.get("min"))
+        max_version = _int_or_none(firmware_range.get("max"))
+        if min_version is not None and firmware < min_version:
+            continue
+        if max_version is not None and firmware > max_version:
+            continue
+        choices = [
+            dict(choice)
+            for choice in firmware_range.get("choices") or []
+            if choice.get("value") and choice.get("command_body_hex") and choice.get("ack_prefix_hex")
+        ]
+        if not choices:
+            continue
+        default = str(profile.get("default") or choices[0]["value"])
+        if default not in {str(choice["value"]) for choice in choices}:
+            default = str(choices[0]["value"])
+        return {
+            "key": str(profile.get("key") or "mode"),
+            "title": str(profile.get("title") or "Mode"),
+            "default": default,
+            "choices": choices,
+            "firmware": firmware,
+        }
+    return {}
+
+
+def get_post_add_mode_choice(selection: Dict[str, Any], value: str) -> Dict[str, Any]:
+    """Return one selected post-add mode choice from a mode-selection profile."""
+    selected = str(value or selection.get("default") or "")
+    for choice in selection.get("choices") or []:
+        if str(choice.get("value")) == selected:
+            return dict(choice)
+    return {}
 
 
 def _cap(capabilities: Any, name: str, default: Any = None) -> Any:
@@ -591,6 +815,43 @@ def _cap(capabilities: Any, name: str, default: Any = None) -> Any:
     if isinstance(capabilities, dict):
         return capabilities.get(name, default)
     return getattr(capabilities, name, default)
+
+
+def get_startup_config_refresh_specs_for_capabilities(capabilities: Any) -> list[Dict[str, Any]]:
+    """Return startup/reload config refresh specs matching existing capabilities."""
+    specs: list[Dict[str, Any]] = []
+    for spec in STARTUP_CONFIG_REFRESH_SPECS:
+        required = tuple(spec.get("match_capabilities") or ())
+        any_required = tuple(spec.get("match_any_capabilities") or ())
+        if required and not all(bool(_cap(capabilities, name, False)) for name in required):
+            continue
+        if any_required and not any(bool(_cap(capabilities, name, False)) for name in any_required):
+            continue
+        specs.append(dict(spec))
+    return specs
+
+
+def get_indicator_led_options(*, when_on: bool) -> list[str]:
+    """Return HA-facing indicator LED choices for the selected load state."""
+    values = INDICATOR_LED_ON_VALUES if when_on else INDICATOR_LED_OFF_VALUES
+    return [INDICATOR_LED_OPTIONS[value] for value in values]
+
+
+def indicator_led_value_to_option(value: int | None) -> Optional[str]:
+    """Map a device indicator LED value to a HA-facing option."""
+    if value is None:
+        return None
+    return INDICATOR_LED_OPTIONS.get(int(value))
+
+
+def indicator_led_option_to_value(option: str, *, when_on: bool) -> Optional[int]:
+    """Map a HA-facing indicator LED option to a device value."""
+    allowed = INDICATOR_LED_ON_VALUES if when_on else INDICATOR_LED_OFF_VALUES
+    normalized = str(option or "").strip().lower()
+    for value in allowed:
+        if INDICATOR_LED_OPTIONS[value] == normalized:
+            return value
+    return None
 
 
 def get_supported_sensor_mode_values_for_capabilities(capabilities: Any) -> list[int]:

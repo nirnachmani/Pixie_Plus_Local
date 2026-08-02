@@ -16,15 +16,19 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import (
+from .pixie_const import (
     DOMAIN,
     MANUFACTURER,
+)
+from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
     PixiePlusCoordinatorEntity,
+    device_added_signal,
     endpoint_unique_identifier,
     gateway_device_identifier,
     parent_device_identifier,
@@ -77,12 +81,14 @@ def _bluetooth_connection_state(runtime_data: PixiePlusConfigEntryRuntimeData) -
     return CONNECTION_STATE_DISCONNECTED
 
 
-def _iter_timer_sensor_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_timer_sensor_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return timer remaining sensor endpoints for timer-capable devices."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         if not record.capabilities.supports_timer:
             continue
         endpoints.append(
@@ -100,7 +106,7 @@ def _iter_timer_sensor_endpoints(inventory) -> list[PixieEndpoint]:
     return endpoints
 
 
-def _iter_power_meter_sensor_endpoints(inventory) -> list[PixieEndpoint]:
+def _iter_power_meter_sensor_endpoints(inventory, device_id: int | None = None) -> list[PixieEndpoint]:
     """Return power-meter sensor endpoints for metering-capable devices."""
     gateway_identifier = parent_device_identifier(inventory)
     endpoints: list[PixieEndpoint] = []
@@ -110,8 +116,10 @@ def _iter_power_meter_sensor_endpoints(inventory) -> list[PixieEndpoint]:
         "current": "current",
         "voltage": "voltage",
     }
-    for device_id in sorted(inventory.devices_by_id):
-        record = inventory.devices_by_id[device_id]
+    for current_device_id in sorted(inventory.devices_by_id):
+        record = inventory.devices_by_id[current_device_id]
+        if device_id is not None and int(record.id) != int(device_id):
+            continue
         if not record.capabilities.supports_power_metering:
             continue
         side_names = {
@@ -172,6 +180,21 @@ async def async_setup_entry(
     )
     async_add_entities(entities)
 
+    @callback
+    def _async_add_device_entities(device_id: int) -> None:
+        current_inventory = runtime_data.pixie_runtime.inventory
+        if current_inventory is None:
+            return
+        entities_to_add: list[SensorEntity] = []
+        for endpoint in _iter_timer_sensor_endpoints(current_inventory, device_id=int(device_id)):
+            entities_to_add.append(PixiePlusTimerRemainingSensorEntity(runtime_data, endpoint))
+        for endpoint in _iter_power_meter_sensor_endpoints(current_inventory, device_id=int(device_id)):
+            entities_to_add.append(PixiePlusPowerMeterSensorEntity(runtime_data, endpoint))
+        if entities_to_add:
+            async_add_entities(entities_to_add)
+
+    entry.async_on_unload(async_dispatcher_connect(hass, device_added_signal(entry), _async_add_device_entities))
+
 
 class PixieGatewayConnectionSensorEntity(CoordinatorEntity, SensorEntity):
     """Diagnostic sensor showing one gateway connection path state."""
@@ -230,7 +253,6 @@ class PixieGatewayConnectionSensorEntity(CoordinatorEntity, SensorEntity):
             "manufacturer": MANUFACTURER,
             "name": gateway.model_name or "Pixie Gateway" if gateway else "Pixie Gateway",
             "model": gateway.model_name if gateway else "Pixie Gateway",
-            "model_id": gateway.model_no if gateway else None,
         }
 
     async def async_added_to_hass(self) -> None:
