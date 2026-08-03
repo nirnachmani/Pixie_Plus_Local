@@ -39,6 +39,7 @@ PIXIE_DEFAULT_NAME = "Smart Light"
 BLE_NOTIFY_WAIT_SECONDS = 5.0
 BLE_CANDIDATE_CONNECT_TIMEOUT_SECONDS = 15.0
 BLE_FAILED_CANDIDATE_DISCONNECT_TIMEOUT_SECONDS = 2.0
+BLE_COMMAND_MIN_GAP_SECONDS = 0.075
 BLE_BETTER_RSSI_DELTA_DBM = 10
 BLE_ONLY_POST_LOGIN_COLLECT_SECONDS = 5.0
 BLE_ONLY_IDENTITY_REPLY_SECONDS = 1.5
@@ -183,6 +184,7 @@ class PixieBluetoothRuntime:
     _char_1912: int | None = None
     _char_1914: int | None = None
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _last_1912_write_at: float | None = None
     _reconnect_event: asyncio.Event = field(default_factory=asyncio.Event)
     _reconnect_reason: str | None = None
     _active_candidate_rssi: int | None = None
@@ -957,6 +959,7 @@ class PixieBluetoothRuntime:
         plain_packets = self._build_plain_1912_packets(command_kwargs)
         async with self._write_lock:
             for index, (plain_pkt, delay) in enumerate(plain_packets, start=1):
+                await self._pace_1912_write()
                 encrypted = encrypt_command_packet(self._session_key, self._device_mac, plain_pkt)
                 LOGGER.debug(
                     "%sPixie BLE 1912 write %s/%s plain=%s cipher=%s delay_after=%.3fs kwargs=%s",
@@ -975,6 +978,7 @@ class PixieBluetoothRuntime:
                     self._request_reconnect(reason)
                     await self._disconnect_client()
                     raise RuntimeError(reason) from err
+                self._last_1912_write_at = time.monotonic()
                 if delay:
                     await asyncio.sleep(delay)
 
@@ -1009,6 +1013,7 @@ class PixieBluetoothRuntime:
         async with self._write_lock:
             for index, plain_hex in enumerate(plain_hexes, start=1):
                 raw = bytes.fromhex("".join(str(plain_hex).split()))
+                await self._pace_1912_write()
                 encrypted = encrypt_command_packet(self._session_key, self._device_mac, raw)
                 LOGGER.debug(
                     "%sPixie BLE 1912 direct write target=%s %s/%s plain=%s cipher=%s",
@@ -1026,8 +1031,19 @@ class PixieBluetoothRuntime:
                     response=response,
                     timeout=20.0,
                 )
+                self._last_1912_write_at = time.monotonic()
                 if delay_after:
                     await asyncio.sleep(delay_after)
+
+    async def _pace_1912_write(self) -> None:
+        """Keep a small gap between writes to the Pixie command characteristic."""
+        if self._last_1912_write_at is None:
+            return
+        wait_for = BLE_COMMAND_MIN_GAP_SECONDS - (time.monotonic() - self._last_1912_write_at)
+        if wait_for <= 0:
+            return
+        LOGGER.debug("%sPixie BLE command pacing wait %.3fs", self._log_prefix, wait_for)
+        await asyncio.sleep(wait_for)
 
     def _encrypt_1914_block(self, command: int, plaintext16: bytes) -> bytes:
         """Build a 1914 provisioning block using the logged-in session key."""
