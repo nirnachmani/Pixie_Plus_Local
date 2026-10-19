@@ -46,6 +46,8 @@ The current code includes support for these models:
 - Smart Socket Outlet - SP023/BTAM
 - Flexi Smart LED Strip - FLP12V2M/RGBBT
 - Flexi Streamline - FLP24V2M
+- PIXIE DALI Lighting Controller (2449)
+- PIXIE Tunable White Strip Light (2504)
 - Strip Kit RGB - FLBP24V2RGB/BTAM 
 - Smart RGBTW LED strip controller - LT8915RTW/BTAM
 - LED Strip Controller - LT8915DIM/BT
