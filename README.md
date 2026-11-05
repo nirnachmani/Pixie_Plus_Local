@@ -61,11 +61,21 @@ The current code includes support for these models:
 
 ## Installation
 
-### HACS
+### Marketplace (Home Assistant 2026.11 and later)
+
+1. Open Settings > Marketplace and connect your GitHub account if prompted. A GitHub connection is required to add a custom repository.
+2. Select Add from link and enter `https://github.com/nirnachmani/Pixie_Plus_Local`.
+3. Choose `Integration` if prompted, then install `Pixie Plus Local`.
+4. Follow the integration setup flow. If it does not open automatically, go to Settings > Devices & Services > Add Integration and search for `Pixie Plus Local`.
+5. Choose whether you are adding a Pixie Plus gateway installation or a Pixie installation without a gateway.
+
+Marketplace replaces HACS starting with Home Assistant 2026.11. Existing HACS installations migrate automatically. Follow any restart prompt when updating an installed integration.
+
+### HACS (Home Assistant 2026.10 and earlier)
 
 1. Open HACS.
 2. Go to the custom repositories section (HACS → ⋮ (top right corner) → Custom repositories).
-3. Add `https://github.com/nirnachmani/Pixie_Plus_local` as an `Integration` repository.
+3. Add `https://github.com/nirnachmani/Pixie_Plus_Local` as an `Integration` repository.
 4. Search for `Pixie Plus Local` in HACS and download it.
 5. Restart Home Assistant.
 6. Go to Settings > Devices & Services > Add Integration.
