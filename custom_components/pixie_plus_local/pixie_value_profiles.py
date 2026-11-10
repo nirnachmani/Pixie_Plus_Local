@@ -11,6 +11,11 @@ import colorsys
 from typing import Any, Dict, Optional
 
 
+# Fallback speed count for a fan model whose profile does not state one. 9 is
+# what every fan used before per-model counts existed, so an unprofiled fan
+# keeps its previous behaviour byte for byte.
+DEFAULT_FAN_SPEED_COUNT = 9
+
 EFFECT_COMMAND_CODES: Dict[str, str] = {
     "flash": "01",
     "strobe": "02",
@@ -209,6 +214,7 @@ hardware_list = {
     "3001": "Smart passive infrared motion sensor - SMS861CD/BTAM",
     "3002": "Smart passive infrared motion sensor - SMS862WF/WH/BTAM",    
     "2113": "Smart Timer Switch - STS600BTAM",
+    "0615": "Hunter Pacific ceiling fan",
     "0915": "Hunter Pacific ceiling fan",
     "5715": "Hunter Pacific ceiling fan",
     "2552": "Smart Dimmer rippleSHIELD - SDD400RS/BTAM",
@@ -527,6 +533,28 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
             "daylight": 6500,
         },
     },
+    # Product type 6 / stype 15. Six discrete speeds, measured 2026-11-10 by
+    # stepping the Pixie app through every position on four of these fans and
+    # reading the device's own reports: speed N arrives as value byte N << 4,
+    # i.e. 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, with 0x00 for off. The report
+    # frame and the existing (value_byte >> 4) decode are identical to the
+    # 5715's, so only the profile and the speed count were missing.
+    #
+    # No fan light: the module exposes no light channel, the gateway's device
+    # record carries no `light_name` (the 5715's does) and the Pixie app shows
+    # no light control for it.
+    #
+    # The app does offer 1/2/3 hour timers, but that is a coarser feature than
+    # the 5715's minute-granularity sleep config and its command encoding is
+    # unverified, so no timer or sleep capability is declared here.
+    "0615": {
+        "is_light": False,
+        "is_switch": False,
+        "supports_onoff": True,
+        "is_fan": True,
+        "fan_speed_count": 6,
+        "force_disabled_capabilities": ["supports_fan_light"],
+    },
     "0915": {
         "is_light": False,
         "is_switch": False,
@@ -759,6 +787,15 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
 }
 
 
+def coerce_fan_speed_count(value: Any) -> int:
+    """Return a usable discrete speed count, falling back to the historic 9."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FAN_SPEED_COUNT
+    return count if count > 0 else DEFAULT_FAN_SPEED_COUNT
+
+
 def get_model_capabilities(model_no: str) -> Dict[str, Any]:
     """Return normalized capability flags for a model number."""
     caps = MODEL_CAPABILITIES.get(str(model_no), {})
@@ -802,6 +839,7 @@ def get_model_capabilities(model_no: str) -> Dict[str, Any]:
         "supports_photocell_sensor": bool(caps.get("supports_photocell_sensor", False)),
         "supports_timer": bool(caps.get("supports_timer", False)),
         "is_fan": bool(caps.get("is_fan", False)),
+        "fan_speed_count": coerce_fan_speed_count(caps.get("fan_speed_count")),
         "supports_fan_light": bool(caps.get("supports_fan_light", False)),
         "supports_fan_timer": bool(caps.get("supports_fan_timer", False)),
         "supports_fan_sleep_config": bool(caps.get("supports_fan_sleep_config", False)),

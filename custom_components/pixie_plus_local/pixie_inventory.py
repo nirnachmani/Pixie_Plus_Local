@@ -15,6 +15,8 @@ import json
 import logging
 
 from .pixie_value_profiles import (
+    DEFAULT_FAN_SPEED_COUNT,
+    coerce_fan_speed_count,
     decode_color_runtime_hue_for_capabilities,
     decode_color_runtime_state_for_capabilities,
     decode_color_temp_runtime_state_for_capabilities,
@@ -96,6 +98,17 @@ def supports_plug_led_settings(capabilities: Any) -> bool:
 def supports_sensor_advanced_settings(capabilities: Any) -> bool:
     """Return whether a sensor exposes LED/learn-threshold settings."""
     return bool(getattr(capabilities, "supports_sensor", False))
+
+
+def supports_fan_sleep_switch(capabilities: Any, endpoint_key: str) -> bool:
+    """Use the same sleep-switch capability rules for creation and cleanup."""
+    if not (capabilities.is_fan and capabilities.supports_fan_sleep_config):
+        return False
+    if endpoint_key == "fan_sleep_timer":
+        return capabilities.supports_fan_timer
+    if endpoint_key == "fan_sleep_fade":
+        return capabilities.supports_fan_fade
+    return endpoint_key == "fan_sleep_enabled"
 
 
 def derive_is_on_from_state(
@@ -1010,6 +1023,7 @@ class DeviceCapabilities:
     supports_photocell_sensor: bool = False
     supports_timer: bool = False
     is_fan: bool = False
+    fan_speed_count: int = DEFAULT_FAN_SPEED_COUNT
     supports_fan_light: bool = False
     supports_fan_timer: bool = False
     supports_fan_sleep_config: bool = False
@@ -1062,6 +1076,7 @@ class DeviceCapabilities:
             "supports_photocell_sensor": self.supports_photocell_sensor,
             "supports_timer": self.supports_timer,
             "is_fan": self.is_fan,
+            "fan_speed_count": self.fan_speed_count,
             "supports_fan_light": self.supports_fan_light,
             "supports_fan_timer": self.supports_fan_timer,
             "supports_fan_sleep_config": self.supports_fan_sleep_config,
@@ -1116,6 +1131,7 @@ class DeviceCapabilities:
             supports_photocell_sensor=bool(data.get("supports_photocell_sensor", False)),
             supports_timer=bool(data.get("supports_timer", False)),
             is_fan=bool(data.get("is_fan", False)),
+            fan_speed_count=coerce_fan_speed_count(data.get("fan_speed_count")),
             supports_fan_light=bool(data.get("supports_fan_light", False)),
             supports_fan_timer=bool(data.get("supports_fan_timer", False)),
             supports_fan_sleep_config=bool(data.get("supports_fan_sleep_config", False)),
@@ -1208,6 +1224,9 @@ class DeviceRecord:
         ):
             if model_caps.get(capability_name, False):
                 setattr(capabilities, capability_name, True)
+        # Not part of the boolean loop above: an integer, and it must survive a
+        # value of 0 or a missing key by falling back rather than becoming 0.
+        capabilities.fan_speed_count = coerce_fan_speed_count(model_caps.get("fan_speed_count"))
         for capability_name in model_caps.get("force_disabled_capabilities", []):
             if hasattr(capabilities, capability_name):
                 setattr(capabilities, capability_name, False)
@@ -1311,6 +1330,7 @@ class PixieInventory:
         cap.supports_photocell_sensor = model_caps["supports_photocell_sensor"]
         cap.supports_timer = model_caps["supports_timer"]
         cap.is_fan = model_caps["is_fan"]
+        cap.fan_speed_count = int(model_caps["fan_speed_count"])
         cap.supports_fan_light = model_caps["supports_fan_light"]
         cap.supports_fan_timer = model_caps["supports_fan_timer"]
         cap.supports_fan_sleep_config = model_caps["supports_fan_sleep_config"]

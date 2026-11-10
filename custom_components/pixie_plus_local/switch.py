@@ -26,6 +26,7 @@ from .pixie_ha import (
     physical_device_identifier,
 )
 from .pixie_inventory import (
+    supports_fan_sleep_switch,
     supports_outlet_runtime_config,
     supports_plug_led_settings,
     supports_sensor_advanced_settings,
@@ -53,6 +54,8 @@ def _iter_switch_endpoints(
                 ("fan_sleep_enabled", "Sleep mode"),
                 ("fan_sleep_fade", "Sleep fade"),
             ):
+                if not supports_fan_sleep_switch(record.capabilities, endpoint_key):
+                    continue
                 endpoints.append(PixieEndpoint(
                     device_id=record.id, endpoint_key=endpoint_key, command_target=endpoint_key,
                     entity_unique_id=endpoint_unique_identifier(record, endpoint_key),
