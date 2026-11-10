@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.components.fan import DIRECTION_FORWARD, DIRECTION_REVERSE, FanEntity, FanEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.util.percentage import percentage_to_ranged_value, ranged_value_to_percentage
@@ -142,6 +142,11 @@ class PixiePlusFanEntity(PixiePlusCoordinatorEntity, FanEntity):
             await self.async_turn_on(percentage=percentage)
 
     async def async_set_direction(self, direction: str) -> None:
+        # The hardware only accepts a direction change while the fan is turning.
+        # Surfacing this as ServiceValidationError makes it a 400 with a usable
+        # message instead of the 500 a bare runtime error produced.
+        if not self.is_on:
+            raise ServiceValidationError("The fan must be running before changing direction")
         target = "winter" if direction == DIRECTION_REVERSE else "summer"
         try:
             await self.runtime_data.async_send_local_command(self.hass, command_device_id=self.record.id, command_fan_direction=target)
