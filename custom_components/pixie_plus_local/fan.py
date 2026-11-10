@@ -14,6 +14,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.util.percentage import percentage_to_ranged_value, ranged_value_to_percentage
 
 from .pixie_const import DOMAIN
+from .pixie_value_profiles import DEFAULT_FAN_SPEED_COUNT
 from .pixie_ha import (
     PixieEndpoint,
     PixiePlusConfigEntryRuntimeData,
@@ -64,7 +65,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class PixiePlusFanEntity(PixiePlusCoordinatorEntity, FanEntity):
-    """Pixie/Hunter Pacific DC fan with nine discrete speeds."""
+    """Pixie/Hunter Pacific DC fan with a model-defined number of discrete speeds."""
 
     _attr_supported_features = (
         FanEntityFeature.SET_SPEED
@@ -72,11 +73,22 @@ class PixiePlusFanEntity(PixiePlusCoordinatorEntity, FanEntity):
         | FanEntityFeature.TURN_ON
         | FanEntityFeature.TURN_OFF
     )
-    _attr_speed_count = 9
-    _speed_range = (1, 9)
 
     def __init__(self, runtime_data: PixiePlusConfigEntryRuntimeData, endpoint: PixieEndpoint) -> None:
         super().__init__(runtime_data, endpoint, domain=DOMAIN)
+
+    @property
+    def speed_count(self) -> int:
+        """Discrete speeds this model exposes (5715: 9, 0615: 6)."""
+        try:
+            count = self.record.capabilities.fan_speed_count
+        except (KeyError, AttributeError):
+            return DEFAULT_FAN_SPEED_COUNT
+        return count if isinstance(count, int) and count > 0 else DEFAULT_FAN_SPEED_COUNT
+
+    @property
+    def _speed_range(self) -> tuple[int, int]:
+        return (1, self.speed_count)
 
     @property
     def is_on(self) -> bool | None:
@@ -106,11 +118,12 @@ class PixiePlusFanEntity(PixiePlusCoordinatorEntity, FanEntity):
         **kwargs: Any,
     ) -> None:
         """Turn the fan on at its requested or remembered speed."""
+        max_speed = self.speed_count
         if percentage is None:
-            speed = self.record.runtime.last_fan_speed or self.record.runtime.fan_speed or 9
+            speed = self.record.runtime.last_fan_speed or self.record.runtime.fan_speed or max_speed
         else:
             speed = math.ceil(percentage_to_ranged_value(self._speed_range, percentage))
-            speed = max(1, min(9, speed))
+        speed = max(1, min(max_speed, speed))
         try:
             await self.runtime_data.async_send_local_command(self.hass, command_device_id=self.record.id, command_fan_speed=speed)
         except Exception as err:

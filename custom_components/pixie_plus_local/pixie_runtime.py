@@ -52,6 +52,7 @@ from .pixie_inventory import (
     supports_sensor_advanced_settings,
 )
 from .pixie_value_profiles import (
+    DEFAULT_FAN_SPEED_COUNT,
     EFFECT_COMMAND_ENCODINGS,
     decode_color_runtime_state_for_capabilities,
     decode_color_temp_runtime_state_for_capabilities,
@@ -71,6 +72,25 @@ from .pixie_value_profiles import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# Fan direction is a SET command on fan subcommand 0x03, not a toggle.
+#
+# Measured on a 5715 (2026-11-10), reading the device's own runtime reports
+# rather than the optimistic state:
+#   * `winter` -> 0x01 applies: the device reports tail bit 0 set, every time.
+#   * sending `winter` again while the fan is ALREADY in winter produces no
+#     device report at all. That rules out toggle semantics - a toggle would
+#     have flipped it to summer.
+#   * `summer` -> 0x02 applies and holds: tail bit 0 clears, confirmed by the
+#     device's own report and still summer 150s later.
+#   * the previous encoding sent 0x00 for summer, and summer never applied
+#     (#41). 0x00 was not re-tested here to find out whether the device
+#     rejects it or silently drops it; either way 0x02 is what works.
+#
+# Every other command in this family uses non-zero values (speed 1-9, light
+# level 1-9, sleep timer 0xff/0x00), so 0x02 is the natural encoding for the
+# second of two direction states.
+FAN_DIRECTION_COMMAND_VALUES: Dict[str, int] = {"winter": 0x01, "summer": 0x02}
 
 GATE_OPEN_DURATION_FIELD_OFFSET_MS = 2000
 GATE_CLOSE_DURATION_FIELD_OFFSET_MS = 1000
@@ -4358,7 +4378,10 @@ class PixieAuthHandler:
                 target = "fan_sleep_timer"
                 _fan_packet(b"\x04\x00\x00\x00\x00\x00\x0f\x63\x00\x00")
             elif command_fan_speed is not None:
-                speed = max(0, min(9, int(command_fan_speed)))
+                max_speed = getattr(rec.capabilities, "fan_speed_count", DEFAULT_FAN_SPEED_COUNT)
+                if not isinstance(max_speed, int) or max_speed < 1:
+                    max_speed = DEFAULT_FAN_SPEED_COUNT
+                speed = max(0, min(max_speed, int(command_fan_speed)))
                 target = "fan_speed"
                 _fan_packet(bytes([0x02, 0x00, speed, 0x00, 0x00, 0x00, 0x0F, 0x63, 0x00, 0x00]))
             elif command_fan_light_level is not None:
@@ -4387,13 +4410,13 @@ class PixieAuthHandler:
                 if not rec.runtime.is_on:
                     raise PixieAuthError("The fan must be running before changing direction")
                 direction = str(command_fan_direction).lower()
-                if direction not in {"summer", "winter"}:
+                if direction not in FAN_DIRECTION_COMMAND_VALUES:
                     raise PixieAuthError(f"Unsupported fan direction: {direction}")
                 target = "fan_direction"
                 _fan_packet(bytes([
                     0x03,
                     0x00,
-                    1 if direction == "winter" else 0,
+                    FAN_DIRECTION_COMMAND_VALUES[direction],
                     0x00,
                     0x00,
                     0x00,
