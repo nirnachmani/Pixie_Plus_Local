@@ -59,6 +59,8 @@ The current code includes support for these models:
 - Contact Sensor Transceiver - PC100CS/R/BTAM
 - Hunter Pacific ceiling fan
 
+Hunter Pacific models `0615`, `0915`, and `5715` are supported. Model `0615` has six speeds and no light or sleep controls; `0915` and `5715` use nine speeds. Model `5715` also exposes its fan-light controls.
+
 ## Installation
 
 ### Marketplace (Home Assistant 2026.11 and later)

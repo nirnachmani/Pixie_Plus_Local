@@ -82,7 +82,12 @@ from .pixie_const import (
     POWER_POLL_MAX_INTERVAL_SECONDS,
     TIMER_POLL_INTERVAL_SECONDS,
 )
-from .pixie_inventory import DeviceRecord, PixieInventory, online_value_is_online
+from .pixie_inventory import (
+    DeviceRecord,
+    PixieInventory,
+    online_value_is_online,
+    supports_fan_sleep_switch,
+)
 from .pixie_provisioning import PixieProvisioningMixin
 from .pixie_runtime import (
     CloudParams,
@@ -970,6 +975,9 @@ async def async_cleanup_orphaned_registry_entries(
         for key in endpoint_keys:
             if key == "fan_light" and not record.capabilities.supports_fan_light:
                 continue
+            if key in {"fan_sleep_timer", "fan_sleep_enabled", "fan_sleep_fade"}:
+                if not supports_fan_sleep_switch(record.capabilities, key):
+                    continue
             valid_entity_ids.update(_endpoint_unique_identifier_variants(record, key))
 
     ent_reg = er.async_get(hass)

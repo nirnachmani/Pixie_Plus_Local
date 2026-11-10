@@ -100,6 +100,17 @@ def supports_sensor_advanced_settings(capabilities: Any) -> bool:
     return bool(getattr(capabilities, "supports_sensor", False))
 
 
+def supports_fan_sleep_switch(capabilities: Any, endpoint_key: str) -> bool:
+    """Use the same sleep-switch capability rules for creation and cleanup."""
+    if not (capabilities.is_fan and capabilities.supports_fan_sleep_config):
+        return False
+    if endpoint_key == "fan_sleep_timer":
+        return capabilities.supports_fan_timer
+    if endpoint_key == "fan_sleep_fade":
+        return capabilities.supports_fan_fade
+    return endpoint_key == "fan_sleep_enabled"
+
+
 def derive_is_on_from_state(
     capabilities: "DeviceCapabilities",
     br: Optional[int],

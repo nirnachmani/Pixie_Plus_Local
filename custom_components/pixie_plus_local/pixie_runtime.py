@@ -92,9 +92,6 @@ LOGGER = logging.getLogger(__name__)
 # second of two direction states.
 FAN_DIRECTION_COMMAND_VALUES: Dict[str, int] = {"winter": 0x01, "summer": 0x02}
 
-# Distinguishes "no optimistic prediction recorded" from "predicted None".
-_OPTIMISTIC_UNSET = object()
-
 GATE_OPEN_DURATION_FIELD_OFFSET_MS = 2000
 GATE_CLOSE_DURATION_FIELD_OFFSET_MS = 1000
 
@@ -744,45 +741,6 @@ class PixieAuthHandler:
 
     def _log_debug(self, message: str, *args: Any) -> None:
         LOGGER.debug(self._log_message(message), *args)
-
-    def _remember_optimistic(self, device_id: Any, key: str, value: Any) -> None:
-        """Record a prediction so the next device report can confirm or refute it."""
-        pending = getattr(self, "_optimistic_pending", None)
-        if pending is None:
-            pending = {}
-            self._optimistic_pending = pending
-        try:
-            pending[(int(device_id), key)] = value
-        except (TypeError, ValueError):
-            return
-
-    def _reconcile_optimistic(self, device_id: Any, key: str, reported: Any) -> None:
-        """Clear a prediction once the device reports, loudly when it disagreed.
-
-        Without this a rejected command is indistinguishable from an accepted
-        one: the optimistic value is written on send, the device never confirms
-        it, and reading the entity back shows the commanded value regardless.
-        """
-        pending = getattr(self, "_optimistic_pending", None)
-        if not pending:
-            return
-        try:
-            predicted = pending.pop((int(device_id), key), _OPTIMISTIC_UNSET)
-        except (TypeError, ValueError):
-            return
-        if predicted is _OPTIMISTIC_UNSET or predicted is None:
-            return
-        if predicted != reported:
-            LOGGER.warning(
-                self._log_message(
-                    "Optimistic %s for dev_id=%s was NOT confirmed: predicted %r, "
-                    "device reported %r - discarding the prediction and keeping "
-                    "the reported value"
-                ),
-                key, device_id, predicted, reported,
-            )
-        else:
-            self._log_debug("Optimistic %s for dev_id=%s confirmed as %r", key, device_id, predicted)
 
     def _gateway_reply_route_node_id(self) -> Optional[int]:
         """Return the current home gateway's Pixie device id for reply routing."""
@@ -2101,8 +2059,6 @@ class PixieAuthHandler:
                             "fan_sleep_enabled": bool(tail & 0x40),
                             "fan_timer_kind": fan_timer_kind,
                         })
-                        self._reconcile_optimistic(dev_id, "fan_speed", fan_speed)
-                        self._reconcile_optimistic(dev_id, "fan_direction", update_kwargs["fan_direction"])
                         if fan_timer_kind == "none":
                             update_kwargs["timer_remaining_seconds"] = None
                         self._log_debug(
@@ -5117,14 +5073,12 @@ class PixieAuthHandler:
             update_kwargs["effect_speed"] = effect_speed
         elif target == "fan_speed":
             update_kwargs["fan_speed"] = int(value) if value is not None else None
-            self._remember_optimistic(device_id, "fan_speed", update_kwargs["fan_speed"])
         elif target == "fan_light":
             update_kwargs["fan_light_level"] = int(value) if value is not None else None
         elif target == "fan_light_temperature":
             update_kwargs["fan_light_temperature"] = str(value) if value is not None else None
         elif target == "fan_direction":
             update_kwargs["fan_direction"] = str(value) if value is not None else None
-            self._remember_optimistic(device_id, "fan_direction", update_kwargs["fan_direction"])
         elif target == "fan_sleep_timer":
             if value:
                 duration_minutes = rec.runtime.fan_sleep_duration_minutes
